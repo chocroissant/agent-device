@@ -1,0 +1,173 @@
+// The public API vocabulary for the gesture and text-entry commands.
+
+import type { ClickButton } from './click-button.ts';
+import type { GesturePointerCount } from './gesture-plan-types.ts';
+import type {
+  DragGesturePayload,
+  GesturePayload,
+  SwipeGesturePayload,
+  TapGesturePayload,
+} from './gesture-input.ts';
+import type {
+  ScrollDirection,
+  ScrollInputDirection,
+  SwipePattern,
+  TransformGestureParams,
+} from './scroll-gesture.ts';
+import type { SelectorSnapshotCommandOptions } from './client-capture.ts';
+import type { DeviceCommandBaseOptions } from './client-connection.ts';
+import type { InteractionTarget } from './client-target.ts';
+
+export type RepeatedPressOptions = {
+  count?: number;
+  intervalMs?: number;
+  holdMs?: number;
+  jitterPx?: number;
+  doubleTap?: boolean;
+};
+
+/**
+ * Opt-in (#1101): after the action, wait for the UI to go quiet and return the
+ * settled diff vs the pre-action tree (`settle` on the result) in the same
+ * response. Best-effort — never fails the action. `settleQuietMs` tunes the
+ * quiet window (default 500ms, or 300ms when the settled tree comes from the iOS
+ * simulator snapshot bridge); `timeoutMs` bounds the settle wait (default
+ * 10s) when `settle` is true. A bare `timeoutMs` without `settle` is ignored
+ * for compatibility; `settleQuietMs` still requires `settle`.
+ */
+export type SettleCommandOptions = {
+  settle?: boolean;
+  settleQuietMs?: number;
+  timeoutMs?: number;
+};
+
+/** For a caller that verifies the screen by polling it: opts out of the checks after a gesture. */
+export type PostGestureStabilizationOptions = {
+  /**
+   * Set false to skip the movement check on a directional scroll and the stabilization wait
+   * before the next read. Set it only when your own polling verifies the screen: the next read can
+   * return a tree that the gesture is still moving.
+   */
+  postGestureStabilization?: boolean;
+};
+
+export type ClickOptions = DeviceCommandBaseOptions &
+  SelectorSnapshotCommandOptions &
+  InteractionTarget &
+  RepeatedPressOptions &
+  SettleCommandOptions & {
+    button?: ClickButton;
+    /**
+     * Opt-in (#1047): return cheap post-action evidence (AX digest, node counts,
+     * changedFromBefore) in the response instead of requiring a follow-up
+     * snapshot to confirm the action had an effect.
+     */
+    verify?: boolean;
+  };
+
+export type PressOptions = DeviceCommandBaseOptions &
+  SelectorSnapshotCommandOptions &
+  InteractionTarget &
+  RepeatedPressOptions &
+  SettleCommandOptions & {
+    verify?: boolean;
+  };
+
+export type LongPressOptions = DeviceCommandBaseOptions &
+  SelectorSnapshotCommandOptions &
+  InteractionTarget &
+  SettleCommandOptions & {
+    durationMs?: number;
+  };
+
+export type HoverOptions = DeviceCommandBaseOptions &
+  SelectorSnapshotCommandOptions &
+  InteractionTarget &
+  SettleCommandOptions;
+
+export type SwipeOptions = DeviceCommandBaseOptions &
+  PostGestureStabilizationOptions & {
+    from: { x: number; y: number };
+    to: { x: number; y: number };
+    count?: number;
+    pauseMs?: number;
+    pattern?: SwipePattern;
+  };
+
+export type GestureOptions = DeviceCommandBaseOptions &
+  (GesturePayload | (SwipeGesturePayload & PostGestureStabilizationOptions));
+
+export type PanOptions = DeviceCommandBaseOptions & {
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+  pointerCount?: GesturePointerCount;
+  durationMs?: number;
+};
+
+export type DragOptions = DeviceCommandBaseOptions & Omit<DragGesturePayload, 'kind'>;
+
+export type FlingOptions = DeviceCommandBaseOptions & {
+  direction: ScrollDirection;
+  x: number;
+  y: number;
+  distance?: number;
+};
+
+export type SwipeGestureOptions = DeviceCommandBaseOptions &
+  Omit<SwipeGesturePayload, 'kind'> &
+  PostGestureStabilizationOptions;
+
+export type FocusOptions = DeviceCommandBaseOptions & {
+  x: number;
+  y: number;
+};
+
+export type TypeTextOptions = DeviceCommandBaseOptions & {
+  text: string;
+  delayMs?: number;
+};
+
+export type FillOptions = DeviceCommandBaseOptions &
+  SelectorSnapshotCommandOptions &
+  InteractionTarget &
+  SettleCommandOptions & {
+    text: string;
+    delayMs?: number;
+    /** Publish this fill value as `${VAR}` when script recording is armed. */
+    recordAs?: string;
+    /** The text came from the CLI's stdin; keep it out of diagnostics and recorded actions. */
+    textStdin?: boolean;
+    verify?: boolean;
+  };
+
+export type PinchOptions = DeviceCommandBaseOptions & {
+  scale: number;
+  x?: number;
+  y?: number;
+};
+
+export type RotateGestureOptions = DeviceCommandBaseOptions & {
+  degrees: number;
+  x?: number;
+  y?: number;
+};
+
+export type TransformGestureOptions = DeviceCommandBaseOptions & TransformGestureParams;
+
+/** Touches 2 to 5 points and holds them for `holdMs`; `count` repeats the same contacts. */
+export type TapGestureOptions = DeviceCommandBaseOptions & Omit<TapGesturePayload, 'kind'>;
+
+export type ScrollOptions = DeviceCommandBaseOptions &
+  SettleCommandOptions &
+  PostGestureStabilizationOptions & {
+    direction: ScrollInputDirection;
+    amount?: number;
+    pixels?: number;
+    durationMs?: number;
+    /** Repeat scroll passes until this selector is visible on screen, then stop. */
+    until?: string;
+    /** Maximum scroll gestures for an until search (1–200, default 12). */
+    maxPasses?: number;
+  };

@@ -1,0 +1,58 @@
+import type { RunnerDeviceClaimAuthorityProbe } from '@agent-device/apple-runner';
+import type { HostEnvironment } from '@agent-device/kernel/source-value';
+import { runtimeSlot } from '@agent-device/host-kit/runtime-slots';
+
+export type { RunnerDeviceClaimAuthorityProbe };
+
+type RunnerOwner = {
+  leaseOwnerStateDir: string | undefined;
+  deviceClaimAuthorityProbe: RunnerDeviceClaimAuthorityProbe | undefined;
+  hostEnvironment: HostEnvironment | undefined;
+};
+
+/**
+ * The Apple runner's per-runtime owner state: the lease-owner state directory and claim probe
+ * its daemon set, and the host that daemon's composition bound (#3794). The runner's registries
+ * (sessions, locks, recycle ledger) are separate slots the runner modules declare on the same
+ * store through the runner host port. Kept in a dedicated tiny module so daemon startup can
+ * reach it without loading the runner client's implementation closure.
+ */
+const RUNNER_OWNER_SLOT = Symbol('appleRunnerOwner');
+const runnerOwner = (): RunnerOwner =>
+  runtimeSlot(RUNNER_OWNER_SLOT, (): RunnerOwner => ({
+    leaseOwnerStateDir: undefined,
+    deviceClaimAuthorityProbe: undefined,
+    hostEnvironment: undefined,
+  }));
+
+/**
+ * Binds the host this runtime captured for the Apple runner. Root composition calls it once per
+ * runtime, inside the runtime's entered state, alongside the lease owner state; the runner host
+ * port's `hostEnvironment` member answers from it (#3794).
+ */
+export function setAppleRunnerHostEnvironment(host: HostEnvironment): void {
+  runnerOwner().hostEnvironment = host;
+}
+
+/** The host this runtime bound, or undefined when composition never entered one. */
+export function getAppleRunnerHostEnvironment(): HostEnvironment | undefined {
+  return runnerOwner().hostEnvironment;
+}
+
+export function setRunnerLeaseOwnerStateDir(stateDir: string | undefined): void {
+  runnerOwner().leaseOwnerStateDir = stateDir?.trim() || undefined;
+}
+
+export function getRunnerLeaseOwnerStateDir(): string | undefined {
+  return runnerOwner().leaseOwnerStateDir;
+}
+
+export function setRunnerDeviceClaimAuthorityProbe(
+  probe: RunnerDeviceClaimAuthorityProbe | undefined,
+): void {
+  runnerOwner().deviceClaimAuthorityProbe = probe;
+}
+
+export function getRunnerDeviceClaimAuthorityProbe(): RunnerDeviceClaimAuthorityProbe | undefined {
+  return runnerOwner().deviceClaimAuthorityProbe;
+}

@@ -1,0 +1,300 @@
+import XCTest
+import AgentDeviceSnapshotPresentation
+
+extension RunnerTests {
+  // MARK: - Sequence command
+
+  /// Hard cap mirrored from the daemon (MAX_RUNNER_SEQUENCE_STEPS). Keeps the worst-case
+  /// retained journal response well under the 16KB cap and bounds the lost-response window.
+  var maxSequenceSteps: Int { 20 }
+
+  /// Allowlisted step kinds. Validated on both sides so an unsupported kind is rejected with a
+  /// clear INVALID_ARGS naming the step index, executing nothing.
+  private var sequenceableStepKinds: Set<String> { ["tap", "doubleTap", "longPress"] }
+
+  /// Per-step outcome carried by `assembleSequenceExecution`. The timing is captured by the
+  /// executor closure (via performGesture) so ordering/stop-on-failure stay device-free testable.
+  struct SequenceStepOutcome {
+    let outcome: RunnerInteractionOutcome
+    let gestureStartUptimeMs: Double
+    let gestureEndUptimeMs: Double
+  }
+
+  @MainActor
+  func executeSequence(command: Command, activeApp: XCUIApplication) throws -> Response {
+    guard let steps = command.steps, !steps.isEmpty else {
+      return sequenceInvalidArgs("sequence requires at least one step")
+    }
+    guard steps.count <= maxSequenceSteps else {
+      return sequenceInvalidArgs(
+        "sequence accepts at most \(maxSequenceSteps) steps, received \(steps.count)"
+      )
+    }
+    for (index, step) in steps.enumerated() {
+      if let error = validateSequenceStep(step, index: index) {
+        return error
+      }
+    }
+
+    let synthesizedContext = try synthesizedSequenceCoordinateContext(steps: steps, app: activeApp)
+
+    // Touch frame resolves from the first step's coords so recording-gestures works unchanged. A
+    // synthesized context already names the frame, so the app tree is not read for it again. Where
+    // the app frame refuses that read, a first step with no synthesized route would anchor through the
+    // same read, so it refuses before any step runs; a synthesized one needs no app frame and runs
+    // without a touch frame, as a synthesized `tap` command does.
+    let firstStep = steps[0]
+    var firstFrame: TouchVisualizationFrame?
+    var firstStepRefusal: RunnerCoordinateRefusal?
+    if let x = firstStep.x, let y = firstStep.y {
+      if let synthesizedContext {
+        firstFrame = touchVisualizationFrame(point: SurfacePoint(CGPoint(x: x, y: y)), context: synthesizedContext)
+      } else {
+        do {
+          firstFrame = try resolvedTouchVisualizationFrame(app: activeApp, x: x, y: y)
+        } catch let refusal as RunnerCoordinateRefusal {
+          if synthesizedPolicyKind(forSequenceStep: firstStep) == nil {
+            firstStepRefusal = refusal
+          }
+        }
+      }
+    }
+
+#if os(iOS)
+    let orientation = command.sequenceOrientation ?? synthesizedContext?.geometry.orientation ?? litPanelState.surface?.geometry.orientation
+      ?? Int(RunnerSynthesizedGesture.interfaceOrientation(forApplication: activeApp))
+#else
+    let orientation: Int? = nil
+#endif
+    let execution = try assembleSequenceExecution(steps: steps) { index, step in
+      if index == 0, let firstStepRefusal {
+        return finishedSequenceStep(step, timing: measureGesture {}, outcome: .unsupported(
+          message: firstStepRefusal.message,
+          hint: firstStepRefusal.hint
+        ))
+      }
+#if os(iOS)
+      if orientation != Int(RunnerSynthesizedGesture.interfaceOrientation(forApplication: activeApp)) {
+        return finishedSequenceStep(step, timing: measureGesture {}, outcome: .unsupported(
+          message: "sequence stopped because the screen orientation changed",
+          hint: "Inspect the screen before continuing with the remaining actions."
+        ))
+      }
+#endif
+      return try performSequenceStep(step, activeApp: activeApp, synthesizedContext: synthesizedContext)
+    }
+    return sequenceResponse(execution: execution, touchFrame: firstFrame, sequenceOrientation: orientation)
+  }
+
+  /// Pure, device-free assembler: runs each step in order via `perform`, stops at the first
+  /// `.unsupported` outcome, and assembles the DataPayload (completedSteps, optional
+  /// failedStepIndex, per-step results, top-level gesture timing spanning first..last executed).
+  /// Steps after the failed index are never invoked and produce no result entries, so
+  /// results.count == completedSteps + (failedStepIndex != nil ? 1 : 0).
+  func assembleSequenceExecution(
+    steps: [SequenceStep],
+    perform: (Int, SequenceStep) throws -> SequenceStepOutcome
+  ) rethrows -> SequenceExecutionResult {
+    var results: [SequenceStepResult] = []
+    var completedSteps = 0
+    var failedStepIndex: Int?
+    var gestureStartUptimeMs: Double?
+    var gestureEndUptimeMs: Double?
+
+    for (index, step) in steps.enumerated() {
+      let stepOutcome = try perform(index, step)
+      if gestureStartUptimeMs == nil {
+        gestureStartUptimeMs = stepOutcome.gestureStartUptimeMs
+      }
+      gestureEndUptimeMs = stepOutcome.gestureEndUptimeMs
+
+      switch stepOutcome.outcome {
+      case .performed:
+        results.append(
+          SequenceStepResult(
+            ok: true,
+            kind: step.kind,
+            errorCode: nil,
+            errorMessage: nil,
+            errorHint: nil,
+            gestureStartUptimeMs: stepOutcome.gestureStartUptimeMs,
+            gestureEndUptimeMs: stepOutcome.gestureEndUptimeMs
+          )
+        )
+        completedSteps += 1
+      case .unsupported(let message, let hint):
+        results.append(
+          SequenceStepResult(
+            ok: false,
+            kind: step.kind,
+            errorCode: "UNSUPPORTED_OPERATION",
+            errorMessage: message,
+            errorHint: hint,
+            gestureStartUptimeMs: stepOutcome.gestureStartUptimeMs,
+            gestureEndUptimeMs: stepOutcome.gestureEndUptimeMs
+          )
+        )
+        failedStepIndex = index
+        return SequenceExecutionResult(
+          results: results,
+          completedSteps: completedSteps,
+          failedStepIndex: failedStepIndex,
+          gestureStartUptimeMs: gestureStartUptimeMs,
+          gestureEndUptimeMs: gestureEndUptimeMs
+        )
+      }
+    }
+
+    return SequenceExecutionResult(
+      results: results,
+      completedSteps: completedSteps,
+      failedStepIndex: nil,
+      gestureStartUptimeMs: gestureStartUptimeMs,
+      gestureEndUptimeMs: gestureEndUptimeMs
+    )
+  }
+
+  struct SequenceExecutionResult {
+    let results: [SequenceStepResult]
+    let completedSteps: Int
+    let failedStepIndex: Int?
+    let gestureStartUptimeMs: Double?
+    let gestureEndUptimeMs: Double?
+  }
+
+  // MARK: - Step validation / execution
+
+  private func validateSequenceStep(_ step: SequenceStep, index: Int) -> Response? {
+    guard sequenceableStepKinds.contains(step.kind) else {
+      return sequenceInvalidArgs(
+        "sequence step \(index) has unsupported kind \"\(step.kind)\"; allowed: tap, doubleTap, longPress"
+      )
+    }
+    guard let x = step.x, let y = step.y, x.isFinite, y.isFinite else {
+      return sequenceInvalidArgs("sequence step \(index) (\(step.kind)) requires finite x and y")
+    }
+    return nil
+  }
+
+  @MainActor
+  private func performSequenceStep(
+    _ step: SequenceStep,
+    activeApp: XCUIApplication,
+    synthesizedContext: SynthesizedCoordinateContext? = nil
+  ) throws -> SequenceStepOutcome {
+    let x = step.x ?? 0
+    let y = step.y ?? 0
+    let longPressDurationMs = min(max(step.durationMs ?? 800, 16), 10000)
+    if let policyKind = synthesizedPolicyKind(forSequenceStep: step) {
+      switch try performSynthesizedGesture(activeApp, kind: policyKind, context: synthesizedContext, synthesize: {
+        try synthesizedSequenceStep(
+          policyKind,
+          app: activeApp,
+          x: x,
+          y: y,
+          longPressDurationMs: longPressDurationMs,
+          context: synthesizedContext
+        )
+      }) {
+      case .performed(let timing):
+        return finishedSequenceStep(step, timing: timing, outcome: .performed)
+      case .refused(let timing, let message, let hint):
+        return finishedSequenceStep(
+          step,
+          timing: timing,
+          outcome: .unsupported(message: message, hint: hint)
+        )
+      case .xctestFallback:
+        break
+      }
+    }
+    let (timing, outcome) = try performGesture(activeApp) {
+      // A refused coordinate gesture is this step's outcome: the steps that already ran keep their
+      // results, and the failed step reports the coded refusal instead of aborting the command.
+      do {
+        switch step.kind {
+        case "doubleTap":
+          // doubleTapAt per step, matching the behavior of the retired tapSeries doubleTap path.
+          return try doubleTapAt(app: activeApp, x: x, y: y)
+        case "longPress":
+          return try longPressAt(app: activeApp, x: x, y: y, duration: longPressDurationMs / 1000.0)
+        default:
+          return try tapAt(app: activeApp, x: x, y: y)
+        }
+      } catch let refusal as RunnerCoordinateRefusal {
+        return .unsupported(message: refusal.message, hint: refusal.hint)
+      }
+    }
+    return finishedSequenceStep(step, timing: timing, outcome: outcome)
+  }
+
+  @MainActor
+  private func synthesizedSequenceStep(
+    _ policyKind: SynthesizedGesturePolicyKind,
+    app: XCUIApplication,
+    x: Double,
+    y: Double,
+    longPressDurationMs: Double,
+    context: SynthesizedCoordinateContext?
+  ) throws -> RunnerInteractionOutcome? {
+    switch policyKind {
+#if os(iOS)
+    case .coordinateLongPress:
+      return try synthesizedLongPressAt(
+        app: app,
+        x: x,
+        y: y,
+        durationMs: longPressDurationMs,
+        context: context
+      )
+#endif
+    default:
+      return try synthesizedTapAt(app: app, x: x, y: y, context: context)
+    }
+  }
+
+  private func finishedSequenceStep(
+    _ step: SequenceStep,
+    timing: (gestureStartUptimeMs: Double, gestureEndUptimeMs: Double),
+    outcome: RunnerInteractionOutcome
+  ) -> SequenceStepOutcome {
+    // Sleep AFTER the step — pauseMs is the inter-step gap — but only when the step performed.
+    // assembleSequenceExecution stops at the first unsupported outcome, so pausing after a failed
+    // step would burn up to 10s of watchdog budget with no following step to separate from.
+    if case .performed = outcome, let pauseMs = step.pauseMs, pauseMs > 0 {
+      sleepFor(min(max(pauseMs, 0), 10000) / 1000.0)
+    }
+    return SequenceStepOutcome(
+      outcome: outcome,
+      gestureStartUptimeMs: timing.gestureStartUptimeMs,
+      gestureEndUptimeMs: timing.gestureEndUptimeMs
+    )
+  }
+
+  private func sequenceResponse(
+    execution: SequenceExecutionResult,
+    touchFrame: TouchVisualizationFrame?,
+    sequenceOrientation: Int?
+  ) -> Response {
+    return Response(
+      ok: true,
+      data: DataPayload(
+        message: "sequence",
+        gestureStartUptimeMs: execution.gestureStartUptimeMs,
+        gestureEndUptimeMs: execution.gestureEndUptimeMs,
+        x: touchFrame?.x,
+        y: touchFrame?.y,
+        referenceWidth: touchFrame?.referenceWidth,
+        referenceHeight: touchFrame?.referenceHeight,
+        completedSteps: execution.completedSteps,
+        sequenceOrientation: sequenceOrientation,
+        failedStepIndex: execution.failedStepIndex,
+        sequenceResults: execution.results
+      )
+    )
+  }
+
+  private func sequenceInvalidArgs(_ message: String) -> Response {
+    Response(ok: false, error: ErrorPayload(code: "INVALID_ARGS", message: message))
+  }
+}

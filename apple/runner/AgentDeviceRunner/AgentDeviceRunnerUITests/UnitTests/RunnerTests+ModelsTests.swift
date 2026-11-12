@@ -1,0 +1,403 @@
+import Foundation
+import XCTest
+
+#if AGENT_DEVICE_RUNNER_UNIT_TESTS
+extension RunnerTests {
+  func testErrorPayloadEncodesEveryFieldButTheRunnerInternalRetryableFailure() throws {
+    let payload = ErrorPayload(
+      code: "CODE",
+      message: "message",
+      hint: "hint",
+      retryableFailure: .targetAppUnavailable
+    )
+    let encoded = try JSONEncoder().encode(payload)
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    let storedFields = Set(Mirror(reflecting: payload).children.compactMap(\.label))
+    XCTAssertEqual(Set(object.keys), storedFields.subtracting(["retryableFailure"]))
+  }
+
+  func testTargetAppUnavailableErrorKeepsItsWireShape() throws {
+    let encoded = try JSONEncoder().encode(
+      ErrorPayload.targetAppUnavailable(bundleId: "com.example.app")
+    )
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    XCTAssertEqual(Array(object.keys), ["message"])
+    XCTAssertEqual(object["message"] as? String, "app 'com.example.app' is not available")
+    XCTAssertEqual(
+      ErrorPayload.targetAppUnavailable(bundleId: nil).message,
+      "runner app is not available"
+    )
+  }
+
+  func runnerCommandFixture(_ json: String) throws -> Command {
+    try JSONDecoder().decode(Command.self, from: Data(json.utf8))
+  }
+
+  func testProductionRunnerRequestsDecodeWithoutDroppingAKey() throws {
+    for (name, request) in try productionRunnerRequests() {
+      let command = try decodeProductionRunnerRequest(request, name)
+      XCTAssertEqual(command.command.rawValue, request["command"] as? String, name)
+      let reencoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(command))
+      XCTAssertEqual(runnerRequestKeyPaths(reencoded), runnerRequestKeyPaths(request), name)
+    }
+  }
+
+  func testEveryRunnerCommandTypeHasAProductionRequest() throws {
+    let produced = Set(try productionRunnerRequests().compactMap { $0.request["command"] as? String })
+    let orphaned = CommandType.allCases.map(\.rawValue).filter { !produced.contains($0) }
+    XCTAssertEqual(orphaned, [], "CommandType cases with no production request")
+  }
+
+  func testRunnerSurfacePreparationMatchesTheSharedPolicyFixture() throws {
+    let policies = try XCTUnwrap(runnerContractFixture("runner-surface-policy.json") as? [String: String])
+    XCTAssertEqual(policies, Dictionary(uniqueKeysWithValues: CommandType.allCases.map { ($0.rawValue, $0.surfacePolicy.rawValue) }))
+  }
+
+  func testQueuedReadOnlyTraitsMatchTheDaemonParityFixture() throws {
+    let rows = try XCTUnwrap(
+      runnerContractFixture("runner-command-read-only.json") as? [[String: Any]]
+    )
+    var covered = Set<CommandType>()
+    for row in rows {
+      let request = try XCTUnwrap(row["command"] as? [String: Any])
+      let name = String(describing: request)
+      let command = try decodeProductionRunnerRequest(request, name)
+      let readOnly = try XCTUnwrap(row["readOnly"] as? Bool, name)
+      XCTAssertNil(offQueueRoute(for: command), name)
+      XCTAssertEqual(command.traits.isReadOnly, readOnly, name)
+      covered.insert(command.command)
+    }
+    let queued = try Set(CommandType.allCases.filter { type in
+      let command = try runnerCommandFixture(#"{"command":"\#(type.rawValue)"}"#)
+      return offQueueRoute(for: command) == nil
+    })
+    XCTAssertEqual(covered, queued, "every queued CommandType needs parity coverage")
+  }
+
+  func testEveryRunnerRequestFieldHasAProductionRequest() throws {
+    let entries = try productionRunnerRequests()
+    let requests = entries.map(\.request)
+    let steps = requests.flatMap { $0["steps"] as? [[String: Any]] ?? [] }
+    let plans = requests.compactMap { $0["gesturePlan"] as? [String: Any] }
+    let pointers = plans.flatMap { $0["pointers"] as? [[String: Any]] ?? [] }
+    let samples = pointers.flatMap { $0["samples"] as? [[String: Any]] ?? [] }
+    let litPanels = requests.compactMap { $0["litPanel"] as? [String: Any] }
+    let commands = try entries.map { try decodeProductionRunnerRequest($0.request, $0.name) }
+    XCTAssertEqual(commands.compactMap(\.sequenceOrientation).first, 1)
+    let command = try XCTUnwrap(commands.first, "no production request")
+    let plan = try XCTUnwrap(
+      commands.compactMap(\.gesturePlan).first,
+      "no production request carries a gesturePlan"
+    )
+    let litPanel = try XCTUnwrap(
+      commands.compactMap(\.litPanel).first,
+      "no production request carries a litPanel, so a foldable's surface route would go unpinned"
+    )
+    let step = try JSONDecoder().decode(SequenceStep.self, from: Data(#"{"kind":"tap"}"#.utf8))
+    let sample = try XCTUnwrap(plan.pointers.first?.samples.first)
+    assertEveryStoredField(of: command, appearsIn: requests, "Command")
+    assertEveryStoredField(of: step, appearsIn: steps, "SequenceStep")
+    assertEveryStoredField(of: litPanel, appearsIn: litPanels, "RunnerLitPanelFact")
+    assertEveryStoredField(of: plan, appearsIn: plans, "RunnerGesturePlan")
+    assertEveryStoredField(
+      of: plan.viewport,
+      appearsIn: plans.compactMap { $0["viewport"] as? [String: Any] },
+      "RunnerGestureViewport"
+    )
+    assertEveryStoredField(of: plan.pointers[0], appearsIn: pointers, "RunnerGesturePointer")
+    assertEveryStoredField(of: sample, appearsIn: samples, "RunnerGestureSample")
+    assertEveryStoredField(
+      of: sample.point,
+      appearsIn: samples.compactMap { $0["point"] as? [String: Any] },
+      "RunnerGesturePoint"
+    )
+  }
+
+  private func productionRunnerRequests() throws -> [(name: String, request: [String: Any])] {
+    let entries = try XCTUnwrap(runnerContractFixture("runner-requests.json") as? [[String: Any]])
+    return try entries.map { entry in
+      (
+        name: try XCTUnwrap(entry["name"] as? String),
+        request: try XCTUnwrap(entry["request"] as? [String: Any], "\(entry["name"] ?? "?")")
+      )
+    }
+  }
+
+  private func runnerContractFixture(_ name: String) throws -> Any {
+    let fixtureURL = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .appendingPathComponent("contracts/fixtures/\(name)")
+    return try JSONSerialization.jsonObject(with: Data(contentsOf: fixtureURL))
+  }
+
+  private func decodeProductionRunnerRequest(_ request: [String: Any], _ name: String) throws
+    -> Command
+  {
+    do {
+      return try JSONDecoder().decode(
+        Command.self,
+        from: JSONSerialization.data(withJSONObject: request)
+      )
+    } catch {
+      XCTFail("\(name) does not decode as Command: \(error)")
+      throw error
+    }
+  }
+
+  private func runnerRequestKeyPaths(_ value: Any, _ prefix: String = "") -> Set<String> {
+    if let object = value as? [String: Any] {
+      return object.reduce(into: Set<String>()) { paths, field in
+        paths.insert(prefix + field.key)
+        paths.formUnion(runnerRequestKeyPaths(field.value, "\(prefix)\(field.key)."))
+      }
+    }
+    if let array = value as? [Any] {
+      return array.reduce(into: Set<String>()) { paths, element in
+        paths.formUnion(runnerRequestKeyPaths(element, "\(prefix)[]."))
+      }
+    }
+    return []
+  }
+
+  private func assertEveryStoredField(
+    of value: Any,
+    appearsIn objects: [[String: Any]],
+    _ level: String
+  ) {
+    let fields = Set(Mirror(reflecting: value).children.compactMap(\.label))
+    let produced = Set(objects.flatMap(\.keys))
+    XCTAssertEqual(
+      fields.subtracting(produced).sorted(),
+      [],
+      "\(level) fields with no production request"
+    )
+  }
+
+  /// One row's expectation, as literals. It deliberately does not build a `CommandTraits`: an
+  /// expectation constructed by the type under test moves with it, so a declaration that swapped or
+  /// rewrote a fact would keep such a row green. Each fact is compared below against its own
+  /// literal, and the named groups the classification resolves through are file-private to it
+  /// (#2890 review).
+  private struct ExpectedTraits {
+    let isInteraction: Bool
+    let retryOnSessionLoss: Bool
+    let launchPolicy: CommandLaunchPolicy
+    let convertsRecordedFailure: Bool
+    let retainsJournalResponseJson: Bool
+    let isReadOnly: Bool
+  }
+
+  private func expectation(
+    interaction: Bool,
+    retry: Bool,
+    launch: CommandLaunchPolicy,
+    converts: Bool,
+    retains: Bool,
+    isReadOnly: Bool
+  ) -> ExpectedTraits {
+    ExpectedTraits(
+      isInteraction: interaction,
+      retryOnSessionLoss: retry,
+      launchPolicy: launch,
+      convertsRecordedFailure: converts,
+      retainsJournalResponseJson: retains,
+      isReadOnly: isReadOnly
+    )
+  }
+
+  private func assertTraits(
+    _ traits: CommandTraits,
+    matches expectation: ExpectedTraits,
+    _ request: String
+  ) {
+    XCTAssertEqual(traits.isInteraction, expectation.isInteraction, "\(request) isInteraction")
+    XCTAssertEqual(
+      traits.retryOnSessionLoss,
+      expectation.retryOnSessionLoss,
+      "\(request) retryOnSessionLoss"
+    )
+    XCTAssertEqual(traits.launchPolicy, expectation.launchPolicy, "\(request) launchPolicy")
+    XCTAssertEqual(
+      traits.convertsRecordedFailure,
+      expectation.convertsRecordedFailure,
+      "\(request) convertsRecordedFailure"
+    )
+    XCTAssertEqual(
+      traits.retainsJournalResponseJson,
+      expectation.retainsJournalResponseJson,
+      "\(request) retainsJournalResponseJson"
+    )
+    XCTAssertEqual(traits.isReadOnly, expectation.isReadOnly, "\(request) isReadOnly")
+  }
+
+  /// The commands the merge-base classified read-only, copied from its `CommandType.traits`
+  /// (`git show 6428c54853:…/RunnerTests+Models.swift`) rather than read from anything under test:
+  /// `readOnly: .always`, plus `alert`'s `get` action, which its `.conditional` case resolved to the
+  /// same answer. Both consumers that fact had — replay eligibility and the prepared path's witness
+  /// rule — are pinned against this literal below, so neither can move with the table (#2890 review).
+  private static let mergeBaseReadOnlyCommands: Set<CommandType> = [
+    .findText, .readText, .snapshot, .gestureViewport, .screenshot, .status, .alert,
+  ]
+
+  /// Commands that did not exist at the merge-base, so no classification of its is compared with
+  /// theirs. `appState` arrived with #2929, `pasteboardWrite` with the runner-written simulator
+  /// clipboard, `snapshotBridge` with the runner-served Simulator AX bridge.
+  private static let commandsNewerThanTheMergeBase: Set<CommandType> = [
+    .appState, .pasteboardWrite, .volumeUp, .volumeDown, .snapshotBridge,
+  ]
+
+  /// The commands production never runs through the prepared path's body: `executeOnMain` answers
+  /// these before `executeOnMainPrepared` runs, `executeDispatched` answers `snapshot` earlier
+  /// still, on both this and the merge-base chain, and the transport answers `snapshotBridge` off
+  /// its queue before any of them. The merge-base witness predicate was therefore
+  /// never evaluated for them and neither is the derived one. If a command starts reaching the
+  /// prepared path, removing it here is a claim the equivalence assertion below has to keep proving.
+  private static let commandsAnsweredBeforeThePreparedPath: Set<CommandType> = [
+    .status, .uptime, .appState, .pasteboardWrite, .activate, .terminate, .targetReset, .shutdown,
+    .recordStart, .recordStop, .snapshot, .snapshotBridge,
+  ]
+
+  private func assertRememberedTextEntryWitnessInvalidation(
+    _ command: Command,
+    type: CommandType,
+    wasReadOnlyAtMergeBase: Bool,
+    _ request: String
+  ) {
+    if !Self.commandsNewerThanTheMergeBase.contains(type) {
+      XCTAssertEqual(
+        command.traits.retryOnSessionLoss,
+        wasReadOnlyAtMergeBase,
+        "\(request) must stay replayable exactly where the merge-base classified it read-only"
+      )
+    }
+    // The merge-base rule (`RunnerTests+CommandExecution.swift:11`):
+    // `command != .tap && command != .type && !isReadOnlyCommand(command)`. `querySelector` is the
+    // row this review round was about: it was never read-only, so the merge-base cleared a
+    // remembered tap for it too and this column says so for every command, not just that one.
+    let mergeBaseClears = type != .tap && type != .type && !wasReadOnlyAtMergeBase
+    guard !Self.commandsAnsweredBeforeThePreparedPath.contains(type) else { return }
+    XCTAssertEqual(
+      command.invalidatesRememberedTextEntryTap,
+      mergeBaseClears,
+      "\(request) must invalidate a remembered text-entry tap exactly as the merge-base did"
+    )
+  }
+
+  /// Every decision the runner makes from a classification, asserted for every command from one
+  /// table. `retry` is replay eligibility and `launch` is what the runner may do about a stopped
+  /// app: `querySelector` is the row that proves one does not set the other (#2890). Each row names
+  /// a concrete launch case, so re-pointing a command at another policy fails that row.
+  func testEveryCommandDeclaresEveryRunnerSideDecisionTogether() throws {
+    let table: [(CommandType, ExpectedTraits)] = [
+      (.tap, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.mouseClick, expectation(interaction: false, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.longPress, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.drag, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.remotePress, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.type, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.swipe, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.scroll, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.desktopScroll, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.findText, expectation(interaction: false, retry: true, launch: .existingApp, converts: false, retains: true, isReadOnly: true)),
+      (
+        .querySelector,
+        expectation(interaction: false, retry: false, launch: .existingApp, converts: true, retains: true, isReadOnly: true)
+      ),
+      (.readText, expectation(interaction: false, retry: true, launch: .existingApp, converts: false, retains: true, isReadOnly: true)),
+      (.snapshot, expectation(interaction: false, retry: true, launch: .existingApp, converts: false, retains: false, isReadOnly: true)),
+      (.screenshot, expectation(interaction: false, retry: true, launch: .noApp, converts: false, retains: false, isReadOnly: true)),
+      (.backInApp, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.backSystem, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.home, expectation(interaction: false, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.rotate, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.appSwitcher, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (
+        .actionButton,
+        expectation(interaction: false, retry: false, launch: .presentedSurface, converts: true, retains: true, isReadOnly: false)
+      ),
+      (
+        .volumeUp,
+        expectation(interaction: false, retry: false, launch: .presentedSurface, converts: true, retains: true, isReadOnly: false)
+      ),
+      (
+        .volumeDown,
+        expectation(interaction: false, retry: false, launch: .presentedSurface, converts: true, retains: true, isReadOnly: false)
+      ),
+      (.keyboardDismiss, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.keyboardReturn, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (
+        .alert,
+        expectation(interaction: false, retry: true, launch: .presentedSurface, converts: false, retains: true, isReadOnly: true)
+      ),
+      (.sequence, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.gesture, expectation(interaction: true, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (
+        .gestureViewport,
+        expectation(interaction: false, retry: true, launch: .existingApp, converts: false, retains: true, isReadOnly: true)
+      ),
+      (.recordStart, expectation(interaction: false, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.recordStop, expectation(interaction: false, retry: false, launch: .noApp, converts: false, retains: true, isReadOnly: false)),
+      (.status, expectation(interaction: false, retry: true, launch: .noApp, converts: false, retains: true, isReadOnly: true)),
+      (.uptime, expectation(interaction: false, retry: false, launch: .noApp, converts: false, retains: true, isReadOnly: false)),
+      (.appState, expectation(interaction: false, retry: true, launch: .noApp, converts: false, retains: true, isReadOnly: true)),
+      (.snapshotBridge, expectation(interaction: false, retry: true, launch: .noApp, converts: false, retains: false, isReadOnly: true)),
+      (.pasteboardWrite, expectation(interaction: false, retry: false, launch: .noApp, converts: false, retains: true, isReadOnly: false)),
+      (.activate, expectation(interaction: false, retry: false, launch: .mayLaunch, converts: true, retains: true, isReadOnly: false)),
+      (.terminate, expectation(interaction: false, retry: false, launch: .noApp, converts: false, retains: true, isReadOnly: false)),
+      (.targetReset, expectation(interaction: false, retry: false, launch: .noApp, converts: false, retains: true, isReadOnly: false)),
+      (.shutdown, expectation(interaction: false, retry: false, launch: .noApp, converts: false, retains: true, isReadOnly: false))
+    ]
+    for (type, rowExpectation) in table {
+      let request = #"{"command":"\#(type.rawValue)"}"#
+      let command = try runnerCommandFixture(request)
+      XCTAssertEqual(command.command, type, request)
+      assertTraits(command.traits, matches: rowExpectation, request)
+      assertRememberedTextEntryWitnessInvalidation(
+        command,
+        type: type,
+        wasReadOnlyAtMergeBase: Self.mergeBaseReadOnlyCommands.contains(type),
+        request
+      )
+    }
+    XCTAssertEqual(
+      Set(table.map { $0.0 }),
+      Set(CommandType.allCases),
+      "every command states its decisions in this table"
+    )
+
+    // The one payload-dependent command settles each fact per action: `get` changes nothing and may
+    // be replayed, while `accept` and `dismiss` mutate and must not be.
+    let alertCases: [(action: String?, expectation: ExpectedTraits)] = [
+      (nil, expectation(interaction: false, retry: true, launch: .presentedSurface, converts: false, retains: true, isReadOnly: true)),
+      ("get", expectation(interaction: false, retry: true, launch: .presentedSurface, converts: false, retains: true, isReadOnly: true)),
+      (
+        "accept",
+        expectation(interaction: false, retry: false, launch: .presentedSurface, converts: true, retains: true, isReadOnly: false)
+      ),
+      (
+        "dismiss",
+        expectation(interaction: false, retry: false, launch: .presentedSurface, converts: true, retains: true, isReadOnly: false)
+      )
+    ]
+    for alertCase in alertCases {
+      let request = alertCase.action.map { #"{"command":"alert","action":"\#($0)"}"# }
+        ?? #"{"command":"alert"}"#
+      let command = try runnerCommandFixture(request)
+      assertTraits(command.traits, matches: alertCase.expectation, request)
+      // The merge-base resolved `alert` through `readOnly: .conditional`, whose rule was this same
+      // action test, so only `get` — and the missing action it defaults to — was read-only there.
+      assertRememberedTextEntryWitnessInvalidation(
+        command,
+        type: .alert,
+        wasReadOnlyAtMergeBase: (command.action ?? "get").lowercased() == "get",
+        request
+      )
+    }
+  }
+}
+#endif

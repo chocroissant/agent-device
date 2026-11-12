@@ -1,0 +1,82 @@
+export type { TriggerAppEventCommandResult } from '../app-events.ts';
+export { assertResolvedAppsFilter, resolveAppsFilter } from '../app-inventory.ts';
+export type { AppsFilter } from '../app-inventory.ts';
+export type { AppStateCommandResult } from '../app-state.ts';
+export {
+  LOCAL_DEVICE_INVENTORY_PLATFORM_SELECTORS,
+  WEB_DESKTOP_DEVICE,
+  countDeviceInventoryByGroup,
+  filterDeviceInventoryProjection,
+  isDeviceClaimConflictReason,
+  projectProviderDeviceInventoryRequest,
+  providerInstanceUnallocatedError,
+} from '../device-inventory.ts';
+export type {
+  DeviceClaimConflictReason,
+  DeviceInventoryGroup,
+  DeviceInventoryGroupCounts,
+  DeviceInventoryRequest,
+  ProviderDeviceInventoryRequest,
+} from '../device-inventory.ts';
+export type {
+  DeviceInventoryProvider,
+  DeviceLease,
+  LeaseLifecycleContext,
+  LeaseLifecycleProvider,
+  ProviderAppCatalog,
+  ProviderAppCatalogHandler,
+  ProviderAppCatalogQuery,
+  ProviderDeviceInventoryOutcome,
+  ProviderDeviceInventorySource,
+} from '../device-provider.ts';
+export {
+  DEVICE_ROTATIONS,
+  DEVICE_ROTATION_SURFACE_INDEX,
+  FOLD_SCREEN_COORDINATE_SPACE,
+  MAX_FOLD_DURATION_MS,
+  MAX_FOLD_KEYFRAMES,
+  parseFoldInput,
+  parseFoldKeyframesJson,
+  FOLD_POSES,
+  FOLD_POSE_USAGE,
+  deviceRotationFromSurfaceIndex,
+  deviceRotationOrientation,
+  deviceRotationSurfaceDegrees,
+  foldPoseForHingeAngle,
+  isDeviceRotation,
+  ORIENTATION_REQUESTS,
+  parseOrientationRequest,
+  parseFoldPose,
+  HARDWARE_BUTTON_NAMES,
+  HARDWARE_BUTTON_NAME_LABELS,
+  HARDWARE_BUTTON_USAGE,
+  parseHardwareButtonPositionals,
+} from '../device-rotation.ts';
+export type { HardwareButton, HardwareButtonName } from '../device-rotation.ts';
+export {
+  TELEPHONY_ACTIONS,
+  TELEPHONY_CALL_ACTIONS,
+  TELEPHONY_USAGE,
+  parseTelephonyEventInput,
+  parseTelephonyPositionals,
+  telephonyPositionals,
+} from '../telephony-input.ts';
+export type {
+  DeviceRotation,
+  OrientationRequest,
+  FoldPose,
+  FoldKeyframe,
+  FoldScreenCoordinateSpace,
+  SetFoldPoseInput,
+} from '../device-rotation.ts';
+export type { TelephonyEventInput } from '../telephony-input.ts';
+export type { TelephonyCommandResult, TelephonyRuntimeOperations } from '../telephony-runtime.ts';
+export type { BootCommandResult, ShutdownCommandResult } from '../device.ts';
+export type {
+  ProviderDeviceInstallOptions,
+  ProviderDeviceInstallResult,
+  ProviderDeviceRuntime,
+  ProviderExpiredLeaseRecovery,
+  ProviderPortReverseOptions,
+} from '../provider-device-runtime.ts';
+export type { TargetShutdownResult } from '../target-shutdown-contract.ts';

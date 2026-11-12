@@ -1,0 +1,650 @@
+import { daemonPlatformServicesFixture } from '../__tests__/support/platform-services-fixture.ts';
+import fs from 'node:fs';
+
+import path from 'node:path';
+import { expect, test, vi } from 'vitest';
+import { SCREENSHOT_CROP_REASONS } from '@agent-device/contracts/capture';
+import type { Interactor, ScreenshotOptions } from '@agent-device/contracts/interactor-types';
+import {
+  bindLocalScreenshotInteractor,
+  defaultCaptureOnly,
+} from '@agent-device/contracts/screenshot-runtime';
+import type { RawSnapshotNode } from '@agent-device/kernel/snapshot';
+import {
+  ANDROID_EMULATOR,
+  IOS_DEVICE,
+  IOS_SIMULATOR,
+  mkdtempForTestSync,
+} from '@agent-device/test-kit';
+import { makeSession } from '../__tests__/support/session-factories.ts';
+import { contextFromFlags } from '../core/context.ts';
+import type { GenericPlatformExecutionParams } from '../core/generic-leaf-execution.ts';
+import { resolveScreenshotGenericExecution } from './screenshot-runtime.ts';
+import {
+  screenshotRuntimeFixture,
+  writeSolidPng,
+} from '../__tests__/support/screenshot-runtime-fixture.ts';
+import type { DaemonRequest } from '../index.ts';
+import type { SessionState } from '../core/session-state.ts';
+import { screenshotCommandSurface as testCreateCommandSurface } from '../__tests__/support/screenshot-command-surface-fake.ts';
+
+const unavailableCapture = Object.freeze({
+  available: false,
+  reason: 'unsupported-platform-leaf' as const,
+  hint: 'screenshot is not supported on Vega OS: the Vega runtime exposes remote navigation only.',
+});
+
+function screenshotRequest(overrides: Partial<DaemonRequest> = {}): DaemonRequest {
+  return {
+    command: 'screenshot',
+    token: 'test-token',
+    session: 'default',
+    positionals: [],
+    ...overrides,
+  };
+}
+
+function executionParams(
+  session: SessionState,
+  req: DaemonRequest,
+  dispatchContext: GenericPlatformExecutionParams['dispatchContext'] = {},
+): GenericPlatformExecutionParams {
+  return {
+    session,
+    sessionName: session.name,
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    command: 'screenshot',
+    request: req,
+    positionals: req.positionals ?? [],
+    out: req.flags?.out,
+    dispatchContext,
+  };
+}
+
+async function executeResult(
+  resolved: Awaited<ReturnType<typeof resolveScreenshotGenericExecution>>,
+  session: SessionState,
+  req: DaemonRequest,
+  dispatchContext?: GenericPlatformExecutionParams['dispatchContext'],
+): Promise<Record<string, unknown>> {
+  if (!resolved.ok) throw new Error('the screenshot plan must be admitted');
+  const result = await resolved.execute(executionParams(session, req, dispatchContext));
+  if (result === undefined) throw new Error('the screenshot leaf returns a result record');
+  return result;
+}
+
+test('admits one capture plan, binds once, and hands the runtime the resolved destination', async () => {
+  const fixture = screenshotRuntimeFixture();
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+  const outPath = path.join(
+    mkdtempForTestSync('agent-device-bound-capture'),
+    `agent-device-bound-capture-${Date.now()}.png`,
+  );
+  const req = screenshotRequest({ positionals: [outPath] });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+
+  expect(resolved.ok).toBe(true);
+  if (!resolved.ok) return;
+  expect(fixture.binds).toHaveLength(1);
+  await resolved.execute(executionParams(session, req));
+  expect(fixture.captureScreenshot).toHaveBeenCalledTimes(1);
+  expect(fixture.captureScreenshot.mock.calls[0]?.[0]).toMatchObject({ outPath });
+  expect(fs.existsSync(outPath)).toBe(true);
+});
+
+test('an iOS simulator session capture skips the redundant boot probe', async () => {
+  const fixture = screenshotRuntimeFixture();
+  const session = makeSession('ios', { device: IOS_SIMULATOR });
+  const outPath = path.join(
+    mkdtempForTestSync('agent-device-ios-boot-probe'),
+    `agent-device-ios-boot-probe-${Date.now()}.png`,
+  );
+  const req = screenshotRequest({ positionals: [outPath] });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+  if (!resolved.ok) throw new Error('screenshot admission must succeed');
+  await resolved.execute(executionParams(session, req));
+
+  expect(fixture.captureScreenshot.mock.calls[0]?.[0].options).toMatchObject({
+    skipIosSimulatorBootCheck: true,
+  });
+});
+
+test('refuses an unavailable exact-owner capture fact before binding', async () => {
+  const fixture = screenshotRuntimeFixture({ capture: unavailableCapture });
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: screenshotRequest({ positionals: ['/tmp/unsupported.png'] }),
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+
+  expect(resolved).toEqual({
+    ok: false,
+    response: {
+      ok: false,
+      error: {
+        code: 'UNSUPPORTED_OPERATION',
+        message: 'screenshot is not supported on this device',
+        hint: unavailableCapture.hint,
+        details: { reason: 'unsupported-platform-leaf' },
+      },
+    },
+  });
+  expect(fixture.binds).toHaveLength(0);
+  expect(fixture.captureScreenshot).not.toHaveBeenCalled();
+});
+
+test('--overlay-refs is refused up front when the target cannot capture a tree', async () => {
+  const fixture = screenshotRuntimeFixture({
+    snapshot: { available: false, reason: 'unsupported-platform-leaf' },
+  });
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: screenshotRequest({ positionals: ['/tmp/overlay.png'], flags: { overlayRefs: true } }),
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+
+  expect(resolved.ok).toBe(false);
+  if (resolved.ok) return;
+  expect(resolved.response).toMatchObject({
+    ok: false,
+    error: {
+      code: 'UNSUPPORTED_OPERATION',
+      hint: 'Re-run screenshot without --overlay-refs.',
+    },
+  });
+  // Nothing was captured: a plan that cannot annotate never writes a PNG the caller must discard.
+  expect(fixture.binds).toHaveLength(0);
+  expect(fixture.captureScreenshot).not.toHaveBeenCalled();
+});
+
+test('the default destination is a reserved temp file, removed when the capture fails', async () => {
+  let requestedPath: string | undefined;
+  const fixture = screenshotRuntimeFixture({
+    onCapture: (input) => {
+      requestedPath = input.outPath;
+      throw new Error('capture failed');
+    },
+  });
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+  const req = screenshotRequest();
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+  if (!resolved.ok) throw new Error('screenshot admission must succeed');
+
+  await expect(resolved.execute(executionParams(session, req))).rejects.toThrow(/capture failed/);
+  expect(path.basename(requestedPath ?? '')).toBe('screenshot.png');
+  expect(path.basename(path.dirname(requestedPath ?? ''))).toContain('agent-device-screenshot-');
+  expect(fs.existsSync(path.dirname(requestedPath ?? ''))).toBe(false);
+});
+
+test('rejects the retired max-size field before inspecting owner facts', async () => {
+  const fixture = screenshotRuntimeFixture();
+  const session = makeSession('default', { device: IOS_SIMULATOR });
+
+  await expect(
+    resolveScreenshotGenericExecution({
+      hostCwd: process.cwd(),
+      createCommandSurface: testCreateCommandSurface,
+      platformServices: daemonPlatformServicesFixture(),
+      req: screenshotRequest({
+        positionals: ['/tmp/legacy.png'],
+        flags: { screenshotMaxSize: 720 } as unknown as DaemonRequest['flags'],
+      }),
+      session,
+      inspectFacts: fixture.inspectFacts,
+      bindDevice: fixture.bindDevice,
+    }),
+  ).rejects.toMatchObject({ code: 'INVALID_ARGS' });
+  expect(fixture.binds).toHaveLength(0);
+});
+
+test('rejects --pixel-density outside iOS-family simulators before inspecting owner facts', async () => {
+  const fixture = screenshotRuntimeFixture();
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+
+  await expect(
+    resolveScreenshotGenericExecution({
+      hostCwd: process.cwd(),
+      createCommandSurface: testCreateCommandSurface,
+      platformServices: daemonPlatformServicesFixture(),
+      req: screenshotRequest({
+        positionals: ['/tmp/android.png'],
+        flags: { screenshotPixelDensity: 2 },
+      }),
+      session,
+      inspectFacts: fixture.inspectFacts,
+      bindDevice: fixture.bindDevice,
+    }),
+  ).rejects.toMatchObject({ code: 'UNSUPPORTED_OPERATION' });
+  expect(fixture.binds).toHaveLength(0);
+});
+
+test('refuses --capture-backend runner with --pixel-density or --normalize-status-bar, and any other backend, before inspecting owner facts', async () => {
+  const refused = async (
+    device: SessionState['device'],
+    // The wire flags are untyped, so a request can name a backend the type does not list.
+    flags: Record<string, unknown>,
+    code: string,
+  ): Promise<void> => {
+    const fixture = screenshotRuntimeFixture();
+    await expect(
+      resolveScreenshotGenericExecution({
+        hostCwd: process.cwd(),
+        createCommandSurface: testCreateCommandSurface,
+        platformServices: daemonPlatformServicesFixture(),
+        req: screenshotRequest({
+          positionals: ['/tmp/runner.png'],
+          flags: flags as DaemonRequest['flags'],
+        }),
+        session: makeSession('default', { device }),
+        inspectFacts: fixture.inspectFacts,
+        bindDevice: fixture.bindDevice,
+      }),
+    ).rejects.toMatchObject({ code });
+    expect(fixture.binds).toHaveLength(0);
+  };
+
+  await refused(
+    IOS_SIMULATOR,
+    { screenshotCaptureBackend: 'runner', screenshotPixelDensity: 3 },
+    'INVALID_ARGS',
+  );
+  await refused(
+    IOS_SIMULATOR,
+    { screenshotCaptureBackend: 'runner', screenshotNormalizeStatusBar: true },
+    'INVALID_ARGS',
+  );
+  await refused(IOS_SIMULATOR, { screenshotCaptureBackend: 'simctl' }, 'INVALID_ARGS');
+});
+
+async function captureThroughRealBinding(
+  params: Readonly<{
+    device: SessionState['device'];
+    flags: DaemonRequest['flags'];
+    captureCapabilities: Parameters<typeof bindLocalScreenshotInteractor>[0]['captureCapabilities'];
+  }>,
+) {
+  const fixture = screenshotRuntimeFixture();
+  const screenshot = vi.fn(async (outPath: string, _options?: ScreenshotOptions) => {
+    writeSolidPng(outPath);
+    return {};
+  });
+  fixture.captureScreenshot.mockImplementation(
+    bindLocalScreenshotInteractor({
+      device: params.device,
+      signal: new AbortController().signal,
+      resolveInteractor: async () => ({ screenshot }) as unknown as Interactor,
+      captureCapabilities: params.captureCapabilities,
+    }).captureScreenshot,
+  );
+  const session = makeSession('capture', { device: params.device });
+  const req = screenshotRequest({
+    positionals: [path.join(mkdtempForTestSync('agent-device-bound-capture'), 'capture.png')],
+    flags: params.flags,
+  });
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+  return {
+    screenshot,
+    execute: async () =>
+      await executeResult(resolved, session, req, contextFromFlags('/tmp/daemon.log', req.flags)),
+  };
+}
+
+test('a Maestro comparison capture reaches the interactor as a runner capture where the owner declares it', async () => {
+  const { screenshot, execute } = await captureThroughRealBinding({
+    device: IOS_SIMULATOR,
+    flags: { maestro: { screenshotCaptureBackend: 'runner' } },
+    captureCapabilities: () => ({ captureBackends: ['runner'] }),
+  });
+
+  await execute();
+
+  expect(screenshot.mock.calls[0]?.[1]).toMatchObject({ captureBackend: 'runner' });
+  expect(screenshot.mock.calls[0]?.[1]).not.toHaveProperty('preferredCaptureBackend');
+});
+
+test('a Maestro comparison capture keeps the default capture of an owner that declares no runner', async () => {
+  const { screenshot, execute } = await captureThroughRealBinding({
+    device: IOS_SIMULATOR,
+    flags: { maestro: { screenshotCaptureBackend: 'runner' } },
+    captureCapabilities: defaultCaptureOnly('this owner has one capture path'),
+  });
+
+  await execute();
+
+  expect(screenshot.mock.calls[0]?.[1]).not.toHaveProperty('captureBackend');
+});
+
+test('an Android session refuses --capture-backend runner at its capture owner', async () => {
+  const { screenshot, execute } = await captureThroughRealBinding({
+    device: ANDROID_EMULATOR,
+    flags: { screenshotCaptureBackend: 'runner' },
+    captureCapabilities: defaultCaptureOnly('an Android device captures through adb'),
+  });
+
+  await expect(execute()).rejects.toMatchObject({
+    code: 'UNSUPPORTED_OPERATION',
+    details: { reason: 'screenshot-capture-backend-unsupported' },
+  });
+  expect(screenshot).not.toHaveBeenCalled();
+});
+
+test('a --capture-backend runner request reaches the bound capture', async () => {
+  const fixture = screenshotRuntimeFixture();
+  const session = makeSession('ios', { device: IOS_SIMULATOR });
+  const req = screenshotRequest({
+    positionals: [path.join(mkdtempForTestSync('agent-device-runner-capture'), 'runner.png')],
+    flags: { screenshotCaptureBackend: 'runner' },
+  });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+
+  await executeResult(resolved, session, req, contextFromFlags('/tmp/daemon.log', req.flags));
+  expect(fixture.captureScreenshot.mock.calls[0]?.[0]?.options?.captureBackend).toBe('runner');
+});
+
+const CROP_TREE_ROOT = {
+  index: 0,
+  depth: 0,
+  type: 'android.widget.FrameLayout',
+  rect: { x: 0, y: 0, width: 100, height: 50 },
+} satisfies RawSnapshotNode;
+
+const CROP_TREE = [
+  CROP_TREE_ROOT,
+  {
+    index: 1,
+    depth: 1,
+    parentIndex: 0,
+    type: 'android.widget.Button',
+    label: 'Save',
+    rect: { x: 10, y: 10, width: 40, height: 20 },
+  },
+];
+
+test('the crop runs against the platform screenshot dimensions', async () => {
+  const fixture = screenshotRuntimeFixture({
+    snapshotResult: () => ({
+      nodes: CROP_TREE,
+      backend: 'android',
+      producer: 'android-uiautomator',
+    }),
+  });
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+  const outPath = path.join(
+    mkdtempForTestSync('agent-device-crop-order'),
+    `agent-device-crop-order-${Date.now()}.png`,
+  );
+  const req = screenshotRequest({
+    positionals: [outPath],
+    flags: { screenshotCropOn: 'label="Save"' },
+  });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+  const result = await executeResult(resolved, session, req);
+
+  expect(fixture.captureScreenshot).toHaveBeenCalledTimes(1);
+  expect(fixture.captureSnapshot).toHaveBeenCalledTimes(1);
+  expect(result).toMatchObject({ width: 40, height: 20 });
+  expect(fixture.captureSnapshot.mock.calls[0]?.[0].options).toMatchObject({
+    interactiveOnly: false,
+    includeRects: true,
+  });
+});
+
+test('a partial crop surfaces its warning once in the result record and annotates nothing', async () => {
+  const fixture = screenshotRuntimeFixture({
+    snapshotResult: () => ({
+      nodes: [
+        CROP_TREE_ROOT,
+        {
+          index: 1,
+          depth: 1,
+          parentIndex: 0,
+          type: 'android.widget.Button',
+          label: 'Save',
+          rect: { x: 80, y: 10, width: 50, height: 20 },
+        },
+      ],
+      backend: 'android',
+      producer: 'android-uiautomator',
+    }),
+  });
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+  const outPath = path.join(
+    mkdtempForTestSync('agent-device-crop-warning'),
+    `agent-device-crop-warning-${Date.now()}.png`,
+  );
+  const req = screenshotRequest({
+    positionals: [outPath],
+    flags: { screenshotCropOn: 'label="Save"' },
+  });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+  const result = await executeResult(resolved, session, req);
+
+  expect(result.warnings).toEqual([
+    expect.stringMatching(new RegExp(`^${SCREENSHOT_CROP_REASONS.partialIntersection}:`)),
+  ]);
+  // The crop plan binds the snapshot for the crop alone: no overlay refs, no republished tree.
+  expect(result).not.toHaveProperty('overlayRefs');
+  expect(session.snapshot).toBeUndefined();
+});
+
+test('the crop plan is refused up front when the target cannot capture a tree', async () => {
+  const fixture = screenshotRuntimeFixture({
+    snapshot: { available: false, reason: 'unsupported-platform-leaf' },
+  });
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: screenshotRequest({
+      positionals: ['/tmp/crop.png'],
+      flags: { screenshotCropOn: 'label="Save"' },
+    }),
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+
+  expect(resolved.ok).toBe(false);
+  if (resolved.ok) return;
+  expect(resolved.response).toMatchObject({
+    ok: false,
+    error: {
+      code: 'UNSUPPORTED_OPERATION',
+      details: { reason: 'unsupported-platform-leaf' },
+      hint: 'Re-run screenshot without --crop-on.',
+    },
+  });
+  expect(fixture.binds).toHaveLength(0);
+  expect(fixture.captureScreenshot).not.toHaveBeenCalled();
+});
+
+test('the result record carries the display rotation the capture reported', async () => {
+  const fixture = screenshotRuntimeFixture({
+    onCapture: (input) => {
+      writeSolidPng(input.outPath);
+      return { displayRotation: 'landscape-left' };
+    },
+  });
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+  const outPath = path.join(mkdtempForTestSync('agent-device-display-rotation'), 'shot.png');
+  const req = screenshotRequest({ positionals: [outPath] });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+
+  expect(await executeResult(resolved, session, req)).toMatchObject({
+    path: outPath,
+    displayRotation: 'landscape-left',
+  });
+});
+
+test('the result record omits the display rotation when the capture reported none', async () => {
+  const fixture = screenshotRuntimeFixture();
+  const session = makeSession('default', { device: ANDROID_EMULATOR });
+  const outPath = path.join(mkdtempForTestSync('agent-device-display-rotation'), 'shot.png');
+  const req = screenshotRequest({ positionals: [outPath] });
+
+  const resolved = await resolveScreenshotGenericExecution({
+    hostCwd: process.cwd(),
+    createCommandSurface: testCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    session,
+    inspectFacts: fixture.inspectFacts,
+    bindDevice: fixture.bindDevice,
+  });
+
+  expect(await executeResult(resolved, session, req)).not.toHaveProperty('displayRotation');
+});
+
+for (const backend of ['coredevice', 'xctest', undefined] as const) {
+  for (const crop of [false, true]) {
+    test(`physical iPhone capture backend=${backend}, crop=${crop} enforces capture evidence`, async () => {
+      const fixture = screenshotRuntimeFixture({
+        onCapture: ({ outPath }) => {
+          writeSolidPng(outPath);
+          return backend ? { iosPhysicalCaptureBackend: backend } : {};
+        },
+        snapshotResult: () => ({ nodes: CROP_TREE, backend: 'xctest', producer: 'apple-runner' }),
+      });
+      const session = makeSession('iphone', { device: IOS_DEVICE });
+      const outPath = path.join(mkdtempForTestSync('physical-crop'), 'screen.png');
+      const req = screenshotRequest({
+        positionals: [outPath],
+        flags: crop ? { screenshotCropOn: 'label="Save"' } : {},
+      });
+      const resolved = await resolveScreenshotGenericExecution({
+        hostCwd: process.cwd(),
+        createCommandSurface: testCreateCommandSurface,
+        platformServices: daemonPlatformServicesFixture(),
+        req,
+        session,
+        inspectFacts: fixture.inspectFacts,
+        bindDevice: fixture.bindDevice,
+      });
+      if (crop && backend !== 'coredevice') {
+        await expect(executeResult(resolved, session, req)).rejects.toMatchObject({
+          code: 'UNSUPPORTED_OPERATION',
+          message:
+            'screenshot --crop-on is not accepted on ios-physical-non-coredevice-capture targets',
+          details: {
+            reason: SCREENSHOT_CROP_REASONS.targetNotAccepted,
+            rejectionReason: SCREENSHOT_CROP_REASONS.pendingPixelIdentityEvidence,
+          },
+        });
+        expect(fixture.captureSnapshot).not.toHaveBeenCalled();
+      } else {
+        const result = await executeResult(resolved, session, req);
+        expect(result).toMatchObject(crop ? { width: 40, height: 20 } : { width: 100, height: 50 });
+        expect(fixture.captureSnapshot).toHaveBeenCalledTimes(crop ? 1 : 0);
+      }
+      expect(fixture.captureScreenshot).toHaveBeenCalledTimes(1);
+    });
+  }
+}
+
+test('a request screen mask reaches the bound simulator capture without changing later requests', async () => {
+  const fixture = screenshotRuntimeFixture();
+  const session = makeSession('ios-mask', { device: IOS_SIMULATOR });
+  const outPath = path.join(mkdtempForTestSync('screen-mask-request'), 'screen.png');
+  for (const screenMask of ['black', undefined] as const) {
+    const req = screenshotRequest({
+      positionals: [outPath],
+      flags: screenMask ? { screenshotScreenMask: screenMask } : {},
+    });
+    const resolved = await resolveScreenshotGenericExecution({
+      hostCwd: process.cwd(),
+      createCommandSurface: testCreateCommandSurface,
+      platformServices: daemonPlatformServicesFixture(),
+      req,
+      session,
+      inspectFacts: fixture.inspectFacts,
+      bindDevice: fixture.bindDevice,
+    });
+    await executeResult(resolved, session, req, req.flags);
+    expect(fixture.captureScreenshot.mock.lastCall?.[0].options?.screenMask).toBe(screenMask);
+  }
+});

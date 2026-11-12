@@ -1,0 +1,222 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { test } from 'vitest';
+import {
+  acceptSnapshotBridgeEnvelope,
+  assertSnapshotBridgeEnvelope,
+  bridgeFailureFromEnvelope,
+  createSnapshotBridgeDescribeRequest,
+  encodeSnapshotBridgeFrame,
+  parseSnapshotBridgeEnvelope,
+  SNAPSHOT_SOURCE_PROTOCOL_VERSION,
+  SNAPSHOT_SOURCE_ATTRIBUTE_KEYS,
+  SNAPSHOT_SOURCE_RESPONSE_KEYS,
+  SNAPSHOT_SOURCE_VERSION,
+  SNAPSHOT_SOURCE_WIRE_KEYS,
+  SnapshotBridgeFrameDecoder,
+} from './protocol.ts';
+import type { SnapshotSourceLimits } from './types.ts';
+import { IOS_SYSTEM_SURFACE_HOSTS } from '@agent-device/contracts/ios-system-surface';
+import { SnapshotSourceError } from '@agent-device/capture-kit/snapshot-source-channel';
+
+const limits: SnapshotSourceLimits = {
+  maxRequestBytes: 1024,
+  maxResponseBytes: 4096,
+  maxNodes: 20,
+  maxTraversalDepth: 10,
+  maxDurationMs: 1000,
+};
+
+const wireVocabulary = JSON.parse(
+  await readFile(path.join(import.meta.dirname, 'fixtures', 'wire-vocabulary.json'), 'utf8'),
+) as {
+  protocolVersion: number;
+  sourceVersion: string;
+  requestKeys: string[];
+  responseKeys: string[];
+  attributeKeys: string[];
+};
+
+test('snapshot bridge frames decode a split frame and reject trailing frames', () => {
+  const first = encodeSnapshotBridgeFrame({ requestId: 'one', value: 1 }, limits);
+  const second = encodeSnapshotBridgeFrame({ requestId: 'two', value: 2 }, limits);
+  const decoder = new SnapshotBridgeFrameDecoder(limits.maxResponseBytes);
+
+  assert.equal(decoder.push(first.subarray(0, 3)), undefined);
+  assert.deepEqual(decoder.push(first.subarray(3)), Buffer.from('{"requestId":"one","value":1}'));
+  assert.deepEqual(decoder.finish(), Buffer.from('{"requestId":"one","value":1}'));
+  assert.throws(() => decoder.push(second), /multiple-frames/);
+});
+
+test('snapshot bridge frames reject bounded request and response violations', () => {
+  assert.throws(
+    () => encodeSnapshotBridgeFrame({ payload: 'x'.repeat(2000) }, limits),
+    (error: unknown) =>
+      error instanceof Error &&
+      'failureCode' in error &&
+      (error as { failureCode: string }).failureCode === 'request-limit-exceeded',
+  );
+
+  const decoder = new SnapshotBridgeFrameDecoder(10);
+  const oversized = Buffer.alloc(4);
+  oversized.writeUInt32BE(11, 0);
+  assert.throws(() => decoder.push(oversized), /frame-limit-exceeded/);
+});
+
+test('snapshot bridge envelopes pin protocol, source, and request identity', () => {
+  const request = createSnapshotBridgeDescribeRequest({
+    requestId: 'request-1',
+    pid: 123,
+    generation: 'generation-1',
+    maxDepth: 4,
+    maxNodes: 10,
+    maxDurationMs: 900,
+    maxResponseBytes: 4096,
+  });
+  assert.deepEqual(request, {
+    verb: 'describe',
+    requestId: 'request-1',
+    pid: 123,
+    generation: 'generation-1',
+    snapshotTree: true,
+    automationMode: true,
+    maxDepth: 4,
+    maxNodes: 10,
+    maxDurationMs: 900,
+    maxResponseBytes: 4096,
+  });
+
+  const envelope = parseSnapshotBridgeEnvelope(
+    Buffer.from(
+      JSON.stringify({
+        protocolVersion: SNAPSHOT_SOURCE_PROTOCOL_VERSION,
+        sourceVersion: SNAPSHOT_SOURCE_VERSION,
+        requestId: 'request-1',
+      }),
+    ),
+  );
+  assert.doesNotThrow(() => assertSnapshotBridgeEnvelope(envelope, 'request-1'));
+  assert.throws(() => assertSnapshotBridgeEnvelope(envelope, 'request-2'), /request-id-mismatch/);
+});
+
+test('snapshot bridge failures stay typed at the guest boundary', () => {
+  for (const [guestKind, expectedKind] of [
+    ['unsupported', 'unsupported'],
+    ['malformed_tree', 'malformed-tree'],
+    ['application_not_responding', 'timeout'],
+    ['application_unavailable', 'transport-failure'],
+    ['bad_request', 'malformed-tree'],
+    ['response_limit_exceeded', 'transport-failure'],
+  ] as const) {
+    assert.throws(
+      () =>
+        bridgeFailureFromEnvelope({
+          error_kind: guestKind,
+          error_code: 'fixture-code',
+        }),
+      (error: unknown) =>
+        error instanceof Error &&
+        'failureKind' in error &&
+        (error as { failureKind: string }).failureKind === expectedKind,
+    );
+  }
+});
+
+test('a refusal that names no target keeps its own typed failure', () => {
+  assert.throws(
+    () =>
+      acceptSnapshotBridgeEnvelope(
+        {
+          protocolVersion: SNAPSHOT_SOURCE_PROTOCOL_VERSION,
+          sourceVersion: SNAPSHOT_SOURCE_VERSION,
+          requestId: 'request-1',
+          ok: false,
+          error_kind: 'bad_request',
+          error_code: 'bounds-invalid',
+        },
+        { requestId: 'request-1', pid: 123, generation: 'generation-1' },
+      ),
+    (error: unknown) =>
+      error instanceof SnapshotSourceError &&
+      error.failureKind === 'malformed-tree' &&
+      error.failureCode === 'bounds-invalid',
+  );
+});
+
+test('a surface host refusal names the running host executable', () => {
+  assert.throws(
+    () =>
+      bridgeFailureFromEnvelope({
+        error_kind: 'unsupported',
+        error_code: 'system-surface-host-present',
+        surfaceHostExecutable: 'SafariViewService.app/SafariViewService',
+      }),
+    (error: unknown) =>
+      error instanceof SnapshotSourceError &&
+      error.failureKind === 'unsupported' &&
+      error.failureCode === 'system-surface-host-present' &&
+      error.details?.surfaceHostExecutable === 'SafariViewService.app/SafariViewService',
+  );
+});
+
+// The route sends every registered host executable on each checked request (#2751). A registry the
+// guest's bounds refuse would answer `surface-hosts-invalid` and retire the generation, so the
+// registry must stay inside the bounds the guest validates.
+test('every registered surface host fits the bounds the guest validates', async () => {
+  const native = await readFile(
+    path.join(import.meta.dirname, '../../../../apple/snapshot-bridge/SnapshotBridgeRequest.m'),
+    'utf8',
+  );
+  const bound = (name: string) => Number(native.match(new RegExp(`${name} = (\\d+);`))?.[1]);
+  const maximumHosts = bound('kMaximumSurfaceHosts');
+  const maximumLength = bound('kMaximumSurfaceHostExecutableLength');
+
+  assert.ok(maximumHosts > 0 && maximumLength > 0, 'guest bounds not found');
+  assert.ok(IOS_SYSTEM_SURFACE_HOSTS.length <= maximumHosts);
+  for (const host of IOS_SYSTEM_SURFACE_HOSTS) {
+    assert.ok(host.processExecutable.length > 0);
+    assert.ok(host.processExecutable.length <= maximumLength);
+  }
+});
+
+test('wire vocabulary guard keeps TS and Objective-C literals aligned', async () => {
+  const native = await Promise.all(
+    [
+      'SnapshotBridge.m',
+      'SnapshotBridgeRequest.h',
+      'SnapshotBridgeRequest.m',
+      'SnapshotBridgeRuntime.m',
+      'SnapshotBridgeRuntime.h',
+      'SnapshotBridgeCapture.h',
+      'SnapshotBridgeCapture.m',
+      'SnapshotBridgeSurfaceHosts.m',
+    ].map((fileName) =>
+      readFile(
+        path.join(import.meta.dirname, '../../../../apple/snapshot-bridge', fileName),
+        'utf8',
+      ),
+    ),
+  );
+  const nativeSource = native.join('\n');
+  assert.equal(wireVocabulary.protocolVersion, SNAPSHOT_SOURCE_PROTOCOL_VERSION);
+  assert.equal(wireVocabulary.sourceVersion, SNAPSHOT_SOURCE_VERSION);
+  assert.deepEqual(wireVocabulary.requestKeys, SNAPSHOT_SOURCE_WIRE_KEYS);
+  assert.deepEqual(wireVocabulary.responseKeys, SNAPSHOT_SOURCE_RESPONSE_KEYS);
+  assert.deepEqual(wireVocabulary.attributeKeys, SNAPSHOT_SOURCE_ATTRIBUTE_KEYS);
+  assert.match(nativeSource, /^#define SNAPSHOT_BRIDGE_PROTOCOL_VERSION 1$/m);
+  assert.match(
+    nativeSource,
+    /^#define SNAPSHOT_BRIDGE_SOURCE_VERSION @"agent-device-simulator-ax-v1\.10\.0"$/m,
+  );
+  for (const key of [
+    ...wireVocabulary.requestKeys,
+    ...wireVocabulary.responseKeys,
+    ...wireVocabulary.attributeKeys,
+  ]) {
+    assert.match(
+      nativeSource,
+      new RegExp(`@"${key.replaceAll(/[.*+?^${}()|[\\]\\\\]/g, String.raw`\$&`)}"`),
+    );
+  }
+});

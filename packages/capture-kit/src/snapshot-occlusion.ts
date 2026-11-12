@@ -1,0 +1,682 @@
+import type { RawSnapshotNode, Rect, SnapshotCoveringNode } from '@agent-device/kernel/snapshot';
+import {
+  centerOfRect,
+  formatRole,
+  SNAPSHOT_COVERING_LABEL_MAX_LENGTH,
+} from '@agent-device/kernel/snapshot';
+import { areRectsApproximatelyEqual, normalizeRect } from '@agent-device/kernel/rect-center';
+import { containsPoint, rectContains } from '@agent-device/kernel/rect';
+import {
+  isScrollableNodeLike,
+  normalizeType,
+  isViewportRootNode,
+} from '@agent-device/contracts/snapshot';
+
+const COVERED_PRESENTATION_HINT = 'covered';
+const OVERLAY_KIND_FRAGMENTS = [
+  'tabbar',
+  'toolbar',
+  'navigationbar',
+  'bottomnavigation',
+  'bottomnavigationview',
+  'sheet',
+  'dialog',
+  'alert',
+  'popover',
+  'menu',
+];
+const VIEWPORT_CHROME_KIND_FRAGMENTS = ['tabbar', 'toolbar', 'navigationbar'];
+const FLOATING_BAR_CONTAINER_ROLE = '_UIFloatingBarContainerView';
+/**
+ * How far below the viewport top a full-viewport chrome container may start, before the 0.5pt rect
+ * tolerance. On iOS 27 an app that draws a 2pt bar at the top gets a `_UIFloatingBarContainerView`
+ * at y=2 (#3883). A container that starts below the status bar is tens of points down and gets no
+ * exemption from this check.
+ */
+const VIEWPORT_CHROME_TOP_INSET_PT = 4;
+const TOOLBAR_HOST_KIND_FRAGMENTS = ['toolbar'];
+const TAB_BAR_KIND_FRAGMENTS = ['tabbar'];
+const SCROLL_INDICATOR_KIND_FRAGMENTS = ['scrollbar', 'scrollindicator'];
+const SEMANTIC_TOUCH_KIND_FRAGMENTS = [
+  'button',
+  'link',
+  'menuitem',
+  'tabitem',
+  'textfield',
+  'searchfield',
+  'edittext',
+  'checkbox',
+  'radio',
+  'switch',
+  'cell',
+];
+
+/**
+ * The read side of one occlusion pass. Everything here is IMMUTABLE for the
+ * pass's lifetime: `nodes`/`byIndex` are the caller's input, never the
+ * annotated output, so every cover decision — including the caller-supplied
+ * `isAdditionalOverlayNode` predicate and ancestor classification — evaluates
+ * against the same state no matter when it runs. That immutability is what
+ * makes `coverCache` sound: each position's "is it covered by something
+ * later" question has exactly one answer per pass, so caching it is safe.
+ * Without the cache, `findCoveringNode` -> `visibleCoverRect` ->
+ * `findCoveringNode` recurses once per (position, later-position) pair
+ * without bound, which is O(2^overlayPositions.length): a snapshot with ~40
+ * mutually-overlapping overlay-like nodes (every key of an open Android IME
+ * keyboard, each classified via `isAdditionalOverlayNode`) pins the event
+ * loop for minutes. Annotations are applied in a separate output pass and
+ * never feed back into decisions.
+ */
+type OcclusionScan = {
+  nodes: readonly RawSnapshotNode[];
+  byIndex: Map<number, RawSnapshotNode>;
+  neighbourhood: NeighbourhoodIndex;
+  overlayPositions: number[];
+  coverCache: Map<number, RawSnapshotNode | null>;
+};
+
+/** One-tree context for classifying a node's neighbours without rescanning the whole snapshot. */
+type NeighbourhoodIndex = {
+  byIndex: Map<number, RawSnapshotNode>;
+  childrenByParent: Map<number, RawSnapshotNode[]>;
+  toolbarHostReach: Map<number, ToolbarHostReach | null>;
+};
+
+function collectNeighbourhoodIndex(nodes: readonly RawSnapshotNode[]): NeighbourhoodIndex {
+  const byIndex = new Map<number, RawSnapshotNode>();
+  const childrenByParent = new Map<number, RawSnapshotNode[]>();
+  for (const node of nodes) {
+    byIndex.set(node.index, node);
+    if (typeof node.parentIndex !== 'number') continue;
+    const siblings = childrenByParent.get(node.parentIndex);
+    if (siblings) siblings.push(node);
+    else childrenByParent.set(node.parentIndex, [node]);
+  }
+  return { byIndex, childrenByParent, toolbarHostReach: new Map() };
+}
+
+export type SnapshotOcclusionOptions = {
+  /** Backend-declared overlay roots that use the shared geometric scan (for example Android IME). */
+  isAdditionalOverlayNode?: (node: RawSnapshotNode) => boolean;
+};
+
+// Mutation-lane note: the `nodes.length < 2` early return below is provably
+// redundant — with 0 or 1 nodes, `coveredPositions` can never be non-empty,
+// so the *other* early return a few lines down (`coveredPositions.length ===
+// 0`) already returns `nodes` unchanged by the same reference. This one is a
+// pure allocation-avoiding fast path, not a distinct behavior.
+export function annotateCoveredSnapshotNodes(
+  nodes: RawSnapshotNode[],
+  options: SnapshotOcclusionOptions = {},
+): RawSnapshotNode[] {
+  if (nodes.length < 2) return nodes;
+
+  const neighbourhood = collectNeighbourhoodIndex(nodes);
+  const byIndex = neighbourhood.byIndex;
+  const scan: OcclusionScan = {
+    nodes,
+    byIndex,
+    neighbourhood,
+    // Mutation-lane note: replacing the `[]` (non-overlay) branch with a
+    // non-empty placeholder would only add extra, non-numeric entries to
+    // this array; every consumer treats it as a plain array of positions to
+    // compare/index with, so a stray non-numeric entry is inert (fails the
+    // comparison, indexes to `undefined`) rather than observable.
+    overlayPositions: nodes.flatMap((node, position) =>
+      isOverlayLikeNode(node, neighbourhood, options) ? [position] : [],
+    ),
+    coverCache: new Map(),
+  };
+  const coveredPositions: Array<{ position: number; coveredBy?: SnapshotCoveringNode }> = [];
+  for (const [position, node] of nodes.entries()) {
+    if (!isCandidateTouchNode(node)) continue;
+    const coveringNode = findCoveringNode(scan, position, node, options);
+    if (!coveringNode) continue;
+    const coveredBy = describeCoveringNode(coveringNode);
+    coveredPositions.push(coveredBy ? { position, coveredBy } : { position });
+  }
+  return annotateCoveredPositions(nodes, coveredPositions);
+}
+
+/** Presented roles that name a box rather than a surface a reader would recognize and dismiss. */
+const ANONYMOUS_CONTAINER_KINDS = new Set(['element', 'group', 'other']);
+
+/**
+ * The bounded, non-actionable description of the cover the scan found, or nothing when the cover has
+ * no name. No ref is ever carried — see {@link SnapshotCoveringNode}.
+ *
+ * A live iPhone 18 Pro capture pins the boundary: a `UIAlertController`'s container publishes as the
+ * generic `group` kind and is nameable only through the alert's title carried as its accessible
+ * label, so the refusal reads `the group "Confirm catalog refresh" at (41, 327 320x248)` and names
+ * the surface to dismiss. Strip that label and the same node would say `the group at (...)`, which
+ * points at a box nobody would recognize; an anonymous container of that shape therefore publishes
+ * no cover, and the refusal keeps its generic recovery. A named kind (`dialog`, `tab-bar`, `sheet`)
+ * still describes itself with no label to lean on.
+ */
+function describeCoveringNode(node: CoveringNodeEvidence): SnapshotCoveringNode | null {
+  const label = node.label?.trim();
+  const kind = formatRole(node.type ?? 'Element');
+  if (!label && ANONYMOUS_CONTAINER_KINDS.has(kind)) return null;
+  const rect = positiveRect(node.rect);
+  return {
+    kind,
+    ...(label ? { label: label.slice(0, SNAPSHOT_COVERING_LABEL_MAX_LENGTH) } : {}),
+    ...(rect ? { rect } : {}),
+  };
+}
+
+/** What a backend hit test observed on top of a node, described like a scanned cover. */
+export type CoveringNodeEvidence = Pick<RawSnapshotNode, 'type' | 'label' | 'rect'>;
+
+/**
+ * Applies backend-owned covered decisions through the same publication annotation contract. A
+ * decision that carries the covering element publishes its description; `true` refuses without one.
+ */
+export function annotateSnapshotNodesCoveredByPolicy(
+  nodes: RawSnapshotNode[],
+  isCovered: (node: RawSnapshotNode) => boolean | CoveringNodeEvidence,
+): RawSnapshotNode[] {
+  const coveredPositions: Array<{ position: number; coveredBy?: SnapshotCoveringNode }> = [];
+  for (const [position, node] of nodes.entries()) {
+    if (!isCandidateTouchNode(node)) continue;
+    const decision = isCovered(node);
+    if (!decision) continue;
+    const coveredBy = decision === true ? null : describeCoveringNode(decision);
+    coveredPositions.push(coveredBy ? { position, coveredBy } : { position });
+  }
+  return annotateCoveredPositions(nodes, coveredPositions);
+}
+
+function annotateCoveredPositions(
+  nodes: RawSnapshotNode[],
+  coveredPositions: ReadonlyArray<{ position: number; coveredBy?: SnapshotCoveringNode }>,
+): RawSnapshotNode[] {
+  if (coveredPositions.length === 0) return nodes;
+  const annotated = [...nodes];
+  for (const { position, coveredBy } of coveredPositions) {
+    const node = nodes[position]!;
+    annotated[position] = {
+      ...node,
+      hittable: false,
+      interactionBlocked: 'covered' as const,
+      ...(coveredBy ? { coveredBy } : {}),
+      presentationHints: mergeCoveredHint(node.presentationHints),
+    };
+  }
+  return annotated;
+}
+
+export function isSnapshotNodeInteractionBlocked(
+  node: Pick<RawSnapshotNode, 'interactionBlocked'>,
+): boolean {
+  return node.interactionBlocked !== undefined;
+}
+
+// Mutation-lane note: several guards across this call chain are provably
+// redundant, not undertested:
+//   - `findCoveringNode`'s `!targetRect` — every caller (the outer loop below
+//     and `visibleCoverRect`'s recursive call) only ever passes a node whose
+//     rect was already confirmed positive (via `isCandidateTouchNode` or the
+//     `candidateRect` check just before the recursive call).
+//   - `canCoverPoint`'s and `visibleCoverRect`'s `!candidate` — `position`
+//     always comes from `scan.overlayPositions`, itself built by mapping
+//     over `scan.nodes`, so it is always a valid index into that same array.
+//   - `visibleCoverRect`'s `!isOverlayLikeNode(candidate, ...)` — a position
+//     only lands in `overlayPositions` because this exact predicate, over
+//     the exact same pristine (node, byIndex, options), already returned
+//     true when the array was built.
+function findCoveringNode(
+  scan: OcclusionScan,
+  targetPosition: number,
+  target: RawSnapshotNode,
+  options: SnapshotOcclusionOptions,
+): RawSnapshotNode | null {
+  const cached = scan.coverCache.get(targetPosition);
+  if (cached !== undefined) return cached;
+  // Reentrancy guard: an additional Android overlay may precede an app target
+  // in the cross-window traversal, while that target may itself be overlay-like.
+  // Seed `null` before following either direction so such a cycle fails closed
+  // instead of re-entering.
+  scan.coverCache.set(targetPosition, null);
+
+  const targetRect = positiveRect(target.rect);
+  if (!targetRect) return finishFindCoveringNode(scan, targetPosition, null);
+  const center = centerOfRect(targetRect);
+  const targetIsAdditionalOverlay = options.isAdditionalOverlayNode?.(target) === true;
+
+  for (const position of scan.overlayPositions) {
+    if (
+      !canPositionCoverTarget(scan, position, targetPosition, targetIsAdditionalOverlay, options)
+    ) {
+      continue;
+    }
+    const candidate = scan.nodes[position]!;
+    if (canCoverPoint(scan, position, target, targetRect, center, options)) {
+      return finishFindCoveringNode(scan, targetPosition, candidate);
+    }
+  }
+
+  return finishFindCoveringNode(scan, targetPosition, null);
+}
+
+function canPositionCoverTarget(
+  scan: OcclusionScan,
+  candidatePosition: number,
+  targetPosition: number,
+  targetIsAdditionalOverlay: boolean,
+  options: SnapshotOcclusionOptions,
+): boolean {
+  const candidate = scan.nodes[candidatePosition];
+  if (!candidate) return false;
+  if (candidatePosition > targetPosition) return true;
+  if (candidatePosition === targetPosition || targetIsAdditionalOverlay) return false;
+  return options.isAdditionalOverlayNode?.(candidate) === true;
+}
+
+function finishFindCoveringNode(
+  scan: OcclusionScan,
+  targetPosition: number,
+  result: RawSnapshotNode | null,
+): RawSnapshotNode | null {
+  scan.coverCache.set(targetPosition, result);
+  return result;
+}
+
+function canCoverPoint(
+  scan: OcclusionScan,
+  candidatePosition: number,
+  target: RawSnapshotNode,
+  targetRect: Rect,
+  point: { x: number; y: number },
+  options: SnapshotOcclusionOptions,
+): boolean {
+  const candidate = scan.nodes[candidatePosition];
+  if (!candidate) return false;
+  const coverRect = visibleCoverRect(scan, candidatePosition, target, targetRect, options);
+  return Boolean(coverRect && containsPoint(coverRect, point.x, point.y));
+}
+
+function visibleCoverRect(
+  scan: OcclusionScan,
+  candidatePosition: number,
+  target: RawSnapshotNode,
+  targetRect: Rect,
+  options: SnapshotOcclusionOptions,
+): Rect | null {
+  const candidate = scan.nodes[candidatePosition];
+  if (!candidate || !isOverlayLikeNode(candidate, scan.neighbourhood, options)) return null;
+  if (areRelatedSnapshotNodes(target, candidate, scan.byIndex)) return null;
+  const candidateRect = positiveRect(candidate.rect);
+  if (!candidateRect || areRectsApproximatelyEqual(targetRect, candidateRect)) return null;
+  if (isInToolbarHostOwnPresentation(candidate, target, scan)) return null;
+  if (findCoveringNode(scan, candidatePosition, candidate, options)) return null;
+  return candidateRect;
+}
+
+// Mutation-lane note: the `!positiveRect` guard below is provably redundant
+// — a rect-less "candidate" still flows into `findCoveringNode`, whose own
+// `!targetRect` check (see the note above it) rejects it the same way.
+function isCandidateTouchNode(node: RawSnapshotNode): boolean {
+  if (!positiveRect(node.rect)) return false;
+  if (node.hittable === true) return true;
+  if (isSemanticTouchNode(node)) return true;
+  return Boolean(node.label?.trim() || node.value?.trim() || node.identifier?.trim());
+}
+
+// Mutation-lane note: this function's own `!positiveRect` guard is likewise
+// redundant — a rect-less node that slipped into `overlayPositions` would
+// still be excluded downstream by `visibleCoverRect`'s `!candidateRect`
+// check, which re-derives the same `positiveRect` over the same pristine
+// node.
+function isOverlayLikeNode(
+  node: RawSnapshotNode,
+  neighbourhood: NeighbourhoodIndex,
+  options: SnapshotOcclusionOptions,
+): boolean {
+  if (!positiveRect(node.rect)) return false;
+  if (isViewportRootNode(node)) return false;
+  if (isFullViewportChromeContainer(node, neighbourhood)) return false;
+  if (isSiblingSizedChromeContainer(node, neighbourhood)) return false;
+  if (isOwnPresentationToolbarHost(node, neighbourhood)) return false;
+  // This is a presentation-order heuristic: only known floating UI chrome should cover
+  // later targets. Generic hittable containers can appear later without being visually on top.
+  return (
+    nodeKindIncludesAny(node, OVERLAY_KIND_FRAGMENTS) ||
+    isAdditionalOverlayRootNode(node, neighbourhood.byIndex, options)
+  );
+}
+
+/**
+ * Exempt a viewport-chrome container whose frame equals a listed sibling's. UIKit sizes a bar
+ * container to the branch it presents over, so in the captured shapes a sibling-matching frame is
+ * that branch's footprint, not a surface drawn on top of it; what the container really draws is its
+ * descendants, each with its own rect the scan judges on its own (#2996).
+ *
+ * Two captures carry the shape: a system app's bar container matching the 812pt content branch beside
+ * it marked that branch's 36 nodes plus the navigation bar listed with it, and a tab-bar badge
+ * container matching the platter content view beside it marked every tab. `isFullViewportChromeContainer`
+ * reaches the same verdict only against the viewport root, which such a container stops short of.
+ *
+ * Accepted limit: a snapshot publishes geometry and kind only, so the predicate cannot tell a
+ * pass-through host from an opaque bar of the same frame, and chrome siblings that share one frame
+ * excuse each other. Both captures show the match only where content was being refused, and the kind
+ * gate keeps a `dialog`/`sheet`/`alert` sized to the content around it covering.
+ *
+ * Accepted limit for stacked presentations: the interactive projection lists them as siblings of one
+ * root. iOS drops what sits beneath a SwiftUI sheet from the capture, but keeps what sits beneath a
+ * full-screen cover, and the cover's toolbar host is viewport-sized, so the full-viewport exemption
+ * lets it through. Beneath a cover, only the cover's own bars and a lower presentation's
+ * non-exempt toolbar host still cover.
+ */
+// Mutation-lane note: the `typeof parentIndex` and `!rect` guards below are provably
+// redundant — with no parent index the sibling lookup finds nothing and answers "not
+// sibling-sized" on its own, and a rect-less node fails `areRectsApproximatelyEqual`,
+// which is the same answer the guard gives. They state the preconditions rather than
+// enforce them.
+function isSiblingSizedChromeContainer(
+  node: RawSnapshotNode,
+  neighbourhood: NeighbourhoodIndex,
+): boolean {
+  if (!nodeKindIncludesAny(node, VIEWPORT_CHROME_KIND_FRAGMENTS)) return false;
+  if (typeof node.parentIndex !== 'number') return false;
+  const rect = positiveRect(node.rect);
+  if (!rect) return false;
+  const siblings = neighbourhood.childrenByParent.get(node.parentIndex) ?? [];
+  return siblings.some(
+    (sibling) => sibling.index !== node.index && areRectsApproximatelyEqual(rect, sibling.rect),
+  );
+}
+
+type ToolbarHostReach =
+  | { kind: 'own-presentation' }
+  | { kind: 'over-beneath'; parentIndex: number; ownBranchIndexes: ReadonlySet<number> };
+
+function toolbarHostReach(
+  node: RawSnapshotNode,
+  neighbourhood: NeighbourhoodIndex,
+): ToolbarHostReach | null {
+  const cached = neighbourhood.toolbarHostReach.get(node.index);
+  if (cached !== undefined) return cached;
+  const reach = classifyToolbarHostReach(node, neighbourhood);
+  neighbourhood.toolbarHostReach.set(node.index, reach);
+  return reach;
+}
+
+/**
+ * Toolbar hosts draw their descendants, not their enclosing frame. A host that encloses bars or
+ * scroll containers of its own presentation, the siblings after the previous toolbar and before
+ * this host, covers nothing of it. A host that encloses the presentation beneath it, which an
+ * undimmed sheet keeps in the capture, covers only that presentation, including enclosed tab bars
+ * listed first after the previous toolbar. A host that encloses nothing, or a presentation stacked
+ * over it, keeps covering. Like the sibling-sized exemption, this cannot tell an opaque toolbar
+ * from a host.
+ */
+function classifyToolbarHostReach(
+  node: RawSnapshotNode,
+  neighbourhood: NeighbourhoodIndex,
+): ToolbarHostReach | null {
+  if (!nodeKindIncludesAny(node, TOOLBAR_HOST_KIND_FRAGMENTS)) return null;
+  if (typeof node.parentIndex !== 'number') return null;
+  const rect = positiveRect(node.rect);
+  if (!rect) return null;
+  const siblings = neighbourhood.childrenByParent.get(node.parentIndex)!;
+  const position = siblings.findIndex((sibling) => sibling.index === node.index);
+  const enclosedPositions = siblings.flatMap((sibling, siblingPosition) =>
+    siblingPosition !== position && isEnclosedHostedRegion(rect, sibling) ? [siblingPosition] : [],
+  );
+  if (enclosedPositions.length === 0) return null;
+  if (enclosedPositions.some((siblingPosition) => siblingPosition > position)) return null;
+
+  const previousHostEnd = ownPresentationStart(siblings, position);
+  const ownEnclosed = enclosedPositions.filter(
+    (siblingPosition) => siblingPosition >= previousHostEnd,
+  );
+  if (ownEnclosed.length === enclosedPositions.length) return { kind: 'own-presentation' };
+  const beneathTabBars = new Set<number>();
+  for (const siblingPosition of ownEnclosed) {
+    if (!nodeKindIncludesAny(siblings[siblingPosition]!, TAB_BAR_KIND_FRAGMENTS)) break;
+    beneathTabBars.add(siblingPosition);
+  }
+  return {
+    kind: 'over-beneath',
+    parentIndex: node.parentIndex,
+    ownBranchIndexes: new Set(
+      siblings
+        .slice(previousHostEnd, position)
+        .filter((_, offset) => !beneathTabBars.has(previousHostEnd + offset))
+        .map((sibling) => sibling.index),
+    ),
+  };
+}
+
+function isOwnPresentationToolbarHost(
+  node: RawSnapshotNode,
+  neighbourhood: NeighbourhoodIndex,
+): boolean {
+  return toolbarHostReach(node, neighbourhood)?.kind === 'own-presentation';
+}
+
+function isInToolbarHostOwnPresentation(
+  host: RawSnapshotNode,
+  target: RawSnapshotNode,
+  scan: OcclusionScan,
+): boolean {
+  const reach = toolbarHostReach(host, scan.neighbourhood);
+  if (reach?.kind !== 'over-beneath') return false;
+  const branch = branchUnderParent(target, reach.parentIndex, scan.byIndex);
+  return branch !== undefined && reach.ownBranchIndexes.has(branch.index);
+}
+
+/** The target itself or its ancestor that is a direct child of `parentIndex`. */
+function branchUnderParent(
+  node: RawSnapshotNode,
+  parentIndex: number,
+  byIndex: Map<number, RawSnapshotNode>,
+): RawSnapshotNode | undefined {
+  let current: RawSnapshotNode | undefined = node;
+  const visited = new Set<number>();
+  while (current && !visited.has(current.index)) {
+    if (current.parentIndex === parentIndex) return current;
+    visited.add(current.index);
+    current =
+      typeof current.parentIndex === 'number' ? byIndex.get(current.parentIndex) : undefined;
+  }
+  return undefined;
+}
+
+function ownPresentationStart(siblings: readonly RawSnapshotNode[], position: number): number {
+  for (let previous = position - 1; previous >= 0; previous--) {
+    if (nodeKindIncludesAny(siblings[previous]!, TOOLBAR_HOST_KIND_FRAGMENTS)) return previous + 1;
+  }
+  return 0;
+}
+
+/** A bar or a scroll container inside `rect`; a scroll indicator is not a container. */
+function isEnclosedHostedRegion(rect: Rect, node: RawSnapshotNode): boolean {
+  const isHostedRegion =
+    nodeKindIncludesAny(node, VIEWPORT_CHROME_KIND_FRAGMENTS) ||
+    (isScrollableNodeLike(node) && !nodeKindIncludesAny(node, SCROLL_INDICATOR_KIND_FRAGMENTS));
+  const nodeRect = positiveRect(node.rect);
+  return Boolean(isHostedRegion && nodeRect && rectContains(rect, nodeRect));
+}
+
+function isFullViewportChromeContainer(
+  node: RawSnapshotNode,
+  neighbourhood: NeighbourhoodIndex,
+): boolean {
+  if (!nodeKindIncludesAny(node, VIEWPORT_CHROME_KIND_FRAGMENTS)) return false;
+  const rect = positiveRect(node.rect);
+  if (!rect) return false;
+
+  const byIndex = neighbourhood.byIndex;
+  let current = typeof node.parentIndex === 'number' ? byIndex.get(node.parentIndex) : undefined;
+  const visited = new Set<number>();
+  while (current && !visited.has(current.index)) {
+    if (isViewportRootNode(current)) {
+      const viewportRect = positiveRect(current.rect);
+      return Boolean(
+        viewportRect &&
+        (isViewportFootprint(rect, viewportRect) ||
+          isViewportAboveBottomBar(node, rect, viewportRect, neighbourhood)),
+      );
+    }
+    visited.add(current.index);
+    current =
+      typeof current.parentIndex === 'number' ? byIndex.get(current.parentIndex) : undefined;
+  }
+  return false;
+}
+
+// The floating host can end at a complete bottom tab row after projection removes its content sibling.
+function isViewportAboveBottomBar(
+  node: RawSnapshotNode,
+  rect: Rect,
+  viewport: Rect,
+  neighbourhood: NeighbourhoodIndex,
+): boolean {
+  if (node.role !== FLOATING_BAR_CONTAINER_ROLE || typeof node.parentIndex !== 'number')
+    return false;
+  const bottom = rect.y + rect.height;
+  if (bottom >= viewport.y + viewport.height) return false;
+  if (!isViewportFootprint(rect, { ...viewport, height: bottom - viewport.y })) return false;
+  const siblings = neighbourhood.childrenByParent.get(node.parentIndex) ?? [];
+  const buttons = siblings.flatMap((sibling) => {
+    if (!nodeKindIncludesAny(sibling, ['button', 'tabitem'])) return [];
+    const bar = positiveRect(sibling.rect);
+    if (!bar) return [];
+    return Math.abs(bar.y - bottom) <= 0.5 &&
+      bar.x >= viewport.x &&
+      bar.x + bar.width <= viewport.x + viewport.width &&
+      bar.height <= viewport.height / 4 &&
+      bar.y + bar.height >= viewport.y + viewport.height * 0.9 &&
+      bar.y + bar.height <= viewport.y + viewport.height + 0.5
+      ? [bar]
+      : [];
+  });
+  buttons.sort((a, b) => a.x - b.x);
+  if (buttons.length < 2 || Math.abs(buttons[0]!.x - viewport.x) > 0.5) return false;
+  let edge = viewport.x;
+  const first = buttons[0]!;
+  for (const button of buttons) {
+    if (
+      Math.abs(button.x - edge) > 0.5 ||
+      Math.abs(button.y - first.y) > 0.5 ||
+      Math.abs(button.height - first.height) > 0.5
+    )
+      return false;
+    edge = button.x + button.width;
+  }
+  return Math.abs(edge - (viewport.x + viewport.width)) <= 0.5;
+}
+
+function isAdditionalOverlayRootNode(
+  node: RawSnapshotNode,
+  byIndex: Map<number, RawSnapshotNode>,
+  options: SnapshotOcclusionOptions,
+): boolean {
+  if (options.isAdditionalOverlayNode?.(node) !== true) return false;
+  return !hasRenderableAdditionalOverlayAncestor(node, byIndex, options);
+}
+
+// Mutation-lane note: `typeof x.parentIndex === 'number' ? byIndex.get(...) :
+// undefined` is provably redundant here (and in the structurally identical
+// walk in `isSnapshotAncestor` below) — `Map.get` on a key that was never
+// set (including `undefined`) already returns `undefined`, the exact value
+// the ternary's else-branch produces, so skipping the typeof check changes
+// nothing observable.
+function hasRenderableAdditionalOverlayAncestor(
+  node: RawSnapshotNode,
+  byIndex: Map<number, RawSnapshotNode>,
+  options: SnapshotOcclusionOptions,
+): boolean {
+  let current = typeof node.parentIndex === 'number' ? byIndex.get(node.parentIndex) : undefined;
+  const visited = new Set<number>();
+  while (current && !visited.has(current.index)) {
+    if (isRenderableAdditionalOverlayNode(current, options)) return true;
+    visited.add(current.index);
+    current =
+      typeof current.parentIndex === 'number' ? byIndex.get(current.parentIndex) : undefined;
+  }
+  return false;
+}
+
+// Mutation-lane note: the `?.` here is provably redundant — this only runs
+// once `isAdditionalOverlayRootNode` already confirmed
+// `options.isAdditionalOverlayNode` is a real function (its own, unguarded
+// `!== true` check would otherwise have returned early), and `options` is
+// never replaced mid-walk.
+function isRenderableAdditionalOverlayNode(
+  node: RawSnapshotNode,
+  options: SnapshotOcclusionOptions,
+): boolean {
+  return (
+    options.isAdditionalOverlayNode?.(node) === true &&
+    positiveRect(node.rect) !== null &&
+    !isViewportRootNode(node)
+  );
+}
+
+function isSemanticTouchNode(node: RawSnapshotNode): boolean {
+  return nodeKindIncludesAny(node, SEMANTIC_TOUCH_KIND_FRAGMENTS);
+}
+
+function nodeKindIncludesAny(
+  node: Pick<RawSnapshotNode, 'type' | 'role' | 'subrole'>,
+  fragments: readonly string[],
+): boolean {
+  const normalized = normalizeNodeKind(node);
+  return fragments.some((fragment) => normalized.includes(fragment));
+}
+
+// Mutation-lane note: the `?? ''` fallback's exact replacement text is not
+// observable through this module's public API — every caller only checks
+// substring membership against a fixed, known fragment list, and no
+// plausible filler text coincides with any of them, so no test can
+// distinguish `''` from another non-matching filler here without reaching
+// into this private function directly.
+function normalizeNodeKind(node: Pick<RawSnapshotNode, 'type' | 'role' | 'subrole'>): string {
+  return [node.type, node.role, node.subrole].map((value) => normalizeType(value ?? '')).join(' ');
+}
+
+function areRelatedSnapshotNodes(
+  left: RawSnapshotNode,
+  right: RawSnapshotNode,
+  byIndex: Map<number, RawSnapshotNode>,
+): boolean {
+  return isSnapshotAncestor(left, right, byIndex) || isSnapshotAncestor(right, left, byIndex);
+}
+
+function isSnapshotAncestor(
+  ancestor: RawSnapshotNode,
+  node: RawSnapshotNode,
+  byIndex: Map<number, RawSnapshotNode>,
+): boolean {
+  let current = typeof node.parentIndex === 'number' ? byIndex.get(node.parentIndex) : undefined;
+  const visited = new Set<number>();
+  while (current && !visited.has(current.index)) {
+    if (current.index === ancestor.index) return true;
+    visited.add(current.index);
+    current =
+      typeof current.parentIndex === 'number' ? byIndex.get(current.parentIndex) : undefined;
+  }
+  return false;
+}
+
+function positiveRect(rect: RawSnapshotNode['rect']): Rect | null {
+  const normalized = normalizeRect(rect);
+  return normalized && normalized.width > 0 && normalized.height > 0 ? normalized : null;
+}
+
+function mergeCoveredHint(hints: string[] | undefined): string[] {
+  return Array.from(new Set([...(hints ?? []), COVERED_PRESENTATION_HINT]));
+}
+
+/** The viewport's frame, or the viewport below a strip of at most `VIEWPORT_CHROME_TOP_INSET_PT`. */
+function isViewportFootprint(rect: Rect, viewport: Rect): boolean {
+  const topInset = Math.min(Math.max(rect.y - viewport.y, 0), VIEWPORT_CHROME_TOP_INSET_PT);
+  return areRectsApproximatelyEqual(rect, {
+    ...viewport,
+    y: viewport.y + topInset,
+    height: viewport.height - topInset,
+  });
+}

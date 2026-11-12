@@ -1,0 +1,779 @@
+import {
+  bindTestCommandHost,
+  createTestHostEnvironment,
+  withCapturedStdoutAsync,
+} from '@agent-device/test-kit';
+import { test, vi } from 'vitest';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import type { LeaseDevice, LeaseDeviceSpec } from '@agent-device/contracts/client';
+import { LEASE_DEVICE_SPEC_KEYS } from '@agent-device/contracts/lease-scope';
+import { AppError } from '@agent-device/kernel/errors';
+import {
+  connectionWorkspace,
+  createTestClient,
+  grantedLease,
+  proxyWorkspace,
+  type LeaseAllocateRequest,
+  type LeaseReleaseRequest,
+  unexpectedCommandCall,
+} from '../../../__tests__/remote-connection.fixtures.ts';
+
+vi.mock('@agent-device/react-native', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@agent-device/react-native')>()),
+  stopMetroTunnel: vi.fn(),
+}));
+
+import { materializeRemoteConnectionForCommand } from '../connection-runtime.ts';
+import {
+  readActiveConnectionState,
+  readRemoteConnectionState,
+} from '@agent-device/remote/remote-connection-state';
+import { connectCommand } from '../../../__tests__/test-utils/host-bound-commands.ts';
+
+bindTestCommandHost();
+
+const REMOTE_DEVICE_KEY = 'ios:mobile:SIM-REMOTE';
+
+const GRANTED_DEVICE: LeaseDevice = {
+  model: 'iPhone 17 Pro',
+  osVersion: '26.1',
+  physical: false,
+};
+
+function renewingClient(heartbeats: string[]) {
+  return createTestClient({
+    listDevices: unexpectedCommandCall,
+    allocate: unexpectedCommandCall,
+    release: unexpectedCommandCall,
+    heartbeat: async (request) => {
+      heartbeats.push(request.leaseId);
+      return {
+        leaseId: request.leaseId,
+        tenantId: 'proxy',
+        runId: 'proxy-client-1',
+        backend: 'ios-instance',
+        leaseProvider: 'proxy',
+        clientId: 'client-1',
+        deviceKey: 'ios:mobile:SIM-REMOTE',
+      };
+    },
+  });
+}
+
+test('proxy open by device spec sends the spec on allocate without listing devices and reports the granted device', async () => {
+  const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-device-spec-');
+  const requests: LeaseAllocateRequest[] = [];
+  const spec: Required<LeaseDeviceSpec> = {
+    osVersion: ' >=26 ',
+    imageTag: 'google_apis',
+    deviceMode: 'full',
+    deviceBaseline: 'logged-in',
+    physical: true,
+  };
+  const grantedDevice: LeaseDevice = {
+    ...GRANTED_DEVICE,
+    deviceMode: 'full',
+    baseline: { name: 'logged-in', version: 2 },
+  };
+
+  const materialized = await materializeRemoteConnectionForCommand({
+    host: createTestHostEnvironment(),
+    command: 'open',
+    flags: { ...flags, device: 'iPhone 17 Pro', ...spec },
+    client: createTestClient({
+      listDevices: unexpectedCommandCall,
+      allocate: async (request) => {
+        requests.push(request);
+        return grantedLease(request, { deviceKey: REMOTE_DEVICE_KEY, device: grantedDevice });
+      },
+      release: unexpectedCommandCall,
+    }),
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.deviceKey, undefined);
+  assert.equal(requests[0]?.platform, 'ios');
+  assert.equal(requests[0]?.device, 'iPhone 17 Pro');
+  assert.deepEqual(materialized.leaseDevice, grantedDevice);
+  // The leased device is named by its identity from here on; the spec does not reach the command.
+  assert.equal(materialized.flags.udid, 'SIM-REMOTE');
+  for (const key of LEASE_DEVICE_SPEC_KEYS) {
+    assert.equal(requests[0]?.[key], spec[key]);
+    assert.equal(materialized.flags[key], undefined);
+  }
+  const state = readRemoteConnectionState({ stateDir, session: 'adc-proxy' });
+  assert.equal(state?.leaseId, 'lease-1');
+  assert.deepEqual(state?.leaseDeviceSpec, {
+    leaseId: 'lease-1',
+    spec,
+    device: grantedDevice,
+  });
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a slim grant for a full request is released and refused', async () => {
+  const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-spec-wrong-mode-');
+  const releases: LeaseReleaseRequest[] = [];
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flags, deviceMode: 'full' },
+      client: createTestClient({
+        listDevices: unexpectedCommandCall,
+        allocate: async (request) =>
+          grantedLease(request, {
+            created: true,
+            deviceKey: REMOTE_DEVICE_KEY,
+            device: { ...GRANTED_DEVICE, deviceMode: 'slim' },
+          }),
+        release: async (request) => {
+          releases.push(request);
+          return { released: true };
+        },
+      }),
+    }),
+    (error: AppError) =>
+      error.code === 'UNSUPPORTED_OPERATION' &&
+      error.details?.reason === 'device-spec-unsupported' &&
+      JSON.stringify(error.details?.keys) === '["deviceMode"]',
+  );
+  assert.deepEqual(
+    releases.map((request) => request.leaseId),
+    ['lease-1'],
+  );
+  assert.equal(readRemoteConnectionState({ stateDir, session: 'adc-proxy' })?.leaseId, undefined);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+for (const [label, baseline] of [
+  ['another baseline', { name: 'factory', version: 1 }],
+  ['no baseline', undefined],
+] as const) {
+  test(`a grant reporting ${label} for a baseline request is released and refused`, async () => {
+    const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-spec-wrong-baseline-');
+    const releases: LeaseReleaseRequest[] = [];
+    await assert.rejects(
+      materializeRemoteConnectionForCommand({
+        host: createTestHostEnvironment(),
+        command: 'open',
+        flags: { ...flags, deviceBaseline: 'logged-in' },
+        client: createTestClient({
+          listDevices: unexpectedCommandCall,
+          allocate: async (request) =>
+            grantedLease(request, {
+              created: true,
+              deviceKey: REMOTE_DEVICE_KEY,
+              device: { ...GRANTED_DEVICE, ...(baseline ? { baseline } : {}) },
+            }),
+          release: async (request) => {
+            releases.push(request);
+            return { released: true };
+          },
+        }),
+      }),
+      (error: AppError) =>
+        error.code === 'UNSUPPORTED_OPERATION' &&
+        error.details?.reason === 'device-spec-unsupported' &&
+        JSON.stringify(error.details?.keys) === '["deviceBaseline"]',
+    );
+    assert.deepEqual(
+      releases.map((request) => request.leaseId),
+      ['lease-1'],
+    );
+    assert.equal(readRemoteConnectionState({ stateDir, session: 'adc-proxy' })?.leaseId, undefined);
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+}
+
+test('a full grant serves a slim request, because slim is best effort', async () => {
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-spec-slim-full-');
+  const device: LeaseDevice = { ...GRANTED_DEVICE, deviceMode: 'full' };
+
+  const materialized = await materializeRemoteConnectionForCommand({
+    host: createTestHostEnvironment(),
+    command: 'open',
+    flags: { ...flags, deviceMode: 'slim' },
+    client: createTestClient({
+      listDevices: unexpectedCommandCall,
+      allocate: async (request) => grantedLease(request, { deviceKey: REMOTE_DEVICE_KEY, device }),
+      release: unexpectedCommandCall,
+    }),
+  });
+
+  assert.equal(materialized.flags.udid, 'SIM-REMOTE');
+  assert.deepEqual(materialized.leaseDevice, device);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a grant that reports no device mode serves a request naming one', async () => {
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-spec-no-mode-echo-');
+
+  const materialized = await materializeRemoteConnectionForCommand({
+    host: createTestHostEnvironment(),
+    command: 'open',
+    flags: { ...flags, deviceMode: 'full' },
+    client: createTestClient({
+      listDevices: unexpectedCommandCall,
+      allocate: async (request) =>
+        grantedLease(request, { deviceKey: REMOTE_DEVICE_KEY, device: GRANTED_DEVICE }),
+      release: unexpectedCommandCall,
+    }),
+  });
+
+  assert.equal(materialized.flags.udid, 'SIM-REMOTE');
+  assert.deepEqual(materialized.leaseDevice, GRANTED_DEVICE);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a by-spec grant omitting created binds and records the granted spec without releasing it', async () => {
+  const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-spec-old-daemon-');
+  const releases: LeaseReleaseRequest[] = [];
+  const materialized = await materializeRemoteConnectionForCommand({
+    host: createTestHostEnvironment(),
+    command: 'open',
+    flags: { ...flags, osVersion: '>=26' },
+    client: createTestClient({
+      listDevices: unexpectedCommandCall,
+      allocate: async (request) => {
+        const { created: _created, ...lease } = grantedLease(request, {
+          deviceKey: REMOTE_DEVICE_KEY,
+          device: GRANTED_DEVICE,
+        });
+        return lease;
+      },
+      release: async (request) => {
+        releases.push(request);
+        return { released: true };
+      },
+    }),
+  });
+  assert.equal(materialized.flags.udid, 'SIM-REMOTE');
+  assert.deepEqual(materialized.leaseDevice, GRANTED_DEVICE);
+  assert.deepEqual(readRemoteConnectionState({ stateDir, session: 'adc-proxy' })?.leaseDeviceSpec, {
+    leaseId: 'lease-1',
+    spec: { osVersion: '>=26' },
+    device: GRANTED_DEVICE,
+  });
+  assert.deepEqual(releases, []);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('proxy open by device spec without a platform or lease backend fails before allocating', async () => {
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-device-spec-no-platform-');
+  const { platform: _platform, ...flagsWithoutPlatform } = flags;
+
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flagsWithoutPlatform, osVersion: '26' },
+      client: createTestClient({
+        listDevices: unexpectedCommandCall,
+        allocate: unexpectedCommandCall,
+      }),
+    }),
+    { code: 'INVALID_ARGS' },
+  );
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a lease returned without lease.device for a spec request is released and the command fails with device-spec-unsupported', async () => {
+  const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-device-spec-noecho-');
+  const releases: LeaseReleaseRequest[] = [];
+
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flags, osVersion: '34', imageTag: 'google_apis_playstore' },
+      client: createTestClient({
+        listDevices: unexpectedCommandCall,
+        allocate: async (request) => grantedLease(request, { deviceKey: REMOTE_DEVICE_KEY }),
+        release: async (request) => {
+          releases.push(request);
+          return { released: true };
+        },
+      }),
+    }),
+    (error: AppError) =>
+      error.code === 'UNSUPPORTED_OPERATION' &&
+      error.details?.reason === 'device-spec-unsupported' &&
+      JSON.stringify(error.details?.keys) === '["osVersion","imageTag"]' &&
+      error.details?.leaseId === 'lease-1' &&
+      error.details?.released === true,
+  );
+  assert.equal(releases.length, 1);
+  assert.equal(releases[0]?.leaseId, 'lease-1');
+  assert.equal(releases[0]?.deviceKey, 'ios:mobile:SIM-REMOTE');
+  const state = readRemoteConnectionState({ stateDir, session: 'adc-proxy' });
+  assert.equal(state?.leaseId, undefined);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('an unconfirmed spec lease gets exactly one rollback retry and one typed failure shape', async () => {
+  const { tempRoot, stateDir, flags } = proxyWorkspace(
+    'agent-device-proxy-device-spec-release-fails-',
+  );
+  const releases: LeaseReleaseRequest[] = [];
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flags, physical: true },
+      client: createTestClient({
+        listDevices: unexpectedCommandCall,
+        allocate: async (request) => grantedLease(request, { deviceKey: REMOTE_DEVICE_KEY }),
+        release: async (request) => {
+          releases.push(request);
+          throw new AppError('COMMAND_FAILED', 'backend unreachable');
+        },
+      }),
+    }),
+    (error: AppError) => {
+      assert.equal(error.code, 'UNSUPPORTED_OPERATION');
+      assert.equal(error.details?.reason, 'device-spec-unsupported');
+      assert.equal(error.details?.leaseId, 'lease-1');
+      assert.deepEqual(error.details?.leaseRollback, {
+        leaseId: 'lease-1',
+        released: false,
+        reason: 'LEASE_RELEASE_FAILED',
+        error: 'backend unreachable',
+      });
+      assert.equal(error.details?.released, undefined);
+      assert.equal(error.details?.releaseError, undefined);
+      return true;
+    },
+  );
+  assert.deepEqual(
+    releases.map((request) => request.leaseId),
+    ['lease-1', 'lease-1'],
+  );
+  assert.equal(readRemoteConnectionState({ stateDir, session: 'adc-proxy' })?.leaseId, undefined);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a successful release retry preserves the spec refusal without stale rollback failure evidence', async () => {
+  const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-spec-release-recovers-');
+  const releases: LeaseReleaseRequest[] = [];
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flags, physical: true },
+      client: createTestClient({
+        listDevices: unexpectedCommandCall,
+        allocate: async (request) => grantedLease(request, { deviceKey: REMOTE_DEVICE_KEY }),
+        release: async (request) => {
+          releases.push(request);
+          if (releases.length === 1)
+            throw new AppError('COMMAND_FAILED', 'temporary release failure');
+          return { released: true };
+        },
+      }),
+    }),
+    (error: AppError) => {
+      assert.equal(error.code, 'UNSUPPORTED_OPERATION');
+      assert.equal(error.details?.reason, 'device-spec-unsupported');
+      assert.equal(error.details?.leaseRollback, undefined);
+      assert.equal(error.details?.releaseError, undefined);
+      assert.equal(error.details?.released, true);
+      return true;
+    },
+  );
+  assert.deepEqual(
+    releases.map((request) => request.leaseId),
+    ['lease-1', 'lease-1'],
+  );
+  assert.equal(readRemoteConnectionState({ stateDir, session: 'adc-proxy' })?.leaseId, undefined);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test.each([
+  { created: undefined, releasedIds: ['lease-1'] },
+  { created: false, releasedIds: [] },
+] as const)(
+  'spec refusal discards an allocate response with created=$created unless explicitly reused',
+  async ({ created, releasedIds }) => {
+    const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-spec-discard-');
+    const releases: LeaseReleaseRequest[] = [];
+    await assert.rejects(
+      materializeRemoteConnectionForCommand({
+        host: createTestHostEnvironment(),
+        command: 'open',
+        flags: { ...flags, osVersion: '>=26' },
+        client: createTestClient({
+          listDevices: unexpectedCommandCall,
+          allocate: async (request) =>
+            grantedLease(request, { created, deviceKey: REMOTE_DEVICE_KEY }),
+          release: async (request) => {
+            releases.push(request);
+            return { released: true };
+          },
+        }),
+      }),
+      (error: AppError) => {
+        assert.equal(error.code, 'UNSUPPORTED_OPERATION');
+        assert.equal(error.details?.reason, 'device-spec-unsupported');
+        if (created === undefined) assert.equal(error.details?.released, true);
+        return true;
+      },
+    );
+    assert.deepEqual(
+      releases.map((request) => request.leaseId),
+      releasedIds,
+    );
+    assert.equal(readRemoteConnectionState({ stateDir, session: 'adc-proxy' })?.leaseId, undefined);
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  },
+);
+
+test.each([
+  { created: undefined, releasedIds: ['lease-1'] },
+  { created: false, releasedIds: [] },
+] as const)(
+  'identity refusal discards an allocate response with created=$created unless explicitly reused',
+  async ({ created, releasedIds }) => {
+    const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-identity-discard-');
+    const releases: LeaseReleaseRequest[] = [];
+    await assert.rejects(
+      materializeRemoteConnectionForCommand({
+        host: createTestHostEnvironment(),
+        command: 'open',
+        flags: { ...flags, udid: 'SIM-REQUESTED', osVersion: '>=26' },
+        client: createTestClient({
+          listDevices: unexpectedCommandCall,
+          allocate: async (request) =>
+            grantedLease(request, {
+              created,
+              deviceKey: REMOTE_DEVICE_KEY,
+              device: GRANTED_DEVICE,
+            }),
+          release: async (request) => {
+            releases.push(request);
+            return { released: true };
+          },
+        }),
+      }),
+      (error: AppError) => {
+        assert.equal(error.code, 'INVALID_ARGS');
+        assert.equal(error.details?.reason, 'CONNECTION_DEVICE_CONFLICT');
+        return true;
+      },
+    );
+    assert.deepEqual(
+      releases.map((request) => request.leaseId),
+      releasedIds,
+    );
+    assert.equal(readRemoteConnectionState({ stateDir, session: 'adc-proxy' })?.leaseId, undefined);
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  },
+);
+
+test('a later open on a live spec lease is served when it names the same spec', async () => {
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-device-spec-same-', {
+    leaseId: 'lease-1',
+    deviceKey: 'ios:mobile:SIM-REMOTE',
+    leaseDeviceSpec: { leaseId: 'lease-1', spec: { osVersion: '>=26' }, device: GRANTED_DEVICE },
+  });
+  const heartbeats: string[] = [];
+
+  const materialized = await materializeRemoteConnectionForCommand({
+    host: createTestHostEnvironment(),
+    command: 'open',
+    flags: { ...flags, osVersion: '>=26' },
+    client: renewingClient(heartbeats),
+  });
+
+  assert.deepEqual(heartbeats, ['lease-1']);
+  assert.equal(materialized.flags.udid, 'SIM-REMOTE');
+  assert.equal(materialized.flags.osVersion, undefined);
+  assert.deepEqual(materialized.leaseDevice, GRANTED_DEVICE);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a later open naming a different --os on a live spec lease is refused with CONNECTION_DEVICE_CONFLICT', async () => {
+  const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-device-spec-conflict-', {
+    leaseId: 'lease-1',
+    deviceKey: 'ios:mobile:SIM-REMOTE',
+    leaseDeviceSpec: { leaseId: 'lease-1', spec: { osVersion: '>=26' } },
+  });
+
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flags, osVersion: '18.6.2' },
+      client: renewingClient([]),
+    }),
+    (error: AppError) =>
+      error.code === 'INVALID_ARGS' &&
+      error.details?.reason === 'CONNECTION_DEVICE_CONFLICT' &&
+      JSON.stringify(error.details?.keys) === '["osVersion"]' &&
+      error.details?.deviceKey === 'ios:mobile:SIM-REMOTE',
+  );
+  const state = readRemoteConnectionState({ stateDir, session: 'adc-proxy' });
+  assert.equal(state?.leaseId, 'lease-1');
+  assert.deepEqual(state?.leaseDeviceSpec?.spec, { osVersion: '>=26' });
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a spec named on a live lease allocated without one is refused with CONNECTION_DEVICE_CONFLICT', async () => {
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-device-spec-unspecced-', {
+    leaseId: 'lease-1',
+    deviceKey: 'ios:mobile:SIM-REMOTE',
+  });
+
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'install',
+      flags: { ...flags, physical: true },
+      client: renewingClient([]),
+    }),
+    (error: AppError) =>
+      error.code === 'INVALID_ARGS' &&
+      error.details?.reason === 'CONNECTION_DEVICE_CONFLICT' &&
+      JSON.stringify(error.details?.keys) === '["physical"]',
+  );
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a later open naming the baseline a live lease was allocated by is served', async () => {
+  const device: LeaseDevice = { ...GRANTED_DEVICE, baseline: { name: 'logged-in', version: 2 } };
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-device-spec-same-baseline-', {
+    leaseId: 'lease-1',
+    deviceKey: 'ios:mobile:SIM-REMOTE',
+    leaseDeviceSpec: { leaseId: 'lease-1', spec: { deviceBaseline: 'logged-in' }, device },
+  });
+  const heartbeats: string[] = [];
+
+  const materialized = await materializeRemoteConnectionForCommand({
+    host: createTestHostEnvironment(),
+    command: 'install',
+    flags: { ...flags, deviceBaseline: 'logged-in' },
+    client: renewingClient(heartbeats),
+  });
+
+  assert.deepEqual(heartbeats, ['lease-1']);
+  assert.equal(materialized.flags.udid, 'SIM-REMOTE');
+  assert.equal(materialized.flags.deviceBaseline, undefined);
+  assert.deepEqual(materialized.leaseDevice, device);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a later open naming another baseline on a live lease is refused with CONNECTION_DEVICE_CONFLICT', async () => {
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-device-spec-other-baseline-', {
+    leaseId: 'lease-1',
+    deviceKey: 'ios:mobile:SIM-REMOTE',
+    leaseDeviceSpec: { leaseId: 'lease-1', spec: { deviceBaseline: 'logged-in' } },
+  });
+
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flags, deviceBaseline: 'factory' },
+      client: renewingClient([]),
+    }),
+    (error: AppError) =>
+      error.code === 'INVALID_ARGS' &&
+      error.details?.reason === 'CONNECTION_DEVICE_CONFLICT' &&
+      JSON.stringify(error.details?.keys) === '["deviceBaseline"]',
+  );
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a later open naming another --udid beside the spec on a live spec lease is refused', async () => {
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-device-spec-udid-', {
+    leaseId: 'lease-1',
+    deviceKey: 'ios:mobile:SIM-REMOTE',
+    leaseDeviceSpec: { leaseId: 'lease-1', spec: { osVersion: '>=26' } },
+  });
+
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flags, osVersion: '>=26', udid: 'SIM-OTHER' },
+      client: renewingClient([]),
+    }),
+    (error: AppError) =>
+      error.code === 'INVALID_ARGS' &&
+      error.details?.reason === 'CONNECTION_DEVICE_CONFLICT' &&
+      error.details?.requestedDevice === 'SIM-OTHER' &&
+      error.details?.deviceKey === 'ios:mobile:SIM-REMOTE',
+  );
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a new spec lease for another device than the requested --udid is released and refused', async () => {
+  const { tempRoot, stateDir, flags } = proxyWorkspace('agent-device-proxy-device-spec-udid-new-');
+  const releases: LeaseReleaseRequest[] = [];
+
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flags, osVersion: '>=26', udid: 'SIM-OTHER' },
+      client: createTestClient({
+        listDevices: unexpectedCommandCall,
+        allocate: async (request) =>
+          grantedLease(request, { deviceKey: REMOTE_DEVICE_KEY, device: GRANTED_DEVICE }),
+        release: async (request) => {
+          releases.push(request);
+          return { released: true };
+        },
+      }),
+    }),
+    (error: AppError) =>
+      error.code === 'INVALID_ARGS' &&
+      error.details?.reason === 'CONNECTION_DEVICE_CONFLICT' &&
+      error.details?.requestedDevice === 'SIM-OTHER',
+  );
+  assert.deepEqual(
+    releases.map((release) => release.leaseId),
+    ['lease-1'],
+  );
+  assert.equal(readRemoteConnectionState({ stateDir, session: 'adc-proxy' })?.leaseId, undefined);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a lease re-allocated by its stored device for a non-allocating command does not carry the spec', async () => {
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-device-spec-snapshot-', {
+    leaseId: 'lease-1',
+    deviceKey: 'ios:mobile:SIM-REMOTE',
+    leaseDeviceSpec: { leaseId: 'lease-1', spec: { osVersion: '>=26' }, device: GRANTED_DEVICE },
+  });
+  const requests: LeaseAllocateRequest[] = [];
+
+  await materializeRemoteConnectionForCommand({
+    host: createTestHostEnvironment(),
+    command: 'snapshot',
+    flags: {
+      ...flags,
+      osVersion: '>=26',
+      imageTag: 'google_apis',
+      deviceMode: 'full',
+      deviceBaseline: 'logged-in',
+      physical: true,
+    },
+    client: createTestClient({
+      listDevices: unexpectedCommandCall,
+      heartbeat: async () => {
+        throw new AppError('UNAUTHORIZED', 'lease expired', { reason: 'LEASE_EXPIRED' });
+      },
+      allocate: async (request) => {
+        requests.push(request);
+        return grantedLease(request, { leaseId: 'lease-2' });
+      },
+    }),
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.deviceKey, 'ios:mobile:SIM-REMOTE');
+  for (const key of LEASE_DEVICE_SPEC_KEYS) assert.equal(requests[0]?.[key], undefined);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('a spec recorded for an earlier lease neither serves nor describes the lease held now', async () => {
+  // lease-1 was allocated by spec and has ended; lease-2 was then allocated by --udid without one.
+  const { tempRoot, flags } = proxyWorkspace('agent-device-proxy-device-spec-stale-', {
+    leaseId: 'lease-2',
+    deviceKey: 'ios:mobile:SIM-REMOTE',
+    leaseDeviceSpec: { leaseId: 'lease-1', spec: { osVersion: '>=26' }, device: GRANTED_DEVICE },
+  });
+
+  const materialized = await materializeRemoteConnectionForCommand({
+    host: createTestHostEnvironment(),
+    command: 'open',
+    flags,
+    client: renewingClient([]),
+  });
+  assert.equal(materialized.leaseDevice, undefined);
+
+  await assert.rejects(
+    materializeRemoteConnectionForCommand({
+      host: createTestHostEnvironment(),
+      command: 'open',
+      flags: { ...flags, osVersion: '>=26' },
+      client: renewingClient([]),
+    }),
+    (error: AppError) =>
+      error.code === 'INVALID_ARGS' && error.details?.reason === 'CONNECTION_DEVICE_CONFLICT',
+  );
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('connect proxy stores the device spec as profile defaults like platform and device', async () => {
+  const { tempRoot, stateDir } = connectionWorkspace('agent-device-connect-proxy-spec-');
+
+  await withCapturedStdoutAsync(async () => {
+    await connectCommand({
+      positionals: ['proxy'],
+      flags: {
+        json: true,
+        help: false,
+        version: false,
+        stateDir,
+        daemonBaseUrl: 'http://proxy.example.test/agent-device',
+        platform: 'android',
+        osVersion: '34',
+        imageTag: 'google_apis_playstore',
+        deviceMode: 'full',
+        deviceBaseline: 'logged-in',
+        physical: true,
+      },
+      client: createTestClient(),
+    });
+  });
+
+  const state = readActiveConnectionState({ stateDir });
+  assert.ok(state);
+  const generated = JSON.parse(fs.readFileSync(state.remoteConfigPath, 'utf8')) as Record<
+    string,
+    unknown
+  >;
+  assert.equal(generated.platform, 'android');
+  assert.equal(generated.osVersion, '34');
+  assert.equal(generated.imageTag, 'google_apis_playstore');
+  assert.equal(generated.deviceMode, 'full');
+  assert.equal(generated.deviceBaseline, 'logged-in');
+  assert.equal(generated.physical, true);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test('connect proxy stores no default for a spec key that names nothing', async () => {
+  const { tempRoot, stateDir } = connectionWorkspace('agent-device-connect-proxy-blank-spec-');
+
+  await withCapturedStdoutAsync(async () => {
+    await connectCommand({
+      positionals: ['proxy'],
+      flags: {
+        json: true,
+        help: false,
+        version: false,
+        stateDir,
+        daemonBaseUrl: 'http://proxy.example.test/agent-device',
+        platform: 'android',
+        osVersion: '',
+        imageTag: ' ',
+        deviceMode: '',
+        deviceBaseline: ' ',
+        physical: false,
+      },
+      client: createTestClient(),
+    });
+  });
+
+  const state = readActiveConnectionState({ stateDir });
+  assert.ok(state);
+  const generated = JSON.parse(fs.readFileSync(state.remoteConfigPath, 'utf8')) as Record<
+    string,
+    unknown
+  >;
+  assert.equal(generated.platform, 'android');
+  for (const key of LEASE_DEVICE_SPEC_KEYS) assert.equal(key in generated, false);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});

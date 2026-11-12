@@ -1,0 +1,78 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { afterEach, test, vi } from 'vitest';
+import assert from 'node:assert/strict';
+import { mkdtempForTestSync } from '@agent-device/test-kit';
+
+vi.mock('../cli/commands/react-devtools.ts', () => ({
+  runReactDevtoolsCommand: vi.fn(async () => 0),
+}));
+
+import { runCli } from '../cli.ts';
+import { runReactDevtoolsCommand } from '../cli/commands/react-devtools.ts';
+import { installIsolatedCliTestEnv } from './cli-test-env.ts';
+import {
+  hashRemoteConfigFile,
+  writeRemoteConnectionState,
+} from '@agent-device/remote/remote-connection-state';
+import type { DaemonResponse } from '@agent-device/daemon-client';
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
+
+test('react-devtools uses active remote connection session after defaults are merged', async () => {
+  const tempRoot = mkdtempForTestSync('agent-device-react-devtools-session-');
+  const stateDir = path.join(tempRoot, 'state');
+  const remoteConfigPath = path.join(tempRoot, 'remote.json');
+  fs.writeFileSync(
+    remoteConfigPath,
+    JSON.stringify({
+      daemonBaseUrl: 'https://daemon.example.test',
+      platform: 'android',
+      metroProxyBaseUrl: 'https://bridge.example.test',
+      metroBearerToken: 'token',
+    }),
+  );
+  writeRemoteConnectionState({
+    stateDir,
+    state: {
+      version: 1,
+      session: 'adc-android',
+      remoteConfigPath,
+      remoteConfigHash: hashRemoteConfigFile(remoteConfigPath),
+      daemon: { baseUrl: 'https://daemon.example.test', transport: 'http' },
+      tenant: 'tenant-1',
+      runId: 'run-1',
+      leaseId: 'lease-1',
+      leaseBackend: 'android-instance',
+      platform: 'android',
+      connectedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  });
+
+  const originalExit = process.exit;
+  let exitCode: number | undefined;
+  const restoreEnv = installIsolatedCliTestEnv();
+  (process as any).exit = ((code?: number) => {
+    exitCode = code ?? 0;
+  }) as typeof process.exit;
+
+  const sendToDaemon = async (): Promise<DaemonResponse> => ({ ok: true, data: {} });
+
+  try {
+    await runCli(['react-devtools', 'profile', 'start', '--state-dir', stateDir], {
+      sendToDaemon,
+    });
+  } finally {
+    restoreEnv();
+    process.exit = originalExit;
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+
+  assert.equal(exitCode, 0);
+  assert.equal(vi.mocked(runReactDevtoolsCommand).mock.calls.length, 1);
+  assert.deepEqual(vi.mocked(runReactDevtoolsCommand).mock.calls[0]?.[0], ['profile', 'start']);
+  assert.equal(vi.mocked(runReactDevtoolsCommand).mock.calls[0]?.[1]?.session, 'adc-android');
+});

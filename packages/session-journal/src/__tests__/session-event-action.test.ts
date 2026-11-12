@@ -1,0 +1,381 @@
+import type { SessionAction } from '@agent-device/contracts/session';
+import assert from 'node:assert/strict';
+import { test } from 'vitest';
+import { buildActionEventResult } from '../session-event-action-presentation.ts';
+import { buildActionDetails, buildActionSummary } from '../session-event-action.ts';
+
+function action(
+  command: string,
+  result: Record<string, unknown>,
+  overrides: Partial<SessionAction> = {},
+): SessionAction {
+  return {
+    ts: Date.now(),
+    command,
+    positionals: [],
+    flags: {},
+    result,
+    ...overrides,
+  };
+}
+
+test.each(['volume-down', 'android-keycode:300'])(
+  'TV action events retain button %s in summaries and details',
+  (button) => {
+    const press = action('tv-remote', { button, durationMs: 500 });
+    assert.equal(buildActionSummary(press), `Pressed TV remote ${button}`);
+    assert.equal(buildActionDetails(press).button, button);
+    assert.equal(buildActionDetails(press).durationMs, 500);
+  },
+);
+
+test.each(['volume-sideways', 'android-keycode:2147483648'])(
+  'TV action events omit invalid button %s',
+  (button) => {
+    const press = action('tv-remote', { button });
+    assert.equal(buildActionSummary(press), 'Used TV remote');
+    assert.equal(buildActionDetails(press).button, undefined);
+  },
+);
+
+test('scroll action events describe direction and distance', () => {
+  const byPixels = action('scroll', {
+    direction: 'down',
+    pixels: 240,
+    durationMs: 500,
+  });
+  const toEdge = action('scroll', {
+    direction: 'up',
+    edge: 'top',
+    passes: 3,
+  });
+  const byAmount = action('scroll', {
+    direction: 'right',
+    amount: 0.6,
+  });
+
+  assert.equal(buildActionSummary(byPixels), 'Scrolled down by 240px');
+  assert.equal(buildActionSummary(toEdge), 'Scrolled to top in 3 passes');
+  assert.equal(buildActionSummary(byAmount), 'Scrolled right by 0.6');
+  const details = buildActionDetails(byPixels);
+  assert.deepEqual(
+    {
+      direction: details.direction,
+      pixels: details.pixels,
+      durationMs: details.durationMs,
+    },
+    {
+      direction: 'down',
+      pixels: 240,
+      durationMs: 500,
+    },
+  );
+});
+
+test('install action events include the app name and identifier', () => {
+  assert.equal(
+    buildActionSummary(
+      action('install', {
+        appName: 'Example',
+        bundleId: 'com.example.app',
+        appPath: '/tmp/Example.app',
+      }),
+    ),
+    'Installed Example (com.example.app)',
+  );
+  assert.equal(
+    buildActionSummary(
+      action('reinstall', {
+        appName: 'Example',
+        packageName: 'com.example.android',
+      }),
+    ),
+    'Reinstalled Example (com.example.android)',
+  );
+});
+
+test('screenshot action events prefer the client-requested filename', () => {
+  const result = buildActionEventResult(
+    {
+      command: 'screenshot',
+      meta: {
+        clientArtifactPaths: {
+          path: '/Users/example/artifacts/home-screen.png',
+        },
+      },
+    },
+    { path: '/tmp/agent-device-screenshot-random.png' },
+  );
+  const screenshot = action('screenshot', result);
+
+  assert.equal(buildActionSummary(screenshot), 'Captured screenshot home-screen.png');
+  assert.equal(buildActionDetails(screenshot).requestedFileName, 'home-screen.png');
+  assert.equal(JSON.stringify(buildActionDetails(screenshot)).includes('/Users/example'), false);
+});
+
+test('screenshot action events fall back to the daemon output basename', () => {
+  const result = buildActionEventResult({ command: 'screenshot' }, { path: '/tmp/screenshot.png' });
+
+  assert.equal(
+    buildActionSummary(action('screenshot', result)),
+    'Captured screenshot screenshot.png',
+  );
+});
+
+test('action events retain only typed command-owned flags', () => {
+  const details = buildActionDetails(
+    action(
+      'open',
+      { appBundleId: 'com.example.app' },
+      {
+        positionals: ['com.example.app'],
+        flags: {
+          platform: 'ios',
+          surface: 'app',
+          relaunch: true,
+          launchArgs: ['plain-private-value'],
+          header: ['X-Customer: private-customer'],
+          replayEnv: ['CUSTOMER=private-customer'],
+          replayShellEnv: { CUSTOMER: 'private-customer' },
+          out: '/private/customer/output',
+        },
+      },
+    ),
+  );
+
+  assert.deepEqual(details.flags, {
+    platform: 'ios',
+    surface: 'app',
+    relaunch: true,
+  });
+  assert.equal(JSON.stringify(details).includes('private-customer'), false);
+  assert.equal(JSON.stringify(details).includes('plain-private-value'), false);
+  assert.equal(JSON.stringify(details).includes('/private/customer'), false);
+});
+
+test('unknown commands never project arbitrary result messages or paths', () => {
+  const details = buildActionDetails(
+    action('future-command', {
+      message: 'customer-private-result',
+      path: '/private/customer/result.txt',
+      outPath: '/private/customer/output.txt',
+      telemetryPath: '/private/customer/telemetry.txt',
+      appName: 'private-customer-app',
+      ref: 'private-customer-ref',
+      x: 123,
+    }),
+  );
+
+  assert.equal(buildActionSummary(action('future-command', {})), 'Ran future-command');
+  assert.deepEqual(details, { command: 'future-command' });
+  assert.equal(JSON.stringify(details).includes('customer-private'), false);
+});
+
+test('identity action events project only public result platforms', () => {
+  const publicPlatform = buildActionDetails(
+    action('open', { platform: 'ios', appBundleId: 'com.example.app' }),
+  );
+  const internalPlatform = buildActionDetails(
+    action('open', { platform: 'apple', appBundleId: 'com.example.app' }),
+  );
+
+  assert.equal(publicPlatform.platform, 'ios');
+  assert.equal(internalPlatform.platform, undefined);
+});
+
+test('structural action events preserve navigation, viewport, keyboard, and gesture outcomes', () => {
+  const back = action('back', { action: 'back', mode: 'system' });
+  const orientation = action('orientation', {
+    action: 'orientation',
+    orientation: 'landscape-left',
+  });
+  const viewport = action('viewport', { width: 402, height: 874 });
+  const keyboard = action('keyboard', {
+    action: 'dismiss',
+    platform: 'ios',
+    wasVisible: true,
+    visible: false,
+    dismissed: true,
+    focusedResourceId: 'private-field-id',
+  });
+  const gesture = action('gesture', {
+    kind: 'pan',
+    durationMs: 500,
+    pointerCount: 2,
+    x1: 10,
+    y1: 20,
+    x2: 30,
+    y2: 40,
+    message: 'private backend message',
+  });
+
+  assert.equal(buildActionSummary(back), 'Went back using system navigation');
+  assert.equal(buildActionSummary(orientation), 'Rotated to landscape-left');
+
+  // An owner that reported no resulting rotation keeps the requested value, so
+  // the recorded action must not claim the device rotated.
+  const unconfirmedOrientation = action('orientation', {
+    action: 'orientation',
+    orientation: 'portrait',
+    confirmed: false,
+    warning:
+      'Requested portrait; the device owner reported no resulting orientation, so the rotation is unconfirmed.',
+    message: 'Rotation requested: portrait (unconfirmed)',
+  });
+  assert.equal(buildActionSummary(unconfirmedOrientation), 'Requested portrait (unconfirmed)');
+  const sensorOrientation = action('orientation', { action: 'orientation', orientation: 'auto' });
+  assert.equal(buildActionSummary(sensorOrientation), 'Rotation follows the device sensor');
+  assert.deepEqual(buildActionDetails(sensorOrientation), {
+    command: 'orientation',
+    orientation: 'auto',
+  });
+  assert.equal(buildActionSummary(viewport), 'Set viewport to 402×874');
+  assert.equal(buildActionSummary(keyboard), 'Dismissed keyboard');
+  assert.equal(buildActionSummary(gesture), 'Ran pan gesture');
+  assert.deepEqual(buildActionDetails(keyboard), {
+    command: 'keyboard',
+    platform: 'ios',
+    action: 'dismiss',
+    visible: false,
+    wasVisible: true,
+    dismissed: true,
+  });
+  assert.equal(JSON.stringify(buildActionDetails(keyboard)).includes('private-field-id'), false);
+  assert.deepEqual(buildActionDetails(gesture), {
+    command: 'gesture',
+    x2: 30,
+    y2: 40,
+    durationMs: 500,
+    kind: 'pan',
+    pointerCount: 2,
+    x1: 10,
+    y1: 20,
+  });
+});
+
+// #1598: the keyboard-dismiss mechanism must show up in both the human
+// summary and the structured details, so a transcript reader can tell a
+// vouched-for dismiss-key tap; unrecognized mechanisms are dropped (#1606).
+test('keyboard dismiss action events drop an unrecognized mechanism', () => {
+  const keyboard = action('keyboard', {
+    action: 'dismiss',
+    platform: 'ios',
+    wasVisible: true,
+    visible: false,
+    dismissed: true,
+    mechanism: 'legacySafeAreaTap',
+  });
+
+  assert.equal(buildActionSummary(keyboard), 'Dismissed keyboard');
+  assert.deepEqual(buildActionDetails(keyboard), {
+    command: 'keyboard',
+    platform: 'ios',
+    action: 'dismiss',
+    visible: false,
+    wasVisible: true,
+    dismissed: true,
+  });
+});
+
+test('keyboard dismiss action events omit mechanism when the keyboard was already hidden', () => {
+  const keyboard = action('keyboard', {
+    action: 'dismiss',
+    platform: 'ios',
+    wasVisible: false,
+    visible: false,
+    dismissed: false,
+  });
+
+  assert.equal(buildActionSummary(keyboard), 'Keyboard was already hidden');
+  assert.deepEqual(buildActionDetails(keyboard), {
+    command: 'keyboard',
+    platform: 'ios',
+    action: 'dismiss',
+    visible: false,
+    wasVisible: false,
+    dismissed: false,
+  });
+});
+
+test('record and trace events expose only bounded artifact basenames', () => {
+  const trace = action(
+    'trace',
+    { action: 'stop', outPath: '/private/customer/perf.trace' },
+    { positionals: ['stop', '/private/customer/perf.trace'] },
+  );
+  const recording = action(
+    'record',
+    { action: 'stop', outPath: 'C:\\private\\customer\\demo.mp4', showTouches: false },
+    { positionals: ['stop'] },
+  );
+
+  assert.equal(buildActionSummary(trace), 'Stopped trace perf.trace');
+  assert.equal(buildActionSummary(recording), 'Stopped recording demo.mp4');
+  assert.deepEqual(buildActionDetails(trace), {
+    command: 'trace',
+    positionals: ['<arg>', '<arg>'],
+    action: 'stop',
+    fileName: 'perf.trace',
+  });
+  assert.deepEqual(buildActionDetails(recording), {
+    command: 'record',
+    positionals: ['<arg>'],
+    action: 'stop',
+    fileName: 'demo.mp4',
+    showTouches: false,
+  });
+});
+
+test('telephony action events name the simulated event and carry neither number nor text', () => {
+  const sms = action(
+    'telephony',
+    {
+      action: 'sms',
+      number: '5551234',
+      textLength: 11,
+      message: 'Simulated an incoming SMS from 5551234',
+    },
+    { positionals: ['sms', '5551234', 'private msg'] },
+  );
+  const call = action('telephony', { action: 'call', number: '5551234' });
+  const cancel = action('telephony', { action: 'cancel', number: '5551234' });
+
+  assert.equal(buildActionSummary(sms), 'Simulated an incoming SMS');
+  assert.equal(buildActionSummary(call), 'Simulated an incoming call');
+  assert.equal(
+    buildActionSummary(action('telephony', { action: 'accept', number: '5551234' })),
+    'Accepted the simulated call',
+  );
+  assert.equal(buildActionSummary(cancel), 'Ended the simulated call');
+  assert.equal(buildActionSummary(action('telephony', {})), 'Simulated a telephony event');
+  assert.deepEqual(buildActionDetails(sms), {
+    command: 'telephony',
+    action: 'sms',
+    positionals: ['<arg>', '<arg>', '<arg>'],
+  });
+  const serialized = JSON.stringify(buildActionDetails(sms));
+  assert.equal(serialized.includes('5551234'), false);
+  assert.equal(serialized.includes('private msg'), false);
+});
+
+test('a cancelled multi-finger tap series records its kind and how many repetitions completed', () => {
+  const tap = action('gesture', {
+    kind: 'tap',
+    durationMs: 50,
+    pointerCount: 5,
+    count: 3,
+    completed: 1,
+    pauseMs: 100,
+    message: 'Tapped 5 points 1 of 3 times; the request was cancelled',
+  });
+  assert.equal(buildActionSummary(tap), 'Ran tap gesture');
+  assert.deepEqual(buildActionDetails(tap), {
+    command: 'gesture',
+    kind: 'tap',
+    durationMs: 50,
+    pointerCount: 5,
+    count: 3,
+    completed: 1,
+    pauseMs: 100,
+  });
+});

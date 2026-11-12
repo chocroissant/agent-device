@@ -1,0 +1,325 @@
+import path from 'node:path';
+import { isIosFamily, isMacOs, type DeviceInfo } from '@agent-device/kernel/device';
+import { AppError } from '@agent-device/kernel/errors';
+import type {
+  AppLogBackgroundProcess,
+  AppLogLiveSnapshot,
+  AppLogOutputSink,
+  AppLogRuntimeHost,
+  AppLogStartInput,
+  AppLogStartResult,
+} from '@agent-device/contracts/app-log-runtime';
+import type { FinishOutcome } from '@agent-device/contracts/durable-resource';
+import type { RuntimeOwnerRef } from '@agent-device/contracts/platform-runtime';
+import type { LogBackend } from '@agent-device/contracts/observability';
+import { AsyncCleanupStack } from '@agent-device/contracts/async-lifecycle';
+import {
+  assertAppLogSessionArtifacts,
+  createAppLogLiveHandleFromFinish,
+  createAppLogStartResult,
+} from '@agent-device/capture-kit';
+import { scopeSimctlArgsForDevice } from '../core/simctl.ts';
+import { APPLE_XCTEST_LOGS_HINT, backendForAppleDevice } from './backend.ts';
+import {
+  checkCoreDeviceConsoleCaptureSupport,
+  IOS_DEVICE_CONSOLE_CAPTURE_PROBE_FAILED,
+  IOS_DEVICE_CONSOLE_CAPTURE_UNSUPPORTED,
+} from './coredevice-console.ts';
+import { createAppleAppLogEnvelope, type AppleAppLogDescriptor } from './descriptor.ts';
+import {
+  buildAppleLogPredicate,
+  buildIosDeviceConsoleLaunchArgs,
+  buildIosSimulatorLogStreamArgs,
+} from './log-predicate.ts';
+
+// Measured launches take 1-2 s on a loaded host.
+const SIMULATOR_STREAM_LAUNCH_TIMEOUT_MS = 10_000;
+
+export async function startAppleAppLogs(
+  host: AppLogRuntimeHost,
+  device: DeviceInfo,
+  input: AppLogStartInput,
+  owner: RuntimeOwnerRef,
+  signal?: AbortSignal,
+): Promise<AppLogStartResult> {
+  assertAppleLogStartSupported(device);
+  assertAppLogSessionArtifacts(host, input);
+  const backend = backendForAppleDevice(device);
+  const command = await commandForAppleAppLogs(host, device, input.appBundleId, signal);
+  const rollback = new AsyncCleanupStack();
+  let adopted = false;
+  try {
+    const output = await host.outputs.openAppend(input.outputPath);
+    rollback.defer(async () => {
+      if (!adopted) await output[Symbol.asyncDispose]();
+    });
+    signal?.throwIfAborted();
+    const launch = observeFirstWrite(output);
+    const backgroundProcess = await startCheckedAppleProcess(
+      host,
+      device,
+      command,
+      launch.sink,
+      input.pidPath,
+      signal,
+    );
+    rollback.defer(async () => {
+      if (!adopted) await backgroundProcess[Symbol.asyncDispose]();
+    });
+    if (device.kind === 'simulator') {
+      await waitForSimulatorStreamLaunch(host, launch.written, backgroundProcess.wait, signal);
+    }
+    const handle = createAppleProcessHandle(
+      host,
+      backgroundProcess,
+      output,
+      backend,
+      input.outputPath,
+    );
+    const descriptor: AppleAppLogDescriptor = {
+      transport: backend === 'ios-device' ? 'coredevice-console' : 'apple-log-stream',
+      backend,
+      outputPath: input.outputPath,
+      ...(input.pidPath === undefined ? {} : { pidPath: input.pidPath }),
+    };
+    const result = createAppLogStartResult(
+      handle,
+      createAppleAppLogEnvelope({
+        sessionId: input.sessionId,
+        device,
+        owner,
+        fence: input.fence,
+        descriptor,
+      }),
+    );
+    adopted = true;
+    return result;
+  } finally {
+    await rollback[Symbol.asyncDispose]();
+  }
+}
+
+function assertAppleLogStartSupported(device: DeviceInfo): void {
+  if (device.appleOs === 'watchos') {
+    throw new AppError('UNSUPPORTED_PLATFORM', 'watchOS app logs are not supported');
+  }
+  if (
+    isIosFamily(device) &&
+    device.kind === 'device' &&
+    device.iosPhysicalDeviceBackend === 'xctest'
+  ) {
+    throw new AppError('UNSUPPORTED_OPERATION', APPLE_XCTEST_LOGS_HINT, {
+      hint: APPLE_XCTEST_LOGS_HINT,
+    });
+  }
+}
+
+async function startCheckedAppleProcess(
+  host: AppLogRuntimeHost,
+  device: DeviceInfo,
+  command: { executable: string; args: readonly string[]; allowFailure: true },
+  output: AppLogOutputSink,
+  pidPath: string | undefined,
+  signal?: AbortSignal,
+): Promise<AppLogBackgroundProcess> {
+  if (isIosFamily(device) && device.kind === 'device') {
+    const support = await checkCoreDeviceConsoleCaptureSupport(host, signal);
+    if (!support.supported) {
+      const message =
+        support.reason === 'unsupported'
+          ? IOS_DEVICE_CONSOLE_CAPTURE_UNSUPPORTED
+          : IOS_DEVICE_CONSOLE_CAPTURE_PROBE_FAILED;
+      throw new AppError(
+        support.reason === 'unsupported' ? 'UNSUPPORTED_OPERATION' : 'COMMAND_FAILED',
+        message.message,
+        { backend: 'ios-device', hint: message.hint, stderr: support.stderr },
+      );
+    }
+  }
+  signal?.throwIfAborted();
+  return await host.processes.start({
+    command: { kind: 'host', request: command },
+    output,
+    ...(pidPath ? { markerPath: pidPath } : {}),
+  });
+}
+
+async function commandForAppleAppLogs(
+  host: AppLogRuntimeHost,
+  device: DeviceInfo,
+  appBundleId: string,
+  signal?: AbortSignal,
+) {
+  if (isMacOs(device)) {
+    return {
+      executable: 'log',
+      args: ['stream', '--style', 'compact', '--predicate', buildAppleLogPredicate(appBundleId)],
+      allowFailure: true,
+    } as const;
+  }
+  if (device.kind === 'device') {
+    return {
+      executable: 'xcrun',
+      args: buildIosDeviceConsoleLaunchArgs(device.id, appBundleId),
+      allowFailure: true,
+    } as const;
+  }
+  const executableName = await resolveSimulatorExecutable(host, device, appBundleId, signal);
+  return {
+    executable: 'xcrun',
+    args: buildIosSimulatorLogStreamArgs(device, { appBundleId, executableName }),
+    allowFailure: true,
+  } as const;
+}
+
+async function resolveSimulatorExecutable(
+  host: AppLogRuntimeHost,
+  device: DeviceInfo,
+  appBundleId: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const container = await host.appleTools.run(
+    {
+      tool: 'simctl',
+      args: scopeSimctlArgsForDevice(device, ['get_app_container', device.id, appBundleId, 'app']),
+      allowFailure: true,
+      timeoutMs: 4_000,
+    },
+    signal,
+  );
+  const appPath = container.exitCode === 0 ? container.stdout.trim() : '';
+  if (!appPath) return undefined;
+  const plist = await host.commands.run(
+    {
+      executable: 'plutil',
+      args: ['-extract', 'CFBundleExecutable', 'raw', '-o', '-', path.join(appPath, 'Info.plist')],
+      allowFailure: true,
+      timeoutMs: 4_000,
+    },
+    signal,
+  );
+  return plist.exitCode === 0 ? plist.stdout.trim() || undefined : undefined;
+}
+
+function observeFirstWrite(output: AppLogOutputSink): {
+  sink: AppLogOutputSink;
+  written: Promise<void>;
+} {
+  let markWritten = noop;
+  const written = new Promise<void>((resolve) => {
+    markWritten = resolve;
+  });
+  const sink: AppLogOutputSink = {
+    write: async (chunk) => {
+      markWritten();
+      await output.write(chunk);
+    },
+    [Symbol.asyncDispose]: async () => await output[Symbol.asyncDispose](),
+  };
+  return { sink, written };
+}
+
+// simctl forwards a stop signal only after the in-simulator process has launched. An earlier
+// signal ends simctl while the launch completes, and the orphan keeps the output pipes open.
+async function waitForSimulatorStreamLaunch(
+  host: AppLogRuntimeHost,
+  written: Promise<void>,
+  exited: Promise<unknown>,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  let onAbort = noop;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal?.reason);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+  const deadline = new AbortController();
+  const timedOut = host.clock
+    .sleep(SIMULATOR_STREAM_LAUNCH_TIMEOUT_MS, deadline.signal)
+    .then(() => 'timed-out' as const);
+  timedOut.catch(noop);
+  try {
+    const launched = Promise.race([written, exited.then(noop, noop)]).then(
+      () => 'launched' as const,
+    );
+    if ((await Promise.race([launched, timedOut, aborted])) === 'timed-out') {
+      throw new AppError(
+        'COMMAND_FAILED',
+        `Simulator log stream did not start within ${SIMULATOR_STREAM_LAUNCH_TIMEOUT_MS}ms`,
+        {
+          reason: 'simulator-log-stream-launch-timeout',
+          timeoutMs: SIMULATOR_STREAM_LAUNCH_TIMEOUT_MS,
+          hint: 'Check that the simulator finished booting, then retry logs start.',
+        },
+      );
+    }
+  } finally {
+    deadline.abort();
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+function noop(): void {}
+
+function createAppleProcessHandle(
+  host: AppLogRuntimeHost,
+  backgroundProcess: AppLogBackgroundProcess,
+  output: AppLogOutputSink,
+  backend: LogBackend,
+  outputPath: string,
+) {
+  const startedAt = host.clock.now();
+  let state: AppLogLiveSnapshot['state'] = 'active';
+  void backgroundProcess.wait.then(
+    (result) => {
+      state = result.exitCode === 0 ? 'ended' : 'failed';
+    },
+    () => {
+      state = 'failed';
+    },
+  );
+  const cleanupSteps = new Set([
+    async () => await backgroundProcess.terminate(),
+    async () => await backgroundProcess.wait.then(() => undefined),
+    async () => await backgroundProcess[Symbol.asyncDispose](),
+    async () => await output[Symbol.asyncDispose](),
+  ]);
+  let finishPromise:
+    | Promise<FinishOutcome<{ backend: LogBackend; outputPath: string; completedAt: number }>>
+    | undefined;
+  const finish = async () =>
+    (finishPromise ??= (async () => {
+      const failures = await cleanupInOrder(cleanupSteps);
+      if (failures.length > 0) {
+        finishPromise = undefined;
+        state = 'failed';
+        return {
+          status: 'cleanup-pending',
+          reason: 'transport-failed',
+          message: 'Apple app-log cleanup did not settle every owned resource',
+        } as const;
+      }
+      state = 'ended';
+      return {
+        status: 'completed',
+        result: { backend, outputPath, completedAt: host.clock.now() },
+      } as const;
+    })());
+  return createAppLogLiveHandleFromFinish({
+    inspect: () => ({ backend, state, startedAt }),
+    finish,
+  });
+}
+
+async function cleanupInOrder(steps: Set<() => Promise<void>>): Promise<unknown[]> {
+  const failures: unknown[] = [];
+  for (const step of steps) {
+    try {
+      await step();
+      steps.delete(step);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  return failures;
+}

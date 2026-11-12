@@ -1,0 +1,122 @@
+import { resolveCommandAndroidAvdSelection } from '../../core/daemon-command-registry.ts';
+import { errorResponse, type DaemonResponse } from '@agent-device/kernel/contracts';
+import type { RuntimeOperationFact } from '@agent-device/contracts/platform-runtime';
+import type { LeaseLifecycleProvider, TargetShutdownResult } from '@agent-device/contracts/device';
+import { shutdownTargetUse } from '@agent-device/contracts/platform-runtime-operations';
+import { publicPlatformString } from '@agent-device/kernel/device';
+import {
+  requireSessionOrExplicitSelector,
+  resolveCommandDevice,
+} from '../../resources/session-device-resolution.ts';
+import {
+  requireRuntimeBinding,
+  requireRuntimeFacts,
+  type RuntimeCommandHandlerParams,
+} from '../../core/session-runtime-admission.ts';
+import { deviceStatusReportResponse } from './session-device-status-response.ts';
+import type { LeaseRegistry } from '../../resources/lease-registry.ts';
+import { resolveSessionScope, sessionMatchesInventoryScope } from '../session-routing.ts';
+import { releaseTargetLease } from '../target-lease-release.ts';
+
+function shutdownUnavailableResponse(fact: RuntimeOperationFact) {
+  if (fact.available) return null;
+  return errorResponse(
+    'UNSUPPORTED_OPERATION',
+    'shutdown is supported only for Apple simulators and Android emulators.',
+    undefined,
+    fact.hint ? { hint: fact.hint } : undefined,
+  );
+}
+
+function shutdownFailureMessage(shutdown: TargetShutdownResult): string {
+  const message = shutdown.error?.message ?? shutdown.stderr.trim();
+  return message.length > 0 ? message : 'Shutdown failed';
+}
+
+/**
+ * Turns off the selected simulator/emulator without ending any session that uses it.
+ * Refuses with `DEVICE_IN_USE` when the target is the active session's device;
+ * that device is shut down via `close --shutdown` instead.
+ */
+export async function handleShutdownCommand(
+  params: RuntimeCommandHandlerParams & {
+    leaseRegistry?: LeaseRegistry;
+    leaseLifecycleProvider?: LeaseLifecycleProvider;
+  },
+): Promise<DaemonResponse> {
+  const activeSession = params.sessionStore.get(params.sessionName);
+  const flags = params.req.flags ?? {};
+  const guard = requireSessionOrExplicitSelector(params.req.command, activeSession, flags);
+  if (guard) return guard;
+
+  const device = await resolveCommandDevice({
+    req: params.req,
+    session: activeSession,
+    env: params.sessionStore.host.env,
+    androidAvdSelection: resolveCommandAndroidAvdSelection(params.req.command),
+    platformServices: params.platformServices,
+  });
+  const inspectFacts = requireRuntimeFacts(params.inspectFacts);
+  const facts = await inspectFacts(device);
+  const unsupported = shutdownUnavailableResponse(facts.operations.shutdownTarget);
+  if (unsupported) return unsupported;
+
+  const deviceSession = params.sessionStore.findByDevice(device.id);
+  if (deviceSession) {
+    const visible = sessionMatchesInventoryScope(
+      deviceSession.session,
+      resolveSessionScope(params.req),
+    );
+    return errorResponse(
+      'DEVICE_IN_USE',
+      'Cannot shut down an active session device directly. Use close --shutdown to end the session and turn off the simulator/emulator.',
+      {
+        ...(visible
+          ? {
+              hint: `Run agent-device close --shutdown --session ${deviceSession.address}`,
+              session: deviceSession.address,
+            }
+          : {}),
+        platform: publicPlatformString(device),
+        target: device.target ?? 'mobile',
+        device: device.name,
+        id: device.id,
+        kind: device.kind,
+      },
+    );
+  }
+
+  const bindDevice = requireRuntimeBinding(params.bindDevice);
+  const runtime = await bindDevice(device, shutdownTargetUse);
+  let provider: Record<string, unknown> | undefined;
+  const shutdown = await runtime.operations.shutdownTarget({
+    releaseLease: async (leaseId) => {
+      const result = await releaseTargetLease({
+        req: params.req,
+        owner: runtime.owner,
+        leaseId,
+        leaseRegistry: params.leaseRegistry,
+        leaseLifecycleProvider: params.leaseLifecycleProvider,
+      });
+      provider = result.provider;
+      return result.shutdown;
+    },
+  });
+  if (!shutdown.success) {
+    return errorResponse(
+      shutdown.error?.code ?? 'COMMAND_FAILED',
+      shutdownFailureMessage(shutdown),
+      {
+        platform: publicPlatformString(device),
+        target: device.target ?? 'mobile',
+        device: device.name,
+        id: device.id,
+        kind: device.kind,
+        shutdown,
+      },
+    );
+  }
+
+  const response = deviceStatusReportResponse(device, { shutdown });
+  return response.ok && provider ? { ...response, data: { ...response.data, provider } } : response;
+}

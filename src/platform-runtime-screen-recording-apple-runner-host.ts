@@ -1,0 +1,119 @@
+import type { AppleScreenRecordingRunnerRequest } from '@agent-device/contracts/screen-recording-runtime-host';
+import type { ManagedProcessOwnership } from '@agent-device/contracts/platform-runtime-host';
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import type { EnvMap } from '@agent-device/kernel/source-value';
+
+export async function runAppleRecordingRunner(
+  device: DeviceInfo,
+  request: AppleScreenRecordingRunnerRequest,
+  signal?: AbortSignal,
+) {
+  const { resolveAppleRunnerScreenRecordingTransport } =
+    await import('./platform-runtime-screen-recording-apple-runner-transport.ts');
+  const transport = resolveAppleRunnerScreenRecordingTransport();
+  if (request.kind === 'stop') {
+    if (transport.authority !== request.runnerAuthority) {
+      throw new Error('Apple runner recording ownership changed before cleanup');
+    }
+    await transport.stop({
+      device,
+      runnerSessionId: request.runnerSessionId,
+      appBundleId: request.appBundleId,
+      signal,
+    });
+    return {};
+  }
+  const result = await transport.start({
+    device,
+    appBundleId: request.appBundleId,
+    outputPath: request.outputPath,
+    fps: request.fps,
+    signal,
+  });
+  return Object.freeze({
+    runnerSessionId: result.runnerSessionId,
+    runnerAuthority: transport.authority,
+    ...(result.remotePath === undefined ? {} : { remotePath: result.remotePath }),
+    ...(typeof result.recorderStartUptimeMs === 'number'
+      ? { recorderStartUptimeMs: result.recorderStartUptimeMs }
+      : {}),
+  });
+}
+
+export async function inspectAppleRunnerOwnership(
+  device: DeviceInfo,
+  runnerSessionId: string,
+  runnerAuthority: 'local-lease' | 'scoped-provider',
+): Promise<ManagedProcessOwnership> {
+  const { resolveAppleRunnerScreenRecordingTransport } =
+    await import('./platform-runtime-screen-recording-apple-runner-transport.ts');
+  const transport = resolveAppleRunnerScreenRecordingTransport();
+  return transport.authority === runnerAuthority
+    ? await transport.inspect(device, runnerSessionId)
+    : 'ownership-lost';
+}
+
+export async function retrieveAppleRunnerRecording(
+  device: DeviceInfo,
+  remotePath: string,
+  outputPath: string,
+  env: Readonly<EnvMap>,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
+  const { resolveIosPhysicalDeviceControl } =
+    await import('@agent-device/platform-apple/physical-device');
+  const control = resolveIosPhysicalDeviceControl(device);
+  await control.copyRunnerFile(device, remotePath, outputPath, env);
+  signal?.throwIfAborted();
+}
+
+export async function captureAppleClockAnchor(
+  device: DeviceInfo,
+  appBundleId: string,
+  signal?: AbortSignal,
+  requestId?: string,
+) {
+  try {
+    const [simulatorTransport, runnerTransport] = await Promise.all([
+      import('./platform-runtime-screen-recording-apple-transport.ts').then((module) =>
+        module.resolveAppleSimulatorScreenRecordingTransport(),
+      ),
+      import('./platform-runtime-screen-recording-apple-runner-transport.ts').then((module) =>
+        module.resolveAppleRunnerScreenRecordingTransport(),
+      ),
+    ]);
+    if (
+      simulatorTransport.mode === 'transport-composed' &&
+      runnerTransport.authority !== 'scoped-provider'
+    ) {
+      return undefined;
+    }
+    const { runAppleRunnerCommand } =
+      await import('@agent-device/platform-apple/runner/operations');
+    const result = await runAppleRunnerCommand(
+      device,
+      { command: 'snapshot', appBundleId, interactiveOnly: true, depth: 1 },
+      { signal, requestId },
+    );
+    const wallClockAtMs = Date.now();
+    return typeof result.currentUptimeMs === 'number' &&
+      Number.isFinite(result.currentUptimeMs) &&
+      result.currentUptimeMs > 0
+      ? { wallClockAtMs, uptimeMs: result.currentUptimeMs }
+      : undefined;
+  } catch {
+    signal?.throwIfAborted();
+    const { throwIfRequestCanceled } = await import('@agent-device/host-kit/request');
+    throwIfRequestCanceled(requestId);
+    return undefined;
+  }
+}
+
+export async function isAppleRunnerBundleId(
+  bundleId: string,
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<boolean> {
+  const { resolveRunnerContainerBundleIds } = await import('@agent-device/apple-runner');
+  return resolveRunnerContainerBundleIds(env).includes(bundleId);
+}

@@ -1,0 +1,937 @@
+import { gestureHelpTopic } from './cli-help-gestures.ts';
+import { listCliCommandNames } from '@agent-device/command-registry/catalog';
+import { getReplayBackendDeclaration } from '@agent-device/replay-port/replay-backend-declarations';
+import { normalizeCliCommandAlias } from '@agent-device/command-registry/cli-command-aliases';
+import { helpBody } from '@agent-device/command-registry/command-text';
+import { getCliCommandSchema, getCommandSchema } from '@agent-device/command-surface';
+import type { CommandSchema } from '@agent-device/command-registry/command-schema';
+import {
+  DEVICE_SELECTION_FLAG_KEYS,
+  GLOBAL_FLAG_KEYS,
+} from '@agent-device/command-registry/flag-groups';
+import { getFlagDefinitions } from '@agent-device/command-registry/flag-registry';
+import type { FlagDefinition, FlagKey } from '@agent-device/command-registry/flag-types';
+import { buildCommandUsage } from './usage.ts';
+import { readVersion } from '@agent-device/host-kit/version';
+import {
+  debuggingHelpTopics,
+  manualQaHelpTopics,
+  qaReportHelpTopics,
+  WAIT_FAILURE_CONTRACT,
+} from './cli-help-workflows.ts';
+import { renderCliHelpOverview } from './cli-help-overview.ts';
+import { foldableHelpTopic } from './cli-help-foldable.ts';
+import { reactNativeHelpTopic } from './cli-help-react-native.ts';
+import { TV_PLUGIN_FLOWS } from './cli-help-tv.ts';
+import { providerPluginHelp } from '../provider-plugin-catalog.ts';
+
+const CONFIGURATION_LINES = [
+  'Default config files: ~/.agent-device/config.json (or <AGENT_DEVICE_HOME>/config.json), ./agent-device.json (project-safe defaults only).',
+  'Use --config <path> or AGENT_DEVICE_CONFIG for explicit connection/provider defaults; project config cannot select endpoints or credentials.',
+] as const;
+
+const ENVIRONMENT_LINES = [
+  { label: 'AGENT_DEVICE_SESSION', description: 'Explicit session name' },
+  { label: 'AGENT_DEVICE_PLATFORM', description: 'Default platform binding' },
+  {
+    label: 'AGENT_DEVICE_SCREENSHOT_SCALE',
+    description: 'Default screenshot scale factor',
+  },
+  { label: 'AGENT_DEVICE_SESSION_LOCK', description: 'Bound-session conflict mode' },
+  { label: 'AGENT_DEVICE_DAEMON_BASE_URL', description: 'Connect to remote daemon' },
+  {
+    label: 'AGENT_DEVICE_DAEMON_AUTH_TOKEN',
+    description: 'Remote daemon service/API token',
+  },
+  {
+    label: 'AGENT_DEVICE_DAEMON_STARTUP_TIMEOUT_MS',
+    description: 'Local daemon startup ceiling (default 120000)',
+  },
+  {
+    label: 'AGENT_DEVICE_CLOUD_BASE_URL',
+    description: 'Bridge/control-plane API origin for cloud auth and /api-keys',
+  },
+] as const;
+
+const EXAMPLE_LINES = [
+  'agent-device open Settings --platform ios',
+  'agent-device open https://example.com --platform web',
+  'agent-device snapshot -i',
+  'agent-device fill @e3 "test@example.com"',
+  'agent-device replay ./session.ad',
+  `agent-device wait absent 'label="Loading..."' 3000`,
+  'agent-device test ./suite --platform android',
+] as const;
+
+const HELP_TOPICS = {
+  commands: {
+    summary: 'Full command catalog, global flags, configuration, and environment',
+    body: 'agent-device help commands',
+  },
+  ...manualQaHelpTopics,
+  maestro: getReplayBackendDeclaration('maestro').help,
+  workflow: {
+    summary: 'Normal agent-device bootstrap, exploration, and validation loop',
+    body: `agent-device help workflow
+
+Command shapes, refs, selectors, waits, recovery, and platform limits for open -> snapshot -i -> settle -> verify -> close loop.
+
+Command shape:
+  Command lines only -- no prose, numbering, fences, pipes, or grep/head/tail/jq; raw output carries refs/hints for the next step. Order: subcommand, positionals, flags: agent-device open com.example.app --session checkout --platform android --relaunch
+  Chain confident consecutive steps with &&: press 'label="Search"' --settle && fill 'label="Search"' "query" --settle. Fall back to one command at a time when a step is uncertain (ambiguous match, network-backed result, unseen screen).
+  Refs look like @e12; use the exact ref from the latest snapshot -i, never a placeholder (@ref, @eN, @Label_Name). Pin with ~s<n> (press @e12~s4); every platform rejects a stale pinned ref -- refresh with snapshot -i or use a selector.
+  close = agent-device close. App back is back; system back is back --system. Single taps are press/click; gesture tap touches 2 to 5 points at once. type never takes --settle: run type, then diff snapshot to verify. Known flow: batch --steps-file ./steps.json (help batch).
+  Gestures: scroll/swipe for lists/flicks; gesture pan|fling|pinch|rotate|transform|tap|drag for multi-touch. Shapes and platform quirks: help gestures.
+
+Bootstrap:
+  open --foreground -> snapshot. Selection: explicit --device/--udid/--serial, then session, booted/bootable local, or provider; --platform/--target only filter. Ambiguous/empty fails with bounded retry selectors; no provider fallback.
+  Install arguments are app/package id then artifact path: agent-device install com.example.app ./dist/app.apk --platform android, then open <id> --relaunch for fresh state. Use reinstall only when explicitly requested.
+  Unknown app id: devices, then apps, then open <discovered-app-id>. Never open artifact paths or invent package ids; ask if lookup misses the target.
+  Apple CI: prepare ios-runner after boot/install, before replay/test (help prepare). Remote/cloud: connect -> open -> commands -> close -> disconnect (help remote). Reusable scripts, secret-safe fills, replay repair: help scripting.
+
+Snapshots and refs:
+  snapshot reads visible state; snapshot -i gets current interactive refs only -- fast path before interaction. Default text is token-efficient; --raw/--json for full provider tree.
+  Legend: @e12 [button] label="Add to cart" enabled hittable -> press @e12. [off-screen below] -> scroll down --until (a hint, not a ref).
+  Refs stay valid until you press/click/fill/type/scroll/back/wait-for-async-UI, or otherwise change app state; open/--relaunch clears the stored snapshot outright.
+  Prefer --settle and its diff when it shows next target; refresh with snapshot -i only when you did not settle, it reported not settled, or output lacks what you need. A known selector/label after a mutation is often enough, since interaction commands refresh state internally.
+  Truncated preview: snapshot -s @e12 (the current concrete ref), not get text. Missing target: scroll <dir> --until <selector>. TV/D-pad focus: help tv.
+
+Selectors:
+  id="field-email", label="Allow", role=button label="Search" -- not bare role keys (button="Search"); no CSS selectors/--selector/--text/raw x-y when refs/selectors exist.
+  Mutating selector ambiguity: press/click/fill/longpress collapse duplicate accessibility wrappers only when every match is one ancestor-descendant chain resolving to the same actionable node. Matches in distinct subtrees fail with AMBIGUOUS_MATCH and a bounded candidate list; geometry never chooses a winner. Retry one printed candidate ref (pinned to refsGeneration) or narrow the selector with role/id/longer text. Uniqueness-based reads (is except exists/absent, get attrs) share that failure shape.
+  hittable: false on a resolved element does not block dispatch (iOS AX flags are unreliable on deep RN trees); press/fill/click return targetHittable: false plus a hint -- verify or re-target, not a failure.
+
+Text entry:
+  fill replaces; type appends to an already-focused field: fill 'id="field-email"' "qa@example.com"; type "Handle with care" --delay-ms 80
+  fill <target> "" clears the field (replace with nothing); the empty argument must be present -- fill <target> alone is a missing argument.
+  For dropped iOS text, retry with --delay-ms before clipboard paste. This also applies to Limrun iOS, which uses the same Apple runner.
+  Element presses behind the keyboard are refused with tap_keyboard_occludes_target. keyboard dismiss taps its own dismiss key when one exists, else UNSUPPORTED_OPERATION. Android: try dismiss before back. iOS: when both fail, do not tap a static text/heading hoping it is safe; prefer type "\\n" to submit.
+  iOS paste-prompt limits and Android IME/handwriting capture quirks: help debugging.
+
+Session ordering:
+  Stateful commands (open/press/fill/type/scroll/back/alert/replay/batch/close) run serially within one session. Parallelize only read-only commands, or separate sessions/devices.
+
+Read-only and waits:
+${WAIT_FAILURE_CONTRACT}
+  snapshot/get/is/find answer read-only questions; snapshot -i is for refs. --settle confirms local UI quieted; delayed results use wait text "Expected result" or wait <selector> instead of polling; strict disappearance uses wait absent <selector>.
+  wait stable [quietMs] [timeoutMs] (defaults 500/10000) is the fallback for open/relaunch/navigation, or an intentionally-unsettled mutation -- not after a --settle whose diff already shows the change. Ambiguous find: add --first or --last.
+
+Navigation:
+  Pick a coordinate gesture point near the target's center, away from edges/tab bars/nav bars/the home indicator (they trigger system navigation instead); macOS context menus are secondary clicks (help macos). Action sheets/menus/camera screens are normal UI: snapshot -i, press by label/ref, handle permission sheets via UI/alert. If back is ambiguous, prefer a nav/back ref, tab-bar ref, or deep link over repeating it.
+
+Validation and evidence:
+  Nearby mutation diff: diff snapshot -i; with no prior snapshot it initializes the baseline (zero changes) instead of failing.
+  Named expectations need the exact text/selector via wait/is/get/find -- a bare screenshot/snapshot is not verification. Before declaring a task done, confirm the requested end state is actually visible on the current screen, scrolling it into view if needed; get text alone, or stopping one screen early, is not enough.
+  When an action only reveals or reaches a target, verify the exact target named, not just the action. Prefer testIDs/ids/selectors over visible text. Icon/tappable proof: screenshot --overlay-refs; if snapshot is sparse/AX-unavailable, use plain screenshot and coordinates, then retry snapshot -i on another screen.
+  iOS merged: child ref => press it; else press parent @ref --settle. Names are not selectors.
+  Perf/memory/log/network/trace/crash: help debugging. Recording, save-script, batch, replay repair: help scripting.
+
+React Native: help react-native for Metro/Re.Pack reload, DevTools, RN overlays. JS-only change: metro reload, find "Home"; open --relaunch for native reset.
+
+Lifecycle facts (trust these instead of probing): open without --relaunch is idempotent-foreground except native macOS app opens (background); --relaunch restarts it. close keeps a healthy iOS runner warm by default; runners/daemons self-idle after 5 minutes; stale leases self-reclaim. open device claims reclaim other worktrees' warm runners; "already owned by another agent-device daemon" = owner outside claim arbitration. Env vars: help physical-device.
+
+Escalate:
+  help manual-qa scripted manual QA
+  help dogfood exploratory QA report
+  help validate engineering self-validation
+  help debugging logs, network, alerts, traces, text-entry
+  help scripting recording, save-script, batch, replay repair
+  help gestures multi-touch gesture shapes/quirks
+  help tv Android TV, tvOS, Vega VVD remote
+  help react-devtools RN components, props/state/hooks, render profiling
+  help react-native RN hazards, Metro/Re.Pack, routing
+  help remote remote/cloud config, lease, tunnels
+  help macos desktop, frontmost-app, menu bar
+  help web minimal browser loop
+  help ios-system-ui SpringBoard, widget, system-UI`,
+  },
+  scripting: {
+    summary: 'Reusable scripts, secret-safe fills, batch JSON, and replay repair',
+    body: `agent-device help scripting
+
+Use this for reusable .ad script authoring (save-script), scripted destination guards, secret-safe fills, batch multi-step JSON, replay divergence/repair, and evidence recording.
+
+Script paths are the caller's:
+  replay <path> and test <path-or-glob> resolve and read on the machine running the command, then send the script content (Maestro runFlow includes too) with the request. The same flows therefore run against a local daemon and against a remote one (AGENT_DEVICE_DAEMON_BASE_URL) with no copy step, and a missing script fails immediately, naming the path you typed. --save-script writes on the DAEMON host and is rejected against a remote daemon.
+  test --json marks a failed test with infrastructure: true only when the owning runtime classified a device, runner, boot, or transport failure. It remains a failed test; consumers may use the tag to distinguish "the oracle did not run" from a behavioral replay divergence without weakening either gate.
+
+Script line grammar:
+  A .ad line is <command> [positional...] [flag...]. Whitespace splits tokens; a token quoted with " or ' is one argument, and single quotes keep a double quote literal, exactly as at the shell (press 'id="far"' is one selector). Values in double quotes are JSON strings (escape \\\\, \\", \\t, \\n). Values in single quotes are literal, as at the shell: a backslash keeps its own character and the only escape is \\' for an apostrophe. A script carries only the flags declared for that command and marked recorded, so the script form of a step matches the CLI form: scroll down --until 'id="x"', wait 'label="Sign in"' --raw. CLI-only spellings and per-request options are not part of a step: --settle, --verify, scroll --pixels/--duration-ms, and the device-selection flags (--platform, --serial, --device) are the common ones a script does not carry.
+  Reaching an off-screen target is viewport-independent in a script the same way it is at the CLI: write scroll down --until <selector>, not a fixed scroll amount that passes on one screen size and fails on another.
+  press/click/longpress resolve their target once. Before interacting with a loading screen, add an explicit landmark wait: wait 'label="Continue"' 5000, then press 'label="Continue"'.
+
+Reusable open-to-destination scripts:
+  Arm recording on the first open, perform the full journey, verify the destination with a selector-targeted wait, then publish without closing:
+    agent-device open com.example.app --relaunch --save-script=screen-x.ad
+    agent-device press 'id="continue"' --settle
+    agent-device wait 'role="heading" label="Screen X"'
+    agent-device session save-script
+  session save-script [path] [--force] publishes the sole recorded open through the destination guard, omits close, and leaves the session active. The guard is a selector wait on a labeled/id-bearing landmark: its identity is captured while armed and re-verified after the wait resolves at replay time, so a reshuffled screen with the same label elsewhere fails closed instead of false-passing. A duration wait, wait stable, wait absent, wait @ref, or a selector wait on an unlabeled element is not a destination guard. A second successful open aborts publication; start a fresh session to author again.
+  Unparameterized fill/type inputs are literal .ad script content. For a sensitive fill, arm recording first, keep the live value in an env var, and name its replay placeholder explicitly:
+    export AD_VAR_PASSWORD='<secret>'
+    agent-device fill 'id="password"' "$AD_VAR_PASSWORD" --record-as PASSWORD
+  The live app receives the value; recording state and the published script contain only \${PASSWORD}. Reuse the same name for repeated values; --record-as is fill-only, requires an armed recording, and is mutually exclusive with --no-record. Replay with AD_VAR_PASSWORD still set, or pass --env PASSWORD=<value>. Do not record passwords/tokens without --record-as; their literal text is written to the .ad target.
+  To keep the value out of the CLI's argv as well, pipe it in with --text-stdin instead of a text argument:
+    printf %s "$AD_VAR_PASSWORD" | agent-device fill 'id="password"' --text-stdin --record-as PASSWORD
+  --text-stdin reads at most 64 KiB, removes exactly one trailing newline, and refuses a terminal, empty input, invalid UTF-8, or an extra text argument. While recording is armed, --record-as publishes \${VAR} and --no-record leaves the step out; passing neither is an error. Output shows the value as \${VAR} with --record-as and as [REDACTED] otherwise, including in error messages and in the requested, before and after read-back of an unconfirmed fill, which can hold a reformatted form of the value. With --settle, the diff line text and tail labels are replaced whole; refs and counts stay. Without an armed recording the step is not recorded. It is not available inside batch steps.
+  The privacy controls for typed input (--text-stdin and --record-as) keep the literal out of agent-device's own responses, diagnostics, and recorded scripts. They do not rewrite what the platform records: on iOS, XCTest writes its own diagnostic logs and its .xcresult bundle, and typed text can appear in both, on a simulator or a physical device. Treat those as sensitive, and use test-only credentials when they may be kept or shared.
+
+Replay divergence and repair:
+  A failing replay/test step returns REPLAY_DIVERGENCE with a bounded report (screen digest, ranked selector suggestions, resume). Fix app state, then resume with replay --from <n> --plan-digest <sha256> (both from the report's resume field) to continue without re-running earlier steps; resume never re-executes skipped steps, so app state there is the caller's responsibility. --from is replay-only; test rejects it. The digest binds the script, includes, effective --platform/--target, and per-action runtime/identity; native .ad interpolation is late-bound so changing only its values keeps the digest, while Maestro environment substitution can change it.
+  A resource step that cannot run in bounded batch/replay returns details.reason bounded_composite_resource_unsupported, details.shape, and dispatched: no for that step. Affected commands include perf, audio, record, trace, some logs operations, close when it would dispose an owned capture or release a provider lease, and acquisition that would recover another session's durable resources. Existing-session open preserves its owned resource handles. An Android test IME alone is restored by ordinary close, including a bounded step; restoration may settle after the remaining composite time. If restore fails, close retires the session but retains its device claim: inspect the device and claim before recovery, rather than retrying close on the retired session. details.standaloneCommandName names the public command when known; it is not a complete command. Run the original refused step separately with its original arguments and options, the same --session value, and the same private CLI context. For replay, inspect the failed source line. After completing the step directly, use resume.alternateFrom with planDigest if offered and steps remain; resume.from retries the same bounded step and refuses it again. An authored .ad command without a resource classification fails closed with shape <command>:unclassified. Inspect completed steps before retrying the composite; earlier steps may have changed the app. A nested test with an attempt timeout or --record-video is refused before its first attempt; direct test keeps its own timeout behavior.
+  Native .ad session takeover: replay <file>.ad --keep-session suppresses exactly an authored terminal close and returns the surviving session for continued commands. --update/-u is a no-op (ADR 0012); every divergence already carries the same ranked suggestions.
+  Agent-supervised repair: arm replay <file>.ad --save-script[=<out>] before step 1 (armed once; --from continuations do not need it again). Every divergence carries a repairHint: record-and-heal means press the correct control via a blessed @ref from the divergence's screen.refs, recorded, then replay --from <n+1> --plan-digest <sha256>; state-repair means the script is correct but app state is not -- fix state with --no-record actions, then replay --from <n> to re-run the unchanged step; caution means a blind re-press may repeat the mistake; manual means no safe automated repair could be proven. Read-only inspection you run to locate the repair target (snapshot -i, get attrs, find, is) is excluded from the healed script by default; pass --record on a read step you want kept. End the repair with close --save-script[=<out>] (default <stem>.healed.ad); review its diff before promoting it over the original. Running close --save-script before a required resume aborts the repair with no script written.
+
+Batch:
+  agent-device batch --steps '[{"command":"open","input":{"app":"settings"}},{"command":"wait","input":{"kind":"duration","durationMs":100}}]'
+  agent-device batch --steps-file ./steps.json --json
+  Step keys are command, input, and optional runtime -- that is the whole accepted shape. input holds the command's structured fields, not its terminal spelling: a CLI positional becomes a named field (target, text, direction) and a flag becomes a camelCase key (--settle -> "settle":true). Accepted commands, that mapping, and runnable press/fill/snapshot steps: help batch.
+  Maestro full-suite validation on connected devices uses one test command with a comma-separated --device list and --shard-all (--shard-split only to split suite entries across devices):
+    agent-device test ./e2e/maestro --maestro --device udid1,emulator-5554 --shard-all 2
+
+Recording:
+  record start/stop. Default scope is app (needs an active open session); use --scope device/system for whole-screen capture spanning multiple apps/home/settings. --quality medium|high on Android and Apple targets. stop burns touch overlays into the video by default; --hide-touches skips that for the fastest raw recording, and is recommended for gesture-heavy iOS simulator proof videos since overlay timing depends on a stable runner session. Android adb screenrecord has a 180s limit, so long Android recordings return as multiple MP4 chunks while the daemon stays alive; after a daemon restart, record stop recovers only manifest-owned chunks. record stop is safe to repeat: if its request window ended while the daemon was still exporting, running it again in that session returns the completed recording instead of starting a second one. If a leased remote session ends while a recording runs (lease expiry, release, or close), the daemon finishes it and keeps the video and telemetry downloadable by the tenant for 15 minutes; GET /artifacts lists them with the sessionName.
+  record contact-sheet <video.mp4> [--out <sheet.png>] reads an exported MP4 back and writes one PNG holding the frames where the screen visibly changed, each labeled with its elapsed time. It is how you read a recording you cannot play, and it needs no session or device; the frames come out of that file, so the sheet cannot describe a screen the video does not contain. The sample grid is bounded and spread over the whole clip, so it reports coverage, not a review: a flash that opens and closes between two sample times is not in it. Needs a macOS host and an MP4 (a WebM recording is refused).
+  Tracing: trace start ./trace.log, trace stop ./trace.log (path is positional, not --path).`,
+  },
+  gestures: gestureHelpTopic,
+  tv: {
+    summary:
+      'Android TV (incl. Fire TV on Fire OS), tvOS, and Vega VVD focus-first remote navigation',
+    body: `agent-device help tv
+
+Use this when the target is Android TV (including Fire TV devices on Fire OS over ADB), Apple TV/tvOS, or an Amazon Vega OS TV app running in the Vega Virtual Device (VVD). TV surfaces are focus-first: move focus with remote/D-pad buttons, then activate the focused control.
+
+Core loop:
+  agent-device open Settings --platform android --target tv --session tv
+  agent-device snapshot -i --platform android --target tv --session tv
+  agent-device tv-remote press down --platform android --target tv --session tv
+  agent-device is focused 'label="Profiles"' --platform android --target tv --session tv
+  agent-device tv-remote press select --platform android --target tv --session tv
+  agent-device screenshot ./tv-focus.png --overlay-refs --platform android --target tv --session tv
+
+Vega OS:
+  Vega OS is driven through the SDK-matched Vega CLI and VDA, not ADB.
+  Initial support is VVD-only. Physical devices that run Vega OS remain unsupported until their discovery, lifecycle, and remote controls have durable hardware evidence.
+  Use --platform vega --target tv for the running Vega Virtual Device.
+  vega virtual-device start
+  agent-device devices --platform vega --target tv
+  agent-device open <component-id> --platform vega --target tv --session vega-tv
+  agent-device tv-remote press down --platform vega --target tv --session vega-tv
+  agent-device tv-remote press select --platform vega --target tv --session vega-tv
+  agent-device close <component-id> --session vega-tv
+  vega virtual-device stop
+  Use a component ID from the app package or Vega SDK tooling; agent-device app inventory is not yet supported.
+  Use --serial VirtualDevice for explicit VVD selection.
+  The VVD is never booted implicitly; start it with vega virtual-device start.
+  Snapshot, screenshot, selectors, install, touch/text/gesture, logs, and performance commands remain unsupported until their Vega backends are implemented.
+
+Buttons:
+  Examples: tv-remote longpress select; tv-remote press select --duration-ms 500. Syntax: tv-remote [press|longpress] <button> [--duration-ms <ms>]
+  All TV backends: up, down, left, right, select, menu, home, back.
+  Android TV also accepts volume-up, volume-down, mute, power, sleep, wake, media-play-pause, media-next, media-previous, media-rewind, media-fast-forward, channel-up, channel-down, last-channel, guide, info, captions, tv-input, color-red, color-green, color-yellow, and color-blue.
+  android-keycode:<n> sends a raw Android TV keycode from 1 to 2147483647. tvOS and Vega OS refuse these additional buttons. Phones and WebDriver sessions refuse tv-remote. Power and sleep can turn the screen off; success confirms dispatch without waiting for an app or screen change.
+  ok, center, and enter are input aliases for select; command output still reports button: "select".
+  longpress is CLI sugar for --duration-ms 500. --duration-ms overrides that preset.
+  --duration-ms holds a tvOS or Vega OS remote button for that exact duration. On Android TV, any positive duration maps to the ADB longpress form because Android input keyevent has no exact hold duration.
+  Vega OS uses the exact hold duration through inputd-cli in the VVD.
+
+Android TV:
+  Android TV uses ADB keyevents behind agent-device tv-remote. Keep command plans on agent-device; do not switch to raw adb keyevent.
+  Use --target tv when a host has both phone/tablet and TV emulators/devices.
+  Fire TV devices and emulators running Fire OS (Android-based) connect as Android TV devices over ADB: enable ADB debugging, run adb connect <ip>:5555, and use --platform android --target tv. Discovery reads the amazon.hardware.fire_tv system feature, so a Fire TV that declares no leanback feature is still a tv target.
+
+tvOS:
+  tvOS is driven by the Siri Remote focus engine, not coordinate taps.
+  back maps to the Menu remote button; home maps to the Home remote button.
+  Use --platform ios --target tv for Apple TV simulators and devices.
+
+Focus and visual truth:
+  On Android TV and tvOS, if snapshot -i exposes a focused node, verify it with is focused <selector>.
+  Use wait focused=true only when repeated snapshots preserve focus metadata for the app.
+  If the app exposes only a surface view, or focus metadata is transient, use screenshot --overlay-refs, screenshot, or diff snapshot as visual truth and keep moving focus with tv-remote. On Vega OS, use the VVD display as visual truth until capture support lands.
+  Do not assume press/click @ref works on Android TV, tvOS, or Vega OS until the desired element is focused.`,
+  },
+  ...debuggingHelpTopics,
+  'react-devtools': {
+    summary: 'React Native components, props/state/hooks, and render profiling',
+    body: `agent-device help react-devtools
+
+Use this for React Native internals the accessibility tree cannot show: the component tree, a component's props, state, hooks, and owners, errors and warnings components logged while rendering, and render performance (slow renders, rerenders and their causes, commits over a 16 ms frame).
+
+Components:
+  agent-device react-devtools tree [@ref|Name] [--depth 8] [--limit 60]
+  agent-device react-devtools find <Name> [--exact]
+  agent-device react-devtools inspect <@ref|Name>
+  agent-device react-devtools errors
+
+Render profiling:
+  agent-device react-devtools profile start
+  agent-device react-devtools profile stop
+  agent-device react-devtools profile report [Component]
+  agent-device react-devtools profile commit [N]
+
+Connection:
+  Every command except profile report and profile commit, which read the saved profile, attaches to the app's JavaScript runtime through its Metro dev server: a development build on React Native 0.74 or newer, with no app, Metro, or Babel changes and no start or connect step. It is verified on Android emulators and iOS simulators, through agent-device proxy, and on remote bridge sessions, where it uses the Metro server next to the agent: the session's binding from metro prepare, or --metro-host/--metro-port. A device-facing Metro URL, such as the bridge's, refuses the debugger connection.
+  Add --app <bundle-id> when several apps share the dev server, --metro-device <name> when one app runs on several devices connected to it, and --metro-port/--metro-host (or --bundle-url) when the dev server is neither the session's nor localhost:8081.
+
+Component inspection:
+  Start with find <part of a name> or tree; both print @c refs. Wrapper chains such as providers collapse onto one line, and three or more consecutive siblings with identical subtrees, such as list rows, collapse into one line with a count; run tree @ref to open a branch.
+  inspect takes an @c ref, or a name only one mounted component has. It prints the owners that rendered it, its props, state, hooks (custom hooks list the hooks they call), and what it logged while rendering. Deep values print as short previews.
+  errors lists the mounted components that logged console errors or warnings while rendering, with the messages. When the app's React DevTools backend does not attribute every log to a component, as on React Native 0.74 and 0.76, errors says its list can be incomplete; check logs as well.
+  Refs are DevTools element ids: they change when a component remounts or the app reloads, so find again after either.
+  With a React DevTools window connected to the app, tree, find, errors, and inspect by name fail with tree-unavailable; close it and reload the app.
+
+Profiling loop:
+  1. Run profile start immediately before the interaction; keep the window narrow.
+  2. Drive the interaction with normal agent-device commands. When correlating with logs, run logs clear --restart before the first logs mark.
+  3. Run profile stop. It saves the recording, then prints the commit count, render time, commits over the 16 ms frame budget, and ranked findings, each naming a component, its evidence, and a fix. If changed-prop inspection is interrupted after collection, profile report and profile commit can still read the saved recording.
+  4. Drill into one finding with profile report <Component> or profile commit <N>. Without an argument, report lists components by self time with why they rendered, and commit lists commits in order (the slowest when capped).
+  5. After a fix, repeat the same start, interaction, and stop, and compare the findings.
+
+Findings:
+  slow-render: the component's own render is expensive. memo-defeated: a memoized component often re-renders because props change identity. parent-cascade: the component often re-renders with unchanged props, state, and context when its owner renders. context-cascade: most of the component's renders come from context changes. effect-chain: the component triggers a follow-up commit right after rendering, likely state set in an effect. render-storm: one component commits many times per second. eager-mount: hundreds of instances mount in one commit. slow-commit: a commit of three frames or more that other findings leave mostly unexplained.
+  Timings come from development builds and run slower than release builds; compare runs instead of reading absolute numbers.
+
+Rules:
+  Every command is an agent-device subcommand: agent-device react-devtools ...
+  Do not repeatedly raise table limits such as --limit 50 or --limit 200; drill into one component with profile report instead.
+  For network evidence, use agent-device network dump --include headers; headers is not a positional argument.
+
+Example:
+  agent-device logs clear --restart
+  agent-device logs mark "before catalog search"
+  agent-device react-devtools profile start
+  agent-device fill 'id="catalog-search"' "tart" --delay-ms 80
+  agent-device logs mark "after catalog search"
+  agent-device react-devtools profile stop
+  agent-device react-devtools profile report CatalogScreen
+  agent-device network dump --include headers
+
+Device busy and ownership:
+  DEVICE_IN_USE has two flavors. "already in use by session X" is this daemon's session table: reuse it with --session X, or run close --session X first. "owned by session X in workspace Y" is the host-global device claim another session — from this daemon or another worktree's daemon — or an in-flight command holds; there may be no session to close, and it is never retriable, so run the error's exact recovery command instead of retrying.
+  Inspect ownership without any daemon: agent-device device status (add --stale for proven-dead owners; settle and release those with agent-device device release --stale). devices marks rows that are claimed, so pick an unclaimed device instead of contending.
+  A live foreign owner is released by closing its session from its own workspace or stopping its daemon: agent-device daemon stop --state-dir <owner state dir> (the error names the state dir). The device itself can settle a claim: when it rebooted after that claim was taken, its app, runner, and accessibility session were destroyed, so open reconciles the owner's resources, takes the claim, and reports the release in warnings. Never recover by hunting PIDs with ps/kill. boot/install/shutdown take the same claims as open and refuse foreign-claimed devices identically; they do not ask the device about its boot.
+
+Use snapshot, screenshot, logs, network, perf frames, and perf memory for device/app runtime evidence. Use react-devtools when component internals or React rendering performance matter.`,
+  },
+  cdp: {
+    summary: 'React Native CDP targets, JS heap snapshots, and leak triage',
+    body: `agent-device help cdp
+
+Use this when a React Native or Expo app exposes a CDP target through Metro and
+the task needs JavaScript heap growth checks, heap snapshot diffs, allocation
+hotspots, retained-object leak evidence, or a small runtime eval to confirm JS
+state. Do not use this as the default React Native profiler.
+
+Setup:
+  Start Metro and open the app first. For Android devices/emulators, make sure Metro is reachable from the app, typically with adb reverse tcp:8081 tcp:8081.
+  In remote bridge sessions, omit --url for target list/select after connect; agent-device derives the Metro CDP URL from the prepared remote runtime.
+  agent-device cdp target list --url http://127.0.0.1:8081
+  agent-device cdp target select <target-id>
+
+Quick JS heap signal:
+  agent-device cdp memory usage sample --label baseline --gc
+  # perform the suspected leaking action with agent-device commands
+  agent-device cdp memory usage sample --label after-action --gc
+  agent-device cdp memory usage diff --base jm_1 --compare jm_2
+  agent-device cdp memory usage leak-signal --since jm_1
+
+Retained-object proof:
+  agent-device cdp memory snapshot capture --name baseline --gc
+  # perform the suspected leaking action
+  agent-device cdp memory snapshot capture --name after-action --gc
+  # perform cleanup/navigation that should release the objects
+  agent-device cdp memory snapshot capture --name cleanup --gc
+  agent-device cdp memory snapshot diff --base ms_1 --compare ms_2 --limit 10
+  agent-device cdp memory snapshot leak-triplet --baseline ms_1 --action ms_2 --cleanup ms_3 --limit 10
+  agent-device cdp memory snapshot retainers --snapshot ms_3 --id <node-id> --depth 8 --limit 10
+
+Allocation pressure:
+  Use allocation sampling to find where allocations were created, not to prove a leak:
+    agent-device cdp memory allocation start --name suspected-flow --interval 32768 --stack-depth 32
+    # perform the flow once
+    agent-device cdp memory allocation stop
+    agent-device cdp memory allocation hotspots --limit 10
+    agent-device cdp memory allocation source-maps
+
+Recommended subset:
+  cdp dynamically runs a pinned CDP helper through npm; the first run may download the pinned package, and later runs can reuse the npm cache.
+  Every argument after cdp is passed to the CDP helper. Put agent-device global flags before cdp when you need the outer CLI to consume them.
+  Use cdp memory usage, memory snapshot, memory allocation, and targeted runtime eval.
+  Avoid cdp profile cpu, trace, network, and console by default because agent-device already has perf cpu, trace, network, logs, and react-devtools guidance for those areas.
+
+Runtime eval:
+  After cdp target select, read a JS value: agent-device cdp runtime eval --expr '<expression>' --await
+  --expr reaches only globals the app exposes. Module imports, such as AsyncStorage, are not globals. If it cannot reach the value, report that. Do not guess.
+
+Output contract:
+  Until cdp has a compact leak report command, synthesize one from memory usage diff, snapshot diff, leak-triplet, and retainers. Report heap deltas, top retained classes/shapes, leak-triplet rows that stayed high after cleanup, and the shortest useful retaining paths. Do not paste raw heap snapshots or large allocation profiles into the response; use exported artifacts only when the user asks for raw data.
+
+Target caveats:
+  React Native/Hermes implements a subset of browser CDP. If a command reports an unsupported method, keep the target selected and switch to heap usage samples plus heap snapshots. Prefer react-devtools profile for render causes; prefer perf memory sample or perf memory snapshot for native/process memory.`,
+  },
+  'react-native': reactNativeHelpTopic,
+  'physical-device': {
+    summary: 'Connected phone/tablet setup and iOS signing prerequisites',
+    body: `agent-device help physical-device
+
+Use this when the target is connected hardware instead of a simulator/emulator.
+For simulator/emulator flows, use help manual-qa for routine QA or help workflow for the full reference.
+
+Discovery:
+  agent-device devices --platform ios
+  agent-device devices --platform android
+  With multiple devices present, select one: --device <name>, or --udid <udid> (iOS) / --serial <serial> (Android) when names collide.
+
+iOS physical-device prerequisites:
+  Xcode, xcrun xcdevice, and xcrun xctrace must be available from the selected Xcode.
+  The device must be paired/trusted, connected, unlocked when needed, and have Developer Mode enabled. A paired device that CoreDevice cannot reach (devicectl tunnelState unavailable: unplugged or off the network) is listed with booted: false, and commands refuse it with details.kind not_ready and details.tunnelState unavailable.
+  Modern devices visible to devicectl use CoreDevice. Older devices visible only to xctrace use the XCTest backend automatically.
+  XCTest-backed devices must already have the target app installed and should be opened by bundle ID; app inventory, install/reinstall, logs, performance sampling, recording, deep links, and launch arguments require CoreDevice.
+  XCTest-backed runner commands travel through macOS usbmuxd; keep the trusted device connected by cable.
+  The AgentDeviceRunner XCTest host must be signed before commands can run on a physical device.
+  Start with Automatic Signing and only these env vars:
+    AGENT_DEVICE_IOS_TEAM_ID=ABCDE12345
+    AGENT_DEVICE_IOS_BUNDLE_ID=com.yourname.agentdevice.runner
+  Find team ids and Apple Development signing certificates with:
+    security find-identity -v -p codesigning
+  If Xcode cannot choose a profile, set AGENT_DEVICE_IOS_PROVISIONING_PROFILE to the profile name/specifier, not a file path.
+  AGENT_DEVICE_IOS_SIGNING_IDENTITY is optional; omit it unless xcodebuild asks for a specific identity.
+  The profile/team must allow AGENT_DEVICE_IOS_BUNDLE_ID and <id>.uitests.
+  A runner startup failure names its class in error details.reason rather than only in prose: signing_no_development_team, signing_provisioning_profile_missing, bundle_identifier_already_registered, signing_unspecified, devtools_security_developer_mode_disabled (the Mac's DevToolsSecurity setting, which says nothing about the device's Developer Mode toggle), simulator_service_hub_unavailable (an Xcode too old for the host macOS: macOS refuses to load its DTServiceHub, so every runner launch fails; the command stops as soon as the refusal reaches runner.log, and selecting an Xcode that supports this macOS on the daemon host is the fix), simulator_set_destination_not_found (a --ios-simulator-device-set simulator the selected Xcode cannot resolve; names the set), device_developer_mode_disabled (read from an iPhone's own report before the runner builds, and the only device state that stops a run up front), device_developer_disk_image_unavailable (also read from the device, and published on a startup failure that named no cause of its own, since iOS 17+ mounts the developer disk image on demand during build and launch rather than gating the build), or build_failed_unclassified when nothing proved a cause. The two device reasons are never inferred from tool output or from each other. Branch on details.reason and follow hint; the message is for humans.
+  First-run XCTest setup/build can take longer than normal commands; keep the device connected and use --debug to inspect signing/build diagnostics if setup times out.
+
+Android physical-device prerequisites:
+  Enable USB debugging and confirm the device appears in agent-device devices --platform android.
+  Android does not need the iOS runner signing setup. For React Native/Expo Metro reachability, read help react-native.
+
+Runner and daemon lifecycle (applies to simulators too):
+  open without --relaunch is idempotent-foreground for an already-running app, except native macOS app opens keep it in the background (help macos); neither restarts the process. open --relaunch restarts the app; on iOS simulators this collapses to one simctl launch --terminate-running-process call instead of a separate terminate-then-launch.
+  If a relaunch leaves an existing session's device effects unconfirmed, close can release its claim; idle shutdown retries cleanup and leaves an unconfirmed claim stale, while embedded runtimes and AGENT_DEVICE_DAEMON_IDLE_TIMEOUT_MS=0 require close because they do not shut down for idleness.
+  No runner read launches a session app that is not running: snapshot, wait, is, get, a reading find, and an interaction's leading reads (a gesture's viewport read, the capture that resolves a selector click/fill) answer the retriable APP_NOT_RUNNING instead of bare-launching over a launch SpringBoard still holds behind its deep-link confirmation. Only open, activate, and a command that mutates without a leading read bring a stopped app up.
+  close keeps a healthy iOS simulator XCTest runner warm by default so the next open on that simulator (same udid in the same simulator set) skips the runner build, unless --shutdown was requested, the session was recording, or its device lease ends on close. A lease allocated with retainOnClose can keep the runner between sessions; releasing or expiring that lease stops its runner unless a session outside the lease has taken over the device. A retained runner auto-stops after an idle window (default 5 minutes); set AGENT_DEVICE_IOS_RUNNER_IDLE_STOP_MS to override, or 0 to disable idle stopping. Lease release, expiry, and graceful daemon shutdown still clean up runners they own. Only a ready runner with an observed listener is retained; close retires unfinished prewarm recovery. Losing the retained listener stops that generation, and graceful daemon shutdown stops idle retained runners rather than handing them off without supervision.
+  Each AGENT_DEVICE_STATE_DIR runs its own daemon. It self-exits after an idle window (default 5 minutes, matching the runner idle-stop default) once it has no open sessions, no in-flight requests, and no active recording; set AGENT_DEVICE_DAEMON_IDLE_TIMEOUT_MS to override, or 0 to disable idle reap.
+  A client starting a local daemon waits while the daemon process stays alive and keeps publishing startup progress, so an overloaded host makes startup slower, not failed. It stops at a ceiling (default 120 s; set AGENT_DEVICE_DAEMON_STARTUP_TIMEOUT_MS to a positive integer number of milliseconds to override) and names the outcome in error details.reason: startup-exited (the process ended before registering), startup-stalled (alive, no startup progress for a fixed 60 s window the ceiling variable does not change), or startup-ceiling (a startup was still live when the ceiling passed — this client's daemon or another client's; the client stops its own launch and never signals another client's live daemon. Only a progressing own launch outlasts the 60 s stall window, so a ceiling set below 60 s also ends a silent own launch this way). details.phases carries the startup phase timings it observed and details.startupTimeoutMs the effective ceiling. Branch on details.reason, never on the message. The variable is read only when a client must start a daemon: a value that is not a positive integer fails with INVALID_ARGS before the daemon spawns, and a client that only attaches to or reuses a running daemon never reads it.
+  On iOS simulators, open prepares app accessibility before launching an app or URL. If a running app has an empty accessibility tree after an earlier XCTest session, use open <app> --relaunch, then snapshot -i. A preparation failure is logged and does not block launch.
+  A command that needs the shared local daemon starts it for its state dir when none runs (device status and device release --stale never contact one). When the running daemon comes from another version or build, the command replaces it only if the daemon reports no work: no in-flight request, session, repair session, or live lease (a streaming resumable upload and a host human-control hold that names no lease are not counted); otherwise it fails with details.reason daemon-busy and leaves the daemon alone. A daemon that agreed to leave is waited for up to 60 s and never signaled while it drains; one still running then fails with details.reason daemon-drain-timeout unless it answers nothing and is provably a daemon process, which is force-retired. A daemon from a release that predates this check is never replaced and fails with daemon-incompatible. End a busy or older daemon deliberately with agent-device daemon stop --state-dir <path>. Node clients pick daemonLifecycle 'attach' (never starts or replaces a daemon; fails with daemon-not-running or daemon-incompatible) or 'managed' (the default until 0.22), and ensureDaemon() starts or replaces one explicitly.
+  daemon stop --state-dir <path> stops a detached daemon with process signals after verifying its identity. For a live embedded runtime, stop refuses with details.reason daemon-owner-embedded and a hint naming the host PID. Close that runtime in its host process with the handle returned by startAgentDevice(). Stop refuses live unrecognized ownership with daemon-owner-unrecognized and sends no request or signal. Stop retires an embedded or unrecognized registration when its recorded host lifetime has provably exited. Without --clean, an unreadable daemon.json fails with daemon-record-unreadable. daemon status shows host-owned or owner-not-recognized. Managed clients reuse a matching embedded runtime. Takeover, drain, and timeout recovery refuse a live embedded or unrecognized owner without a signal; a provably exited owner is retired so the state directory stays usable. Detached stop and cleanup use the lifetime and ownership from one registration read. --clean requires proven detached ownership; embedded, unrecognized and unreadable records fail with daemon-clean-not-detached because that cleanup walks the owner's whole process tree.
+  On a machine shared by several agents, set AGENT_DEVICE_SESSION_IDLE_TIMEOUT_MS to also expire an individual session that has taken a host-global device claim and then received no commands for that long; the claim is released and the next command on that session answers SESSION_NOT_FOUND with details.reason SESSION_IDLE_EXPIRED naming the window and the device. Off by default, because on a shared host "idle" and "thinking" are indistinguishable: only set it where an abandoned claim blocking every other agent is the worse failure. Sessions holding a remote lease or any active capture (recording, logs, audio, performance, or trace) are never expired this way.
+  A stale iOS runner lease — its owner process dead, or its AGENT_DEVICE_STATE_DIR deleted — is reclaimed automatically instead of failing with "is already owned by another agent-device daemon". A live owner's runner is also reclaimed when the requesting daemon holds the host-global device claim for that device: claims are exclusive, so holding one proves the runner's owner released the device and merely kept the runner warm. The error remains only for owners outside claim arbitration (a pre-claims build, or daemons pointed at different claim stores).
+
+For iOS SpringBoard, widget, or other system-UI surfaces, read agent-device help ios-system-ui.`,
+  },
+  'ios-system-ui': {
+    summary: 'iOS SpringBoard, widget, and system-surface workflow',
+    body: `agent-device help ios-system-ui
+
+Use this when a task needs iOS SpringBoard (home screen), widget add/edit/remove, or other system-UI surfaces instead of the app under test.
+
+This works today by opening SpringBoard as the session app; there is no separate widget/system command. System labels vary by iOS version and locale, so discover them from the current snapshot instead of relying on the literal strings shown below. This workflow is verified on iOS simulator. On a physical iPhone, opening SpringBoard, snapshot -i, and selector presses on visible home-screen icons are verified; the widget add/edit/remove steps are not yet verified on a physical iPhone.
+
+Core loop:
+  1. Reach the app state you want to prepare (for example, arrange the widget/Live Activity data the app should show) with normal app automation, then agent-device open com.apple.springboard --platform ios. From an existing app session, agent-device home first also lands on the home screen, but open com.apple.springboard is what actually binds the session to SpringBoard for selector-driven commands.
+  2. agent-device snapshot -i to read the current localized SpringBoard controls.
+  3. agent-device longpress <x> <y> on an empty area of the home screen to enter edit mode. This is the one deliberate coordinate step; there is no reliable non-coordinate way to trigger it.
+  4. Re-snapshot and use selectors from the fresh tree to drive the Edit menu -> widget gallery -> search -> size picker -> Add Widget, for example:
+    agent-device snapshot -i
+    agent-device press 'label="Add Widget"'
+    agent-device fill 'label="Search"' "Calendar"
+  5. The widget-gallery search-result rows currently fall back to unlabeled nodes (a known capture gap), so tap the result by coordinates read from a screenshot until that is fixed:
+    agent-device screenshot
+    agent-device press <x> <y>
+  6. Continue with the semantic size picker and agent-device press 'label="Add Widget"' to place it.
+  7. To edit or remove an installed widget, longpress it, then re-snapshot and use the fresh context-menu selectors (Edit Widget / Remove Widget).
+  8. Use screenshots for visual assertions, and as the fallback wherever a system surface exposes sparse accessibility, not only in the gallery step.
+  9. Reopen the app bundle under test (agent-device open <app-id> --platform ios) to return to normal app automation; leaving SpringBoard bound does not resume the app session on its own.
+
+Rules:
+  Do not hard-code Edit/Done/Add Widget or other SpringBoard label text into a plan as a fixed assumption; take them from the latest snapshot -i so the plan survives iOS version/locale differences.
+  A real system permission alert can appear mid-flow; it composes with this workflow normally, so handle it with alert wait/accept/dismiss or by pressing the visible label like any other step.
+  Prefer refs/selectors from the fresh snapshot for every step except the two documented coordinate fallbacks (empty-space long-press to enter edit mode, and the gallery search-result tap).
+  This topic covers what already works by opening SpringBoard as the session app. It does not yet cover keeping an app session open while alternating individual commands against SpringBoard, or Live Activity/Dynamic Island semantics; those land separately.`,
+  },
+  foldable: foldableHelpTopic,
+  remote: {
+    summary: 'Direct proxy, cloud profiles, and remote config',
+    body: `agent-device help remote
+
+Remote connection providers use the same lifecycle:
+  connect -> install/open -> commands -> close -> disconnect
+
+Providers:
+  Cloud: agent-device connect or agent-device connect cloud discovers the agent-device cloud profile.
+  Remote config: agent-device connect --remote-config ./remote-config.json uses a local profile.
+  Direct proxy: agent-device connect proxy --daemon-base-url <proxy-agent-device-url> stores the shared proxy profile and client identity.
+  BrowserStack: agent-device connect browserstack verifies credentials, the exact device, and a bs:// app reference, then stores a local provider profile. It does not create an App Automate session.
+  AWS Device Farm: agent-device connect aws-device-farm verifies credentials and the exact project, device, and optional app upload, then stores a local provider profile. It does not create a remote access session.
+  TestMu AI (plugin, install separately): agent-device connect testmu verifies credentials and the exact virtual device (emulator or simulator) or, with --provider-device-type real, real device and OS version, then stores a local provider profile. --provider-app takes an lt:// app reference, an https URL, or a local path: connect looks an lt:// id up among your uploads for that device pool, while URL and local sources are uploaded and validated when open creates the session. It does not create a hub session.
+  Limrun: agent-device connect limrun verifies access to the selected iOS or Android instance service, then stores a local provider profile. It does not create an instance.
+  Revyl (plugin, install separately): agent-device connect revyl verifies credentials against the Revyl backend, then stores a local provider profile with the platform, optional --device model and --provider-os-version, and a required --provider-app https URL: Revyl downloads and installs that build when it starts the device. It does not rent a device.
+
+Plugin installation: the lines below name the plugin each provider needs, and plugin help is available before installation. plugins list --json reports your installed plugins. A missing plugin returns reason plugin-not-installed with its installation command; a selected plugin that cannot supply the provider returns plugin-unavailable instead. After changing plugins, close sessions and stop an existing local daemon with the same --state-dir before the next device command.
+${providerPluginHelp()}
+
+After direct-provider connect:
+  Read the printed Device, App, Next, and workflow-note lines. They are also available as verification/device/app/liveSession/nextSteps/notes in --json output.
+  BrowserStack, AWS Device Farm, and TestMu AI create the hosted session on open. open needs the installed package or bundle identifier, not the app artifact name, ARN, or lt:// id.
+  Before provider allocation, apps lists compatible uploaded app assets without creating an instance when the selected provider exposes a catalog. open <exact-asset-name> creates the instance with that asset, resolves its installed app id, and launches it. install remains available when the app comes from a fresh local path or URL.
+  AWS Device Farm cannot install after allocation. If connect reports no attached app, run its printed reconnect command, which includes --session <name> --force, before open.
+  Do not run devices as a pre-open catalog probe for direct providers; it can allocate the deferred provider session. Limrun is the exception for apps: before allocation it lists uploaded assets for the selected platform.
+
+Device cloud interfaces:
+  CLI is the canonical bootstrap path: connect limrun/browserstack/aws-device-farm/testmu/revyl, then use normal open/snapshot/click/close/disconnect commands; artifacts are provider-dependent.
+  JavaScript can skip persisted connect state by passing leaseProvider plus provider fields to createAgentDeviceClient or per-command options.
+  MCP exposes operational tools such as open, snapshot, click, close, and artifacts. It does not expose connect/disconnect; run CLI connect first in the same state dir before relying on MCP tools.
+
+Direct proxy flow for a remote Mac/simulator:
+  On the Mac with simulator/device access:
+    agent-device proxy --port 4310
+    cloudflared tunnel --url http://127.0.0.1:4310
+  On the remote client:
+    export AGENT_DEVICE_SESSION=checkout-agent
+    agent-device connect proxy --daemon-base-url https://example.trycloudflare.com/agent-device --daemon-auth-token <token>
+    agent-device devices --platform ios
+    agent-device open Maps --platform ios --device "iPhone 17 Pro"
+    agent-device snapshot -i --platform ios --device "iPhone 17 Pro"
+    agent-device artifacts --json
+    agent-device close
+    agent-device disconnect
+
+Leased sessions: a connection from connect proxy, connect (cloud), another connect provider, or a remote config that sets leaseProvider leases its device for one agent. Every command on it, from connect to disconnect, names its session with --session <name>, AGENT_DEVICE_SESSION, or a config session. Without one, it fails with INVALID_ARGS, reason REMOTE_SESSION_REQUIRED, before anything is leased, and never falls back to the connection another agent on the machine saved last. Set AGENT_DEVICE_SESSION once per agent or CI job before connect.
+
+Proxy lease by device spec:
+  Without --udid or --serial, open, install, reinstall, and uninstall through connect proxy send --platform, --target, and --device on the lease allocate, and the backend in front of the daemon picks the device. --os <version|range>, --image-tag <tag>, --device-mode <slim|full>, --device-baseline <name>, and --physical add a device spec to that request. A non-blank osVersion, imageTag, deviceMode or deviceBaseline and physical: true name a spec key, sent as given; the backend validates its value (for example, Android --os is an API level, --device-mode full asks for an unslimmed iOS simulator, and --device-baseline names a saved device state the backend restores; it is unrelated to diff screenshot --baseline <path>). A blank string and physical: false name nothing, from the CLI, the SDK, or MCP. A value of another type fails with INVALID_ARGS, reason device-spec-invalid. connect proxy stores the spec keys it names as defaults like --platform and --device.
+    agent-device open MyApp --platform ios --device "iPhone 17 Pro" --os ">=26"
+    agent-device open MyApp --platform android --os 34 --image-tag google_apis_playstore
+  A backend that honours the spec returns the granted device as lease.device (model, osVersion, imageTag, physical, deviceMode when it reports one, and baseline {name, version} when one was restored); open --json prints it. A lease that reports no deviceMode is accepted without confirming the mode. A daemon, local or behind agent-device proxy, refuses a request that names a spec key with UNSUPPORTED_OPERATION, reason device-spec-unsupported, and details.keys, and records no lease. When the backend returns a lease without lease.device, with deviceMode slim for a full request, or without baseline.name equal to the requested --device-baseline, the CLI releases that lease, unless the allocation explicitly reports reuse (created: false). The command then fails with UNSUPPORTED_OPERATION, reason device-spec-unsupported, and details.released reports whether a release it attempted succeeded. A live lease serves a later command only when every spec key the command names equals the one the lease was allocated by; otherwise the command fails with reason CONNECTION_DEVICE_CONFLICT. Run connect --force to lease by another spec.
+
+Human takeover of a leased remote device:
+  Run agent-device takeover using the active remote connection and session. It pauses state-changing agent commands until Ctrl+C while snapshots and other read-only diagnostics remain available. Tenant requests can control only their admitted lease device. Local takeover without a remote device lease is not supported.
+    agent-device takeover --session remote-session
+    agent-device takeover status
+    agent-device takeover release <hold-id>
+  An HTTP-mode daemon also accepts authenticated GET/PUT/DELETE requests at /admin/human-control/holds on its loopback listener. Host administrators supply the exact lease backend/provider/device key and use the local daemon token, not a tenant credential. This host-admin route is intentionally not forwarded by agent-device proxy. Holds do not survive daemon restart; re-establish them after reconnecting. The same listener and token serve GET/PUT/DELETE /admin/leases, where a host allocates a macos-app lease confining a client to one app (<bundleId> or <bundleId>@<pid>); tenants cannot allocate one.
+
+Cloud profile flow:
+  export AGENT_DEVICE_SESSION=checkout-ios
+  agent-device connect
+  agent-device open com.example.app
+  agent-device snapshot
+  agent-device disconnect
+
+TestMu AI virtual-device flow (emulators and simulators):
+  agent-device plugins add @agent-device/testmu
+  export LT_USERNAME=... LT_ACCESS_KEY=... AGENT_DEVICE_SESSION=checkout-ios
+  agent-device connect testmu --platform ios --device "iPhone 16" --provider-os-version 18.0 --provider-app lt://APP-id
+  agent-device open com.example.app
+  agent-device snapshot -i
+  agent-device close
+  agent-device artifacts --json
+  agent-device disconnect
+
+TestMu AI real-device flow:
+  agent-device connect testmu --provider-device-type real --platform ios --device "iPhone 16" --provider-os-version 18 --provider-app ./MyApp.ipa --session checkout-real
+  Real iOS devices are listed by major OS version (18, not 18.0) and install a signed .ipa. Real and virtual devices have separate upload APIs, so pass an lt:// id uploaded for the pool you connect to.
+
+${TV_PLUGIN_FLOWS}
+BrowserStack hosted-device flow:
+  export BROWSERSTACK_USERNAME=... BROWSERSTACK_ACCESS_KEY=... AGENT_DEVICE_SESSION=checkout-android
+  agent-device connect browserstack --platform android --device "Google Pixel 8" --provider-os-version 14.0 --provider-app bs://app-id
+  agent-device open com.example.app
+  agent-device snapshot -i
+  agent-device close
+  agent-device artifacts --json
+  agent-device disconnect
+
+AWS Device Farm hosted-device flow:
+  export AWS_REGION=us-west-2 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_SESSION_TOKEN=... AGENT_DEVICE_SESSION=checkout-android
+  agent-device connect aws-device-farm --platform android --aws-project-arn <arn> --aws-device-arn <arn> --aws-app-arn <arn>
+  agent-device open com.example.app
+  agent-device snapshot -i
+  agent-device close
+  agent-device artifacts --json
+  agent-device disconnect
+  AWS Device Farm currently supports Android and iOS WebDriver sessions only; Vega OS and Vega Fire TV ARNs are not routed.
+
+Limrun direct-device flow:
+  export LIMRUN_API_KEY=... AGENT_DEVICE_SESSION=checkout-android
+  agent-device connect limrun --platform android
+
+  Limrun creates remote iOS simulators and Android emulators only. Do not pass local device selectors such as --udid, --serial, or --device.
+  To drive an existing instance without the API key, set LIM_IOS_INSTANCE_URL and LIM_IOS_INSTANCE_TOKEN, or LIM_ANDROID_INSTANCE_URL, LIM_ANDROID_INSTANCE_TOKEN, and LIM_ANDROID_INSTANCE_ADB_URL, from the instance status before connect. agent-device then never creates or deletes that instance; install and reinstall sync local app files without LIMRUN_API_KEY. Android still needs its ADB URL to connect. The apps command before the first open requires LIMRUN_API_KEY to list stored assets.
+  Set LIMRUN_KEEP_ALIVE=1 to ping the instance every 30 seconds while a session is open, so an idle session does not hit the Limrun inactivity timeout. It is off by default.
+  To capture network traffic, connect with --provider-network-logs --provider-network-hosts <app API hosts>. artifacts and close write the HAR and print its path and any capture failures; the HAR holds raw headers and bodies, and captured traffic exits through the daemon host.
+  agent-device apps
+  agent-device open Example.apk
+  agent-device snapshot -i
+  agent-device close
+  agent-device disconnect
+
+Revyl cloud-device flow (plugin, install separately):
+  agent-device plugins add @agent-device/revyl
+  export REVYL_API_KEY=... AGENT_DEVICE_SESSION=checkout-ios
+  agent-device connect revyl --platform ios --provider-app https://downloads.example.test/app.zip
+  agent-device open com.example.app
+  agent-device snapshot -i
+  agent-device close
+  agent-device disconnect
+  Revyl starts a device from its own pool, so --device and --provider-os-version are preferences it picks from rather than a catalog lookup; leave them unset to get a simulator that is already warm. --provider-app must be an https URL it can download. connect verifies the key without renting a device; the device is rented on the first command that needs it and released on close or disconnect.
+
+Local profile flow:
+  agent-device connect --remote-config ./remote-config.json
+  agent-device open com.example.app
+  agent-device snapshot
+  agent-device disconnect
+
+Script flow, per-command config:
+  agent-device open com.example.app --remote-config ./remote-config.json
+  agent-device snapshot --remote-config ./remote-config.json
+  agent-device disconnect --remote-config ./remote-config.json
+
+Rules:
+  connect and disconnect are top-level commands. Do not write agent-device remote connect or agent-device remote disconnect.
+  Use connect without --remote-config when the cloud control plane owns the connection profile.
+  Prefer connect --remote-config over --daemon-base-url, --tenant, --run-id, and --lease-id when using a local profile.
+  Use agent-device proxy for direct tunnel access to a Mac you control. Expose the printed proxy URL through cloudflared/ngrok, then run agent-device connect proxy with the tunnel URL and printed token before normal commands.
+  Use Limrun, BrowserStack, AWS Device Farm, TestMu AI, and Revyl through local provider profiles; they do not accept a remote agent-device daemon URL.
+  Device cloud credentials must be available before the command starts. Limrun uses LIMRUN_API_KEY, or the LIM_*_INSTANCE_* variables for an existing instance. BrowserStack uses BROWSERSTACK_USERNAME and BROWSERSTACK_ACCESS_KEY. TestMu AI uses LT_USERNAME and LT_ACCESS_KEY. Revyl uses REVYL_API_KEY, with REVYL_API_URL to point at another Revyl backend. AWS Device Farm uses the AWS CLI credential chain, including CI-provided AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN, AWS profiles, or web identity role variables.
+  A local daemon keeps the Limrun, BrowserStack, TestMu AI, and Revyl credentials it started with. When the shell holds different ones, the first command that allocates a lease refuses with reason provider-credentials-changed; run agent-device daemon stop with the same --state-dir, then rerun the command. A shell that sets none of them uses the daemon's. A daemon with an HTTP auth hook serves remote callers and does not compare.
+  A lease for a provider the daemon has no runtime for refuses with UNSUPPORTED_OPERATION, reason provider-not-registered, and lists the registered providers, plus the plugins that failed to register as failedPlugins; no lease is recorded. Restart the daemon with the provider configured. Provider-less leases, proxy, and cloud need no provider runtime.
+  Direct-provider connect performs read-only provider calls and saves active connection state only after verification succeeds. It never creates a device, instance, App Automate session, or AWS remote access session.
+  connect without --session always creates a fresh remote session and prints that session in its next-step commands. Concurrent callers must pass the returned --session on every command; the ambient active connection is only a single-workflow convenience.
+  To replace an existing connection, pass its returned session explicitly with --session <name> --force. --force without --session creates another fresh session and does not release or overwrite an unrelated active connection.
+  Prefer short-lived AWS role credentials in CI. Generated connection profiles store app/device selectors and ARNs, not Limrun API keys or instance tokens, BrowserStack or TestMu AI access keys, or AWS credentials.
+  Limrun Android supports direct ADB port reverse for local Metro. Limrun iOS requires a public Metro URL because it cannot reach local host ports directly.
+  After closing a device cloud session, run agent-device artifacts --json to retrieve provider video/log/dashboard URLs when the provider has made them available.
+  connect proxy stores the connection profile and client identity. Proxy device leases are acquired on open and expire after five minutes without commands; when a lease expires or is released, the daemon ends the session opened under it and frees its device; devices may inspect proxy inventory without allocating.
+  Multiple agents can share one proxy when each uses connect proxy, open, commands, close, and disconnect.
+  disconnect releases local connection state; close releases the active session and device lease.
+  A busy direct-proxy device error means another agent owns the device until it closes or its inactivity lease expires.
+  Keep the proxy token secret. Anyone with the token can control the proxied daemon.
+  A daemon with AGENT_DEVICE_HTTP_AUTH_HOOK configured treats HTTP requests as remote: host-path install sources are rejected, as are install and reinstall binary paths, push payload files, and xctrace template files; uploaded artifacts remain supported, inline push JSON remains supported, and Maestro runScript, evalScript, and JavaScript conditions are rejected. No-hook local HTTP and socket flows retain their local behavior.
+  A daemon started with AGENT_DEVICE_DAEMON_POLICY=<policy.json> enforces that policy for every request, including batch steps and replay actions: it can limit which devices are visible and bindable, allow or deny commands (Maestro flows reach the daemon as the runtime command), and deny device-shutdown. A denial is UNAUTHORIZED with details.reason DAEMON_POLICY_DENIED; do not retry it. Use an allowed command or device, or ask the daemon operator to change the policy; a denied capability such as device-shutdown has no allowed alternative.
+  If local/proxy iOS reports that the runner is already owned by another agent-device daemon after lease admission, retry after the owning session closes or after lease expiry. If the conflict repeats, clean stale daemon state on the machine with simulator access.
+  Do not use --config as a remote profile flag. --config loads CLI defaults; --remote-config selects remote daemon/profile settings.
+  For self-contained scripts, pass the same --remote-config to every operational command, including disconnect; a preceding connect is optional but not required.
+  For remote artifact installs, use install-from-source <url> or install-from-source --github-actions-artifact org/repo:artifact; do not download CI artifacts locally first.
+  After connect, let the active remote connection supply runtime hints.
+  For connected phone/tablet setup and iOS signing prerequisites, read agent-device help physical-device.
+  Use --debug when remote connection or transport errors need diagnostic ids and remote log hints.`,
+  },
+  macos: {
+    summary: 'macOS desktop, frontmost-app, and menu bar surfaces',
+    body: `agent-device help macos
+
+Use macOS only when the task targets desktop apps, desktop surfaces, or menu bar extras.
+
+Open and inspect:
+  agent-device open TextEdit --platform macos
+  agent-device snapshot -i --platform macos
+
+Surfaces:
+  --surface is an open flag; the session keeps it, so later commands do not repeat it.
+  --surface app            normal app session
+  --surface frontmost-app  inspect whichever app is frontmost
+  --surface desktop        desktop-wide surface
+  --surface menubar        menu bar extras and menu bar-only apps
+
+Menu bar app example:
+  agent-device open "Agent Device Tester Menu" --platform macos --surface menubar
+  agent-device snapshot -i --platform macos
+
+Context menu example:
+  agent-device click @e66 --button secondary --platform macos
+  agent-device snapshot -i --platform macos
+
+Rules:
+  Use open and snapshot -i for menu bar inspection. Do not output inspect as a command.
+  Context menus are not ambient UI: secondary-click a visible target, then re-snapshot and use the new menu-item refs.
+  Do not let iOS simulator-set scoping hide macOS desktop targets.
+  Prefer refs/selectors over raw coordinates.
+  macOS snapshot rects are window-space; use current refs or overlay refs instead of guessing coordinates.
+  On the default XCTest backend a read (snapshot, get, find) of a session app that sits behind other windows is answered from where it sits, without raising the app; interactions and a window-level screenshot of that app still bring it forward.
+  With AGENT_DEVICE_MACOS_APP_BACKEND=native, each app opened on the app surface is its own device: sessions on different apps run in parallel; a same-app or whole-Mac (desktop, menubar, frontmost-app) session conflicts.
+  An app session opens its app in the background and opens or closes only that app (open <url> goes to it). It refuses clipboard, settings, and audio probe; use a --surface desktop session for those, or a new --session for another app.`,
+  },
+  web: {
+    summary: 'Minimal browser workflow with the managed web backend',
+    body: `agent-device help web
+
+Use --platform web only for the minimal browser command loop exposed through agent-device.
+
+Dependency:
+  Browser mechanics come from a managed, pinned agent-browser backend. agent-device owns command/session/replay integration, selectors/refs at the command surface, and artifact routing; agent-browser owns browser launch, page control, screenshots, and browser-specific behavior.
+  Use --platform web when a browser step belongs inside an agent-device session, replay, batch, MCP, or typed-client flow. Use agent-browser directly for standalone web automation.
+  Before first use, set up and verify the managed backend:
+    agent-device web setup
+    agent-device web doctor
+  Web automation requires Node 24+.
+
+Planning rule:
+  For web command plans, output only agent-device command lines. Do not add prose, numbering, Markdown fences, shell pipes, or agent-browser commands unless the task is explicitly standalone browser automation outside agent-device.
+
+First-slice loop:
+  Audio probe start uses duration seconds first, then bucket milliseconds.
+  agent-device web setup
+  agent-device web doctor
+  agent-device open https://example.com --platform web
+  agent-device snapshot -i --platform web
+  agent-device get text @e2 --platform web
+  agent-device is visible 'label="Welcome"' --platform web
+  agent-device find text "Welcome" exists --platform web
+  agent-device click @e12 --platform web
+  agent-device hover @e14 --settle --platform web
+  agent-device fill @e13 "qa@example.com" --platform web
+  agent-device wait text "Welcome" 3000 --platform web
+  agent-device record start ./artifacts/web-flow.webm --platform web
+  agent-device network dump 25 --include headers --platform web
+  agent-device audio probe start 10 1000 --platform web
+  agent-device screenshot ./artifacts/web-home.png --platform web
+  agent-device screenshot ./artifacts/web-full.png --platform web --fullscreen
+  agent-device viewport 1280 900 --platform web
+  agent-device record stop --platform web
+  agent-device close --platform web
+
+Supported in agent-device web sessions:
+  open <url>, snapshot -i, get text/attrs, is visible/hidden/exists/absent/focused/text, find text/selector, click/press @ref or selector, hover @ref or selector, fill/type @ref or selector, wait text/selector/absent, network dump, audio probe, screenshot, record start/stop with WebM output, close, and replay scripts made from those commands.
+  hover moves the pointer without pressing so hover-gated UI (row toolbars, menus) appears; use --settle to read what it revealed, then act on the fresh refs. hover @ref hovers the browser element handle directly; pair --settle with a selector or coordinates (web refs carry no geometry, as with click @ref --settle). Web only: touch platforms have no hover state, so hover-gated flows there need a different entry point.
+
+Out of scope for agent-device web support:
+  Browser runtime debugging, tabs/windows/devtools control, network routing/interception/HAR, storage/cookie management, arbitrary page scripting, downloads/uploads, multi-page orchestration, and agent-browser-specific diagnostics. Use agent-browser directly for those browser-specific workflows.
+
+Rules:
+  Do not claim web e2e CI exists unless a project workflow explicitly provides it.
+  Do not use native mobile or desktop setup commands such as boot, apps, install, settings, alert, keyboard, perf, logs, or react-devtools for --platform web.
+  Keep browser plans session-scoped: open a URL, inspect refs, act on refs/selectors, verify with wait/get/is/snapshot, capture screenshot only when visual evidence is needed, then close. Each --session name is its own browser (cookies and storage) and its own device (agent-browser-chrome:session:p_<name>, or t_<tenant hash>_<name> under tenant isolation so tenants never share a browser): web sessions with different names run in parallel, and the same name in the same tenant conflicts while different tenants may reuse a name. Without --session under local workspace scoping, each workspace uses its own browser and device (agent-browser-chrome:session:w_<workspace scope>); different workspaces can run in parallel, while the same workspace conflicts across daemons sharing a claims directory. A request without a workspace scope (no cwd) uses the default session's browser and device (p_default, or t_<tenant hash>_default under tenant isolation). A name matches case-insensitively and must be 1 to 30 characters of letters, digits, "_" and "-" (1 to 17 under tenant isolation); anything else, including surrounding whitespace or an empty --session "", is refused with web_session_name_invalid.`,
+  },
+  ...qaReportHelpTopics,
+} as const satisfies Record<string, { summary: string; body: string }>;
+
+function formatCommandListArg(commandName: string, schema: CommandSchema, arg: string): string {
+  const optional = arg.endsWith('?');
+  const name = optional ? arg.slice(0, -1) : arg;
+  const isChoiceLiteral = /^[a-z-]+(?:\|[a-z-]+)+$/i.test(name);
+  const isLiteralToken =
+    isChoiceLiteral ||
+    (schema.usageOverride !== undefined &&
+      schema.usageOverride.startsWith(`${commandName} ${name}`));
+  if (optional) {
+    if (isChoiceLiteral) return `[${name}]`;
+    if (isLiteralToken) return name;
+    return `[${name}]`;
+  }
+  return isLiteralToken ? name : `<${name}>`;
+}
+
+function buildCommandListUsage(commandName: string, schema: CommandSchema): string {
+  if (schema.listUsageOverride) return schema.listUsageOverride;
+  const positionals = (schema.positionalArgs ?? []).map((arg) =>
+    formatCommandListArg(commandName, schema, arg),
+  );
+  return [commandName, ...positionals].join(' ');
+}
+
+function renderUsageText(): string {
+  return renderCliHelpOverview();
+}
+
+function renderFullCommandReferenceText(): string {
+  const header = `agent-device help commands
+
+Full command catalog. Use agent-device help <command> for exact flags and behavior.
+`;
+
+  const commands = listCliCommandNames().map((name) => {
+    const schema = getCliCommandSchema(name);
+    return {
+      name,
+      schema,
+      usage: buildCommandListUsage(name, schema),
+    };
+  });
+  const commandLines = renderCommandSection(commands);
+
+  const selectionSection = renderFlagSection(
+    // "shared by", not "accepted by every": a few catalog commands take a subset (connect has
+    // no --udid/--serial, device has no --session) — help <command> states each command's own.
+    "Device Selection (shared by device commands; help <command> lists each command's flags):",
+    listHelpFlags(DEVICE_SELECTION_FLAG_KEYS),
+  );
+  const helpFlags = listHelpFlags(GLOBAL_FLAG_KEYS);
+  const flagsSection = renderFlagSection('Global Flags:', helpFlags);
+  const configSection = renderTextSection('Configuration:', CONFIGURATION_LINES);
+  const environmentSection = renderAlignedSection('Environment:', ENVIRONMENT_LINES);
+  const examplesSection = renderTextSection('Examples:', EXAMPLE_LINES);
+
+  return `${header}
+${commandLines}
+
+${selectionSection}
+
+${flagsSection}
+
+${configSection}
+
+${environmentSection}
+
+${examplesSection}
+`;
+}
+
+export function buildUsageText(): string {
+  return renderUsageText();
+}
+
+function listHelpFlags(keys: ReadonlySet<FlagKey>): FlagDefinition[] {
+  return getFlagDefinitions().filter(
+    (definition) =>
+      keys.has(definition.key) &&
+      definition.usageLabel !== undefined &&
+      definition.usageDescription !== undefined,
+  );
+}
+
+// Command-specific override for a shared flag's help text (see CommandSchema.flagDescriptionOverrides):
+// keeps the FlagDefinition registry as one shared row per flag while letting a command whose
+// semantics genuinely differ (e.g. `replay --save-script` arms a repair transaction, not the
+// open/close authoring lifecycle) show its own description without duplicating the flag entry.
+function applyFlagDescriptionOverrides(
+  definitions: FlagDefinition[],
+  overrides: Partial<Record<FlagKey, string>> | undefined,
+): FlagDefinition[] {
+  if (!overrides) return definitions;
+  return definitions.map((definition) => {
+    const override = overrides[definition.key];
+    return override === undefined ? definition : { ...definition, usageDescription: override };
+  });
+}
+
+function renderFlagSection(title: string, definitions: FlagDefinition[]): string {
+  return renderAlignedSection(
+    title,
+    definitions.map((flag) => ({
+      label: flag.usageLabel ?? '',
+      description: flag.usageDescription ?? '',
+    })),
+  );
+}
+
+// Cap the alignment column so one long outlier label (for example a
+// combined tv-remote usage string) does not force padding whitespace onto
+// every other row. Rows whose label exceeds the cap fall back to a plain
+// two-space gap; they still read fine and every regex in the test suite
+// only requires \s{2,}, never an exact column width.
+const ALIGN_CAP = 26;
+
+function renderAlignedSection(
+  title: string,
+  items: ReadonlyArray<{ label: string; description: string }>,
+): string {
+  if (items.length === 0) {
+    return `${title}\n  (none)`;
+  }
+  const columnWidth = Math.max(...items.map((item) => Math.min(item.label.length, ALIGN_CAP))) + 2;
+  const lines = [title];
+  for (const item of items) {
+    const label =
+      item.label.length <= ALIGN_CAP ? item.label.padEnd(columnWidth) : `${item.label}  `;
+    lines.push(`  ${label}${item.description}`);
+  }
+  return lines.join('\n');
+}
+
+function renderTextSection(title: string, lines: ReadonlyArray<string>): string {
+  if (lines.length === 0) {
+    return `${title}\n  (none)`;
+  }
+  return [title, ...lines.map((line) => `  ${line}`)].join('\n');
+}
+
+function renderCommandSection(
+  commands: Array<{ name: string; schema: CommandSchema; usage: string }>,
+): string {
+  return renderAlignedSection(
+    'Commands:',
+    commands.map((command) => ({
+      label: command.usage,
+      description: command.schema.text.summary,
+    })),
+  );
+}
+
+export function buildCommandUsageText(commandName: string): string | null {
+  const topicHelp = buildHelpTopicUsageText(commandName);
+  if (topicHelp) return topicHelp;
+  const schema = getCommandSchema(commandName);
+  if (!schema) return null;
+  const usage = buildCommandUsage(commandName, schema);
+  const commandFlags = applyFlagDescriptionOverrides(
+    listHelpFlags(new Set<FlagKey>(schema.allowedFlags ?? [])),
+    schema.flagDescriptionOverrides,
+  );
+  const sections: string[] = [];
+  if (commandName === 'connect') {
+    sections.push(`Optional provider plugins:\n${providerPluginHelp()}`);
+  }
+  if (commandFlags.length > 0) {
+    sections.push(renderFlagSection('Command flags:', commandFlags));
+  }
+  const flagsSections = sections.length > 0 ? `\n\n${sections.join('\n\n')}` : '';
+
+  // One synopsis, not two: the header used to repeat the Usage block verbatim.
+  return `Usage:
+  agent-device ${usage}
+
+${helpBody(schema.text)}${flagsSections}
+`;
+}
+
+/** The one-line synopsis of a canonical command name, such as `agent-device fill <target> <text>`. */
+export function buildCommandSynopsis(commandName: string): string | null {
+  const schema = getCommandSchema(commandName);
+  return schema ? `agent-device ${buildCommandUsage(commandName, schema)}` : null;
+}
+
+/** `--help` text for a command name or one of its aliases; `null` when neither has any. */
+export function resolveHelpTargetUsageText(helpTarget: string): string | null {
+  return buildCommandUsageText(normalizeCliCommandAlias(helpTarget));
+}
+
+/**
+ * Topic-id registry view for conformance tooling: the help benchmark's topic
+ * coverage gate enumerates this instead of a hand-maintained list, so adding a
+ * topic without benchmark coverage (or an explicit waiver) fails a test.
+ */
+export function helpTopicIds(): string[] {
+  return Object.keys(HELP_TOPICS);
+}
+
+function buildHelpTopicUsageText(topicName: string): string | null {
+  const topic = HELP_TOPICS[topicName as keyof typeof HELP_TOPICS];
+  if (!topic) return null;
+  const body = topicName === 'commands' ? renderFullCommandReferenceText() : topic.body;
+  const related = RELATED_HELP_LINES.filter((entry) => entry.topic !== topicName)
+    .map((entry) => `  ${entry.line}\n`)
+    .join('');
+  return `${withVersionHeader(topicName, body)}
+
+Related:
+${related}`;
+}
+
+const RELATED_HELP_LINES = [
+  { topic: null, line: 'agent-device help <command>   command-specific flags' },
+  { topic: 'manual-qa', line: 'agent-device help manual-qa   routine QA loop' },
+  { topic: 'workflow', line: 'agent-device help workflow    full automation reference' },
+] as const;
+
+// Every topic body's first line is authored as `agent-device help <topicId>`. Swapping in the
+// installed version here (instead of hand-editing every topic string) gives the skill router a
+// single, reliable header to read the CLI version from without a separate --version call: a
+// missing/old header on `help workflow` means an old CLI that predates this format.
+function withVersionHeader(topicId: string, body: string): string {
+  const legacyHeader = `agent-device help ${topicId}`;
+  if (!body.startsWith(legacyHeader)) return body;
+  return `agent-device ${readVersion()} — ${topicId}${body.slice(legacyHeader.length)}`;
+}

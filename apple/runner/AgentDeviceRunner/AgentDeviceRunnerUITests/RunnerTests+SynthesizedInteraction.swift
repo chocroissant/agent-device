@@ -1,0 +1,866 @@
+import XCTest
+import AgentDeviceSnapshotPresentation
+
+extension RunnerTests {
+  @MainActor
+  func synthesizedDragAt(
+    app: XCUIApplication,
+    x: Double,
+    y: Double,
+    x2: Double,
+    y2: Double,
+    durationMs: Double,
+    profile: SynthesizedDragProfile,
+    context: SynthesizedCoordinateContext? = nil
+  ) throws -> RunnerInteractionOutcome {
+#if os(iOS)
+    guard x.isFinite, y.isFinite, x2.isFinite, y2.isFinite else {
+      return .unsupported(
+        message: "synthesized coordinate drag requires finite coordinates",
+        hint: "Retry with finite x, y, x2, and y2 values."
+      )
+    }
+    guard let context = try context ?? synthesizedCoordinateContext(app: app) else {
+      return .unsupported(
+        message: "synthesized coordinate drag could not resolve an app window with a finite screen frame",
+        hint: "Retry after the app is foregrounded, or use a plain screenshot to choose coordinates."
+      )
+    }
+    guard let geometry = digitizerGeometry(app: app, surface: context.geometry) else {
+      return Self.unmeasuredSoleDisplayOutcome(gesture: "drag")
+    }
+    let frame = context.geometry.windowOnScreen.rect
+    let start = geometry.digitizerPoint(from: SurfacePoint(CGPoint(x: x, y: y))).point
+    let end = geometry.digitizerPoint(from: SurfacePoint(CGPoint(x: x2, y: y2))).point
+    logSynthesizedDispatch(
+      kind: "drag",
+      start: start,
+      end: end,
+      referenceFrame: frame,
+      orientation: context.geometry.orientation
+    )
+    let message = RunnerSynthesizedGesture.synthesizeDrag(
+      withApplication: app,
+      resolvedWindow: context.resolvedWindow,
+      interfaceOrientation: geometry.orientation,
+      drag: RunnerSynthesizedDrag(start: start, end: end, durationMs: durationMs,
+                                  controlledScroll: ObjCBool(profile == .controlledScroll))
+    )
+    if let message {
+      return .unsupported(
+        message: message,
+        hint: "Private XCTest event synthesis is required for AX-free coordinate drag on iOS; update Xcode if this persists."
+      )
+    }
+    return .performed
+#elseif os(tvOS)
+    return .unsupported(
+      message: "coordinate drag is not supported on tvOS",
+      hint: "tvOS has no coordinate input; use remote-driven swipe/scroll to move focus instead."
+    )
+#else
+    return .unsupported(
+      message: "coordinate drag is not supported on macOS",
+      hint: "macOS automation has no touchscreen; use mouse-driven interactions instead."
+    )
+#endif
+  }
+
+  @MainActor
+  func synthesizedTapAt(
+    app: XCUIApplication,
+    x: Double,
+    y: Double,
+    context: SynthesizedCoordinateContext? = nil,
+    deadline: Date? = nil
+  ) throws -> RunnerInteractionOutcome? {
+#if os(iOS)
+    guard x.isFinite, y.isFinite else {
+      return .unsupported(
+        message: "synthesized coordinate tap requires finite coordinates",
+        hint: "Retry with finite x and y values."
+      )
+    }
+    let context = try context ?? synthesizedCoordinateContext(app: app)
+    let resolution = pointGestureTarget(
+      app: app,
+      x: x,
+      y: y,
+      context: context,
+      gesture: .tap
+    )
+    guard case .target(let point, let resolvedWindow, let referenceFrame, let orientation) = resolution else {
+      return resolution.refusal
+    }
+    logSynthesizedDispatch(
+      kind: "tap",
+      start: point,
+      end: nil,
+      referenceFrame: referenceFrame,
+      orientation: orientation
+    )
+    var message: NSString?
+    let status = RunnerSynthesizedGesture.synthesizeTap(
+      withApplication: app,
+      resolvedWindow: resolvedWindow,
+      interfaceOrientation: orientation,
+      point: point,
+      deadline: deadline,
+      errorMessage: &message
+    )
+    switch status {
+    case .succeeded:
+      return .performed
+    case .deadlineExceeded:
+      return nil
+    case .failed:
+      return .unsupported(
+        message: message as String? ?? "private XCTest event synthesis failed",
+        hint: "Falling back to XCTest coordinate tap may be slower and can still need a healthy accessibility tree."
+      )
+    @unknown default:
+      return .unsupported(
+        message: "private XCTest event synthesis returned an unknown status",
+        hint: "Inspect the current app before deciding whether to act again."
+      )
+    }
+#elseif os(tvOS)
+    return .unsupported(
+      message: "coordinate tap is not supported on tvOS; move focus with swipe or scroll, then select the focused element",
+      hint: "tvOS has no coordinate input; move focus with swipe/scroll to the target, then select it."
+    )
+#else
+    return .unsupported(
+      message: "synthesized coordinate tap is not supported on macOS",
+      hint: "macOS automation has no touchscreen; use mouse-driven interactions instead."
+    )
+#endif
+  }
+
+#if os(iOS)
+  /// A long press is one stationary contact held for `durationMs`, synthesized like a tap: it needs
+  /// no app tree, so on a tree XCTest cannot serialize it lands through the sole-screen route.
+  @MainActor
+  func synthesizedLongPressAt(
+    app: XCUIApplication,
+    x: Double,
+    y: Double,
+    durationMs: Double,
+    context: SynthesizedCoordinateContext?
+  ) throws -> RunnerInteractionOutcome {
+    guard x.isFinite, y.isFinite, durationMs.isFinite, durationMs > 0 else {
+      return .unsupported(
+        message: "synthesized coordinate long press requires finite coordinates and a positive duration",
+        hint: "Retry with finite x and y values and a positive durationMs."
+      )
+    }
+    let resolution = pointGestureTarget(
+      app: app,
+      x: x,
+      y: y,
+      context: context,
+      gesture: .longpress
+    )
+    guard case .target(let point, let resolvedWindow, let referenceFrame, let orientation) = resolution else {
+      return resolution.refusal
+    }
+    logSynthesizedDispatch(
+      kind: "longPress",
+      start: point,
+      end: nil,
+      referenceFrame: referenceFrame,
+      orientation: orientation
+    )
+    let samples: [[String: NSNumber]] = [0, durationMs].map { offsetMs in
+      [
+        "x": NSNumber(value: Double(point.x)),
+        "y": NSNumber(value: Double(point.y)),
+        "offsetMs": NSNumber(value: offsetMs),
+      ]
+    }
+    if let message = RunnerSynthesizedGesture.synthesizeGesture(
+      withApplication: app,
+      resolvedWindow: resolvedWindow,
+      interfaceOrientation: orientation,
+      pointerSamples: [samples]
+    ) {
+      return .unsupported(
+        message: message,
+        hint: "Private XCTest event synthesis is required for an AX-free long press on iOS; update Xcode if this persists."
+      )
+    }
+    return .performed
+  }
+#endif
+
+  func keyboardAvoidingDragPoints(
+    app: XCUIApplication,
+    x: Double,
+    y: Double,
+    x2: Double,
+    y2: Double
+  ) throws -> DragPoints {
+    let original = DragPoints(x: x, y: y, x2: x2, y2: y2)
+#if os(iOS)
+    guard let keyboardFrame = visibleKeyboardFrame(app: app) else {
+      return original
+    }
+    let minX = min(x, x2)
+    let minY = min(y, y2)
+    let gestureBounds = CGRect(
+      x: CGFloat(minX),
+      y: CGFloat(minY),
+      width: CGFloat(max(abs(x2 - x), 1)),
+      height: CGFloat(max(abs(y2 - y), 1))
+    )
+    guard gestureBounds.intersects(keyboardFrame) else {
+      return original
+    }
+
+    let appFrame = try onScreenWindowFrame(app: app)
+    guard !appFrame.isEmpty else {
+      return original
+    }
+
+    let padding: Double = 12
+    let targetMaxY = Double(keyboardFrame.minY) - padding
+    let currentMaxY = max(y, y2)
+    let shift = currentMaxY - targetMaxY
+    guard shift > 0 else {
+      return original
+    }
+
+    let adjustedY = y - shift
+    let adjustedY2 = y2 - shift
+    guard min(adjustedY, adjustedY2) >= Double(appFrame.minY) + padding else {
+      return original
+    }
+
+    NSLog(
+      "AGENT_DEVICE_RUNNER_KEYBOARD_AVOIDING_DRAG from=(%.1f,%.1f)->(%.1f,%.1f) adjusted=(%.1f,%.1f)->(%.1f,%.1f) keyboardMinY=%.1f",
+      x,
+      y,
+      x2,
+      y2,
+      x,
+      adjustedY,
+      x2,
+      adjustedY2,
+      Double(keyboardFrame.minY)
+    )
+    return DragPoints(x: x, y: adjustedY, x2: x2, y2: adjustedY2)
+#else
+    return original
+#endif
+  }
+
+  func resolvedTouchVisualizationFrame(app: XCUIApplication, x: Double, y: Double) throws -> TouchVisualizationFrame {
+    let resolved = try resolveCoordinateWindow(app: app)
+    // Without a window the fallback frame is the app's own, so a windowless tree reads it once.
+    let appFrame = resolved.window == nil ? resolved.frame : try readableAppFrame(app: app)
+    let referenceFrame = touchReferenceFrame(app: app, resolved: resolved)
+    let originX = appFrame.isEmpty ? referenceFrame.minX : appFrame.minX
+    let originY = appFrame.isEmpty ? referenceFrame.minY : appFrame.minY
+    return TouchVisualizationFrame(
+      x: originX + x,
+      y: originY + y,
+      referenceWidth: referenceFrame.width,
+      referenceHeight: referenceFrame.height
+    )
+  }
+
+  /// The touch visualization frame of a synthesized gesture, read from its context instead of the
+  /// app tree.
+  func touchVisualizationFrame(
+    point: SurfacePoint<InterfaceScreenSpace>,
+    context: SynthesizedCoordinateContext
+  ) -> TouchVisualizationFrame {
+    TouchVisualizationFrame(
+      x: Double(point.point.x),
+      y: Double(point.point.y),
+      referenceWidth: Double(context.geometry.windowOnScreen.rect.width),
+      referenceHeight: Double(context.geometry.windowOnScreen.rect.height)
+    )
+  }
+
+  func resolvedDragVisualizationFrame(
+    app: XCUIApplication,
+    x: Double,
+    y: Double,
+    x2: Double,
+    y2: Double
+  ) throws -> DragVisualizationFrame {
+    let start = try resolvedTouchVisualizationFrame(app: app, x: x, y: y)
+    let end = try resolvedTouchVisualizationFrame(app: app, x: x2, y: y2)
+    return DragVisualizationFrame(
+      x: start.x,
+      y: start.y,
+      x2: end.x,
+      y2: end.y,
+      referenceWidth: start.referenceWidth,
+      referenceHeight: start.referenceHeight
+    )
+  }
+
+  /// The resolved window's frame, or the app's own frame where no window answers, clear of the
+  /// keyboard.
+  func resolvedTouchReferenceFrame(app: XCUIApplication) throws -> CGRect {
+    touchReferenceFrame(app: app, resolved: try resolveCoordinateWindow(app: app))
+  }
+
+  private func touchReferenceFrame(app: XCUIApplication, resolved: (window: XCUIElement?, frame: CGRect)) -> CGRect {
+    if resolved.window != nil || !resolved.frame.isEmpty {
+      return frameAvoidingKeyboard(app: app, frame: resolved.frame)
+    }
+    return CGRect(x: 0, y: 0, width: 0, height: 0)
+  }
+
+  /// The viewport the portable gesture planner lays pointer paths in: the frame of the synthesized
+  /// context its record is routed through, so a tree with no window whose app provably fills its
+  /// sole screen plans on that screen, the same route a synthesized tap or scroll takes.
+  @MainActor
+  func gestureViewportFrame(app: XCUIApplication) throws -> CGRect {
+#if os(iOS)
+    guard let context = try synthesizedCoordinateContext(app: app) else {
+      return frameAvoidingKeyboard(app: app, frame: try readableAppFrame(app: app))
+    }
+    // The sole-screen route means the windows query just failed, so a keyboard probe would too.
+    return context.resolvedWindow == nil
+      ? context.geometry.windowOnScreen.rect
+      : frameAvoidingKeyboard(app: app, frame: context.geometry.windowOnScreen.rect)
+#else
+    return try resolvedTouchReferenceFrame(app: app)
+#endif
+  }
+
+  private func frameAvoidingKeyboard(app: XCUIApplication, frame: CGRect) -> CGRect {
+#if os(iOS)
+    guard let keyboardFrame = visibleKeyboardFrame(app: app), !frame.isEmpty else {
+      return frame
+    }
+    let intersection = frame.intersection(keyboardFrame)
+    guard !intersection.isNull && intersection.height > 0 else {
+      return frame
+    }
+    let keyboardCoverage = intersection.width / max(frame.width, 1)
+    guard keyboardCoverage >= 0.5 else {
+      return frame
+    }
+    let safeHeight = keyboardFrame.minY - frame.minY
+    guard safeHeight >= frame.height * 0.25 else {
+      return frame
+    }
+    return CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: safeHeight)
+#else
+    return frame
+#endif
+  }
+
+  @MainActor
+  func axFreeSynthesizedDragPlan(
+    app: XCUIApplication,
+    x: Double,
+    y: Double,
+    x2: Double,
+    y2: Double,
+    context: SynthesizedCoordinateContext? = nil
+  ) throws -> SynthesizedDragPlan? {
+#if os(iOS)
+    let context = try context ?? synthesizedCoordinateContext(app: app)
+    guard x.isFinite, y.isFinite, x2.isFinite, y2.isFinite,
+      let context
+    else {
+      return nil
+    }
+    let points = context.allowsKeyboardProbe
+      ? try keyboardAvoidingDragPoints(app: app, x: x, y: y, x2: x2, y2: y2)
+      : DragPoints(x: x, y: y, x2: x2, y2: y2)
+    return SynthesizedDragPlan(
+      points: points,
+      context: context
+    )
+#else
+    return nil
+#endif
+  }
+
+  func logSynthesizedDispatch(
+    kind: String,
+    start: CGPoint,
+    end: CGPoint?,
+    referenceFrame: CGRect,
+    orientation: Int
+  ) {
+    if let end {
+      NSLog(
+        "AGENT_DEVICE_RUNNER_SYNTHESIZED_DISPATCH kind=%@ start=(%.1f,%.1f) end=(%.1f,%.1f) reference=(%.1f,%.1f,%.1f,%.1f) orientation=%d",
+        kind,
+        Double(start.x),
+        Double(start.y),
+        Double(end.x),
+        Double(end.y),
+        Double(referenceFrame.origin.x),
+        Double(referenceFrame.origin.y),
+        Double(referenceFrame.width),
+        Double(referenceFrame.height),
+        orientation
+      )
+      return
+    }
+    NSLog(
+      "AGENT_DEVICE_RUNNER_SYNTHESIZED_DISPATCH kind=%@ point=(%.1f,%.1f) reference=(%.1f,%.1f,%.1f,%.1f) orientation=%d",
+      kind,
+      Double(start.x),
+      Double(start.y),
+      Double(referenceFrame.origin.x),
+      Double(referenceFrame.origin.y),
+      Double(referenceFrame.width),
+      Double(referenceFrame.height),
+      orientation
+    )
+  }
+
+  @MainActor
+  func synthesizedCoordinateContext(
+    app: XCUIApplication,
+    windowQueryRejected: Bool = false
+  ) throws -> SynthesizedCoordinateContext? {
+#if os(iOS)
+    var health = mainOwned.accessibilityHealth
+    let window: XCUIElement?
+    let referenceFrame: CGRect
+    var treeUnreadable = false
+    if requestLitPanel != nil {
+      let booked = try requireRequestLitPanelSurface(app: app)
+      guard let context = SynthesizedCoordinateContext(
+        validating: booked.geometry, resolvedWindow: booked.window, accessibilityHealth: health
+      ) else { throw RunnerAppScreenCaptureFailure.unresolvedScreen }
+      return context
+    }
+    // A tree that just rejected a query skips the windows query only where the sole screen answers
+    // without it; anywhere else that query is still the only route.
+    let rejectedTreeSoleScreenFrame = windowQueryRejected ? soleScreenReferenceFrame(app: app) : nil
+    if rejectedTreeSoleScreenFrame == nil, let resolved = resolveRunnerWindowElement(app: app) {
+      window = resolved.window
+      referenceFrame = resolved.frame
+    } else if let soleScreenFrame = rejectedTreeSoleScreenFrame ?? soleScreenReferenceFrame(app: app) {
+      window = nil
+      referenceFrame = soleScreenFrame
+      // The windows query just failed on this tree, so this gesture's keyboard probes and XCTest
+      // fallbacks would fail on it too, after XCTest's own retries.
+      health = .unavailable
+      treeUnreadable = true
+    } else {
+      return nil
+    }
+    return SynthesizedCoordinateContext(
+      validating: surfaceGeometry(windowFrame: referenceFrame, app: app),
+      resolvedWindow: window,
+      accessibilityHealth: health,
+      treeUnreadable: treeUnreadable
+    )
+#else
+    return nil
+#endif
+  }
+
+
+#if os(iOS)
+  /// The reference frame of the sole-screen route, read without the app's accessibility tree: when
+  /// the app provably fills the device's only screen, its window is that screen. A deep app tree
+  /// makes the windows query fail with `kAXErrorIllegalArgument`, and without this route every
+  /// synthesized tap and scroll on such a screen failed even though synthesis itself needs no tree.
+  /// `RunnerResolveSoleScreen` owns which devices prove that — an iPhone always, an iPad only while
+  /// the app fills the screen — so this reads the same answer the record's routing takes, and
+  /// anything else (a windowed iPad, a multi-screen foldable) keeps requiring a window.
+  @MainActor
+  func soleScreenReferenceFrame(app: XCUIApplication) -> CGRect? {
+    guard soleScreenRouteAdmits(app) else { return nil }
+    let orientation = Int(RunnerSynthesizedGesture.interfaceOrientation(forApplication: app))
+    let frame = soleDisplayPortraitSize().flatMap {
+      Self.soleScreenReferenceFrame(portraitSize: $0, interfaceOrientation: orientation)
+    }
+    NSLog(
+      "AGENT_DEVICE_RUNNER_SYNTHESIZED_SOLE_SCREEN_ROUTE resolved=%@",
+      frame.map { NSCoder.string(for: $0) } ?? "none"
+    )
+    return frame
+  }
+
+  /// The sole-screen admission rule `RunnerResolveSoleScreen` owns: an iPhone by its idiom, an iPad
+  /// only on the fills-screen proof.
+  @MainActor
+  private func soleScreenRouteAdmits(_ app: XCUIApplication) -> Bool {
+    var resolvedScreen: AnyObject?
+    var resolvedDisplayID: UInt = 0
+    return RunnerResolveSoleScreen(app, &resolvedScreen, &resolvedDisplayID) == nil
+  }
+
+  @MainActor
+  func digitizerGeometry(app: XCUIApplication, surface: SurfaceGeometry) -> SurfaceGeometry? {
+    if surface.panelNativeSize != nil { return surface }
+    guard XCUIScreen.screens.count == 1 else { return surface }
+    switch surface.orientation {
+    case RunnerInterfaceOrientation.landscapeLeft, RunnerInterfaceOrientation.landscapeRight,
+      RunnerInterfaceOrientation.portraitUpsideDown:
+      break
+    default:
+      return surface
+    }
+    guard let portraitSize = soleDisplayPortraitSize() else {
+      let routeAdmits = soleScreenRouteAdmits(app)
+      NSLog(
+        "AGENT_DEVICE_RUNNER_APP_SCREEN_UNRESOLVED stage=rotation-basis basis=%@",
+        routeAdmits ? "window" : "refused"
+      )
+      return routeAdmits ? surface : nil
+    }
+    return SurfaceGeometry(windowOnScreen: surface.windowOnScreen,
+                           panelNativeSize: portraitSize, orientation: surface.orientation)
+  }
+
+  func surfaceGeometry(windowFrame: CGRect, app: XCUIApplication) -> SurfaceGeometry {
+    SurfaceGeometry(windowOnScreen: SurfaceRect(windowFrame),
+                    panelNativeSize: requestLitPanel.map { CGSize(width: $0.widthPt, height: $0.heightPt) },
+                    orientation: Int(RunnerSynthesizedGesture.interfaceOrientation(forApplication: app)))
+  }
+
+  private enum SynthesizedPointGesture: String {
+    case tap
+    case longpress
+
+    /// The gesture's name in the unresolved-window refusal, which predates this enum.
+    var unresolvedWindowName: String { self == .tap ? "tap" : "long press" }
+  }
+
+  private enum PointGestureResolution {
+    /// A nil `resolvedWindow` routes the record to the sole screen.
+    case target(point: CGPoint, resolvedWindow: XCUIElement?, referenceFrame: CGRect, orientation: Int)
+    case refused(RunnerInteractionOutcome)
+
+    /// Read only on the branch that is not a target, so its `.performed` answer is never returned.
+    var refusal: RunnerInteractionOutcome {
+      if case .refused(let outcome) = self { return outcome }
+      return .performed
+    }
+  }
+
+  /// Where a synthesized point gesture lands: its native point and the window that routes it, or the
+  /// refusal that stops it before dispatch.
+  @MainActor
+  private func pointGestureTarget(
+    app: XCUIApplication,
+    x: Double,
+    y: Double,
+    context: SynthesizedCoordinateContext?,
+    gesture: SynthesizedPointGesture
+  ) -> PointGestureResolution {
+    if let context {
+      guard let geometry = digitizerGeometry(app: app, surface: context.geometry) else {
+        return .refused(Self.unmeasuredSoleDisplayOutcome(gesture: gesture.rawValue))
+      }
+      let point = geometry.digitizerPoint(from: SurfacePoint(CGPoint(x: x, y: y))).point
+      return .target(point: point, resolvedWindow: context.resolvedWindow, referenceFrame: context.geometry.windowOnScreen.rect, orientation: geometry.orientation)
+    }
+    let orientation = Int(RunnerSynthesizedGesture.interfaceOrientation(forApplication: app))
+    if let unrotated = unrotatedSoleScreenPoint(app: app, x: x, y: y, interfaceOrientation: orientation) {
+      return .target(point: unrotated, resolvedWindow: nil, referenceFrame: .null, orientation: orientation)
+    }
+    return .refused(
+      .unsupported(
+        message: "synthesized coordinate \(gesture.unresolvedWindowName) could not resolve an app window with a finite screen frame",
+        hint: "Retry after the app is foregrounded, or use a plain screenshot to choose coordinates."
+      )
+    )
+  }
+
+  /// A point gesture with no context: no window resolved and the sole screen's size is unreadable,
+  /// so there is no box (#4091). On an admitted sole screen a portrait turn leaves the point as it
+  /// is, so it is dispatched as given; any other turn needs the box and refuses. Nil refuses.
+  @MainActor
+  private func unrotatedSoleScreenPoint(
+    app: XCUIApplication,
+    x: Double,
+    y: Double,
+    interfaceOrientation: Int
+  ) -> CGPoint? {
+    guard XCUIScreen.screens.count == 1, soleScreenRouteAdmits(app) else { return nil }
+    let unrotated = interfaceOrientation == RunnerInterfaceOrientation.portrait
+    NSLog(
+      "AGENT_DEVICE_RUNNER_APP_SCREEN_UNRESOLVED stage=rotation-basis basis=%@ window=none",
+      unrotated ? "unrotated" : "refused"
+    )
+    return unrotated ? CGPoint(x: x, y: y) : nil
+  }
+
+  /// Not `UIScreen.main`: the runner process can read that in compatibility mode (#4091). A failed
+  /// read is not kept, so the next gesture reads again.
+  @MainActor
+  func soleDisplayPortraitSize() -> CGSize? {
+    if let cached = mainOwned.soleDisplayPortraitSize { return cached }
+    let screen = RunnerSoleScreenSize()
+    guard screen.width > 0, screen.height > 0 else { return nil }
+    let size = CGSize(width: min(screen.width, screen.height), height: max(screen.width, screen.height))
+    mainOwned.soleDisplayPortraitSize = size
+    return size
+  }
+
+  static func unmeasuredSoleDisplayOutcome(gesture: String) -> RunnerInteractionOutcome {
+    .unsupported(
+      message:
+        "synthesized \(gesture) could not read the size of the device's only screen, and the app is not "
+        + "proven to fill it, so its coordinates cannot be rotated",
+      hint: "Retry after the app is foregrounded; the runner log records why the screen size could not be read."
+    )
+  }
+#endif
+
+  /// The screen, in points, in the app's interface orientation, anchored at the origin like a window
+  /// frame. An unknown orientation cannot say which way to lay the screen, so it names no frame.
+  static func soleScreenReferenceFrame(
+    portraitSize size: CGSize,
+    interfaceOrientation: Int
+  ) -> CGRect? {
+    SurfaceGeometry.panelFrame(nativeSize: size, orientation: interfaceOrientation)
+  }
+
+#if !os(iOS)
+  func surfaceGeometry(windowFrame: CGRect, app: XCUIApplication) -> SurfaceGeometry {
+    SurfaceGeometry(windowOnScreen: SurfaceRect(windowFrame), panelNativeSize: nil, orientation: 0)
+  }
+#endif
+
+  func swipe(app: XCUIApplication, direction: String) throws -> DragVisualizationFrame? {
+    if performTvRemoteSwipeIfAvailable(direction: direction) {
+      let frame = try resolvedTouchReferenceFrame(app: app)
+      let midX = frame.midX
+      let midY = frame.midY
+      return DragVisualizationFrame(
+        x: midX,
+        y: midY,
+        x2: midX,
+        y2: midY,
+        referenceWidth: frame.width,
+        referenceHeight: frame.height
+      )
+    }
+    return nil
+  }
+
+  private func performTvRemoteSwipeIfAvailable(direction: String) -> Bool {
+    switch direction {
+    case "up":
+      return pressTvRemote(.up)
+    case "down":
+      return pressTvRemote(.down)
+    case "left":
+      return pressTvRemote(.left)
+    case "right":
+      return pressTvRemote(.right)
+    default:
+      return false
+    }
+  }
+
+  func plannedGestureValidationError(_ plan: RunnerGesturePlan) -> String? {
+    guard plan.topology == "single" || plan.topology == "multi" else {
+      return "planned gesture topology must be single or multi"
+    }
+    let isTap = plan.topology == "multi" && plan.intent == "tap"
+    let supportedIntent = plan.topology == "single"
+      ? plan.intent == "fling" || plan.intent == "pan"
+      : isTap || plan.intent == "pan" || plan.intent == "pinch" || plan.intent == "rotate"
+        || plan.intent == "transform"
+    guard supportedIntent else { return "planned gesture has unsupported intent for its topology" }
+    if plan.topology == "single" {
+      guard plan.executionProfile == "endpoint-hold" || plan.executionProfile == "timed-pan" else {
+        return "single-pointer gesture requires a supported execution profile"
+      }
+    } else if plan.executionProfile != nil {
+      return "multi-touch gesture cannot define a single-pointer execution profile"
+    }
+    if let contactOrigin = plan.contactOrigin {
+      guard contactOrigin == runnerScreenEdgeContactOrigin else {
+        return "planned gesture has an unsupported contact origin"
+      }
+      guard plan.topology == "single" else {
+        return "only a single-pointer gesture can start as a screen-edge touch"
+      }
+    }
+    guard plan.durationMs.isFinite, plan.durationMs >= 16, plan.durationMs <= 10_000 else {
+      return "planned gesture durationMs must be between 16 and 10000"
+    }
+    let viewport = plan.viewport
+    guard viewport.x.isFinite, viewport.y.isFinite, viewport.width.isFinite,
+      viewport.height.isFinite, viewport.width > 0, viewport.height > 0
+    else {
+      return "planned gesture viewport must be finite and positive"
+    }
+    let pointerCountMatches = plan.topology == "single"
+      ? plan.pointers.count == 1
+      : isTap
+        ? (2...runnerGestureMaxContacts).contains(plan.pointers.count)
+        : plan.pointers.count == 2
+    guard pointerCountMatches else {
+      return "planned gesture pointer count does not match topology"
+    }
+    for (index, pointer) in plan.pointers.enumerated() where pointer.pointerId != index {
+      return "planned gesture requires ordered pointer ids"
+    }
+    let firstSamples = plan.pointers[0].samples
+    guard firstSamples.count >= 2 else { return "planned pointer paths require at least two samples" }
+    for pointer in plan.pointers {
+      guard pointer.samples.count == firstSamples.count else {
+        return "planned pointer paths require matching samples"
+      }
+      var previousOffset = -1.0
+      for (index, sample) in pointer.samples.enumerated() {
+        guard sample.offsetMs.isFinite,
+          sample.offsetMs == firstSamples[index].offsetMs,
+          sample.offsetMs > previousOffset
+        else {
+          return "planned pointer sample offsets must match and strictly increase"
+        }
+        let point = sample.point
+        guard point.x.isFinite, point.y.isFinite,
+          point.x >= viewport.x,
+          point.x <= viewport.x + viewport.width,
+          point.y >= viewport.y,
+          point.y <= viewport.y + viewport.height
+        else {
+          return "planned pointer sample lies outside the viewport"
+        }
+        previousOffset = sample.offsetMs
+      }
+      guard pointer.samples.first?.offsetMs == 0,
+        pointer.samples.last?.offsetMs == plan.durationMs
+      else {
+        return "planned pointer paths must start at 0 and end at durationMs"
+      }
+    }
+    if isTap {
+      return plannedTapValidationError(plan)
+    }
+    if plan.topology == "multi" {
+      guard let firstStart = firstSamples.first?.point,
+        let secondStart = plan.pointers[1].samples.first?.point,
+        hypot(firstStart.x - secondStart.x, firstStart.y - secondStart.y) > 0
+      else {
+        return "planned pointer paths require a positive initial span"
+      }
+    }
+    return nil
+  }
+
+  /// Tap contacts stay where they land, and two contacts on one point would merge into one touch.
+  private func plannedTapValidationError(_ plan: RunnerGesturePlan) -> String? {
+    var starts: [(x: Double, y: Double)] = []
+    for pointer in plan.pointers {
+      guard let start = pointer.samples.first?.point else {
+        return "planned pointer paths require at least two samples"
+      }
+      for sample in pointer.samples where sample.point.x != start.x || sample.point.y != start.y {
+        return "planned tap contacts must not move"
+      }
+      if starts.contains(where: { $0.x == start.x && $0.y == start.y }) {
+        return "planned tap contacts must start on distinct points"
+      }
+      starts.append((x: start.x, y: start.y))
+    }
+    return nil
+  }
+
+  func plannedGestureExecution(for plan: RunnerGesturePlan) -> PlannedGestureExecution {
+#if os(iOS) && targetEnvironment(simulator)
+    if plan.contactOrigin == runnerScreenEdgeContactOrigin {
+      return .screenEdgeTouch
+    }
+#endif
+    guard plan.topology == "single" else { return .sampled(schedule: nil) }
+    return plan.executionProfile == "endpoint-hold" ? .fastSwipe : .sampled(schedule: plan.executionProfile)
+  }
+
+#if os(iOS)
+  /// A planned gesture's surface and each pointer's `{ x, y, offsetMs }` samples in native
+  /// (portrait-up) digitizer points.
+  struct NativePlannedGesture {
+    let context: SynthesizedCoordinateContext
+    let orientation: Int
+    let pointerSamples: [[[String: NSNumber]]]
+  }
+
+  enum NativePlannedGestureResolution {
+    case resolved(NativePlannedGesture)
+    case refused(RunnerInteractionOutcome)
+  }
+
+  @MainActor
+  func nativePlannedGesture(
+    app: XCUIApplication,
+    plan: RunnerGesturePlan,
+    gesture: String
+  ) throws -> NativePlannedGestureResolution {
+    guard let context = try synthesizedCoordinateContext(app: app) else {
+      return .refused(.unsupported(message: "\(gesture) could not resolve a surface", hint: nil))
+    }
+    guard let geometry = digitizerGeometry(app: app, surface: context.geometry) else {
+      return .refused(Self.unmeasuredSoleDisplayOutcome(gesture: gesture))
+    }
+    let pointerSamples: [[[String: NSNumber]]] = plan.pointers.map { pointer in
+      pointer.samples.map { sample in
+        let point = geometry.digitizerPoint(from: SurfacePoint(CGPoint(x: sample.point.x, y: sample.point.y))).point
+        return [
+          "x": NSNumber(value: Double(point.x)),
+          "y": NSNumber(value: Double(point.y)),
+          "offsetMs": NSNumber(value: sample.offsetMs),
+        ]
+      }
+    }
+    return .resolved(NativePlannedGesture(
+      context: context, orientation: geometry.orientation, pointerSamples: pointerSamples
+    ))
+  }
+#endif
+
+  @MainActor
+  func sampledPlannedGesture(
+    app: XCUIApplication,
+    plan: RunnerGesturePlan
+  ) throws -> RunnerInteractionOutcome {
+#if os(iOS)
+    let planned: NativePlannedGesture
+    switch try nativePlannedGesture(app: app, plan: plan, gesture: "gesture") {
+    case .resolved(let resolved): planned = resolved
+    case .refused(let outcome): return outcome
+    }
+    if let message = RunnerSynthesizedGesture.synthesizeGesture(
+      withApplication: app,
+      resolvedWindow: planned.context.resolvedWindow,
+      interfaceOrientation: planned.orientation,
+      pointerSamples: planned.pointerSamples
+    ) {
+      return .unsupported(
+        message: message,
+        hint: "This gesture uses private XCTest event-synthesis APIs; rebuild the runner with a supported Xcode if this persists."
+      )
+    }
+    return .performed
+#elseif os(tvOS)
+    return .unsupported(
+      message: "multi-touch gestures are not supported on tvOS",
+      hint: "tvOS has no touch input; use remote-driven navigation."
+    )
+#elseif os(visionOS)
+    return .unsupported(
+      message: "multi-touch gestures are not supported on visionOS",
+      hint: "The current XCTest synthesizer supports iOS and iPadOS touch simulators only."
+    )
+#else
+    return .unsupported(
+      message: "multi-touch gestures are not supported on macOS",
+      hint: "macOS automation has no multi-touch input; run on an iOS simulator."
+    )
+#endif
+  }
+
+}

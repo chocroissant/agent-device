@@ -1,0 +1,34 @@
+import type { ReplayDivergenceSuggestionBasis } from '@agent-device/contracts/divergence';
+
+const BASIS_RANK: Record<ReplayDivergenceSuggestionBasis, number> = {
+  id: 0,
+  'role-label': 1,
+  label: 2,
+  other: 3,
+};
+
+export function rankAndDedupeReplaySuggestions<
+  T extends {
+    readonly nodeIndex: number;
+    readonly basis: ReplayDivergenceSuggestionBasis;
+  },
+>(entries: Iterable<T>, recordedRegionNodeIndices: ReadonlySet<number> = new Set()): T[] {
+  const byNode = new Map<number, T>();
+  for (const entry of entries) {
+    const existing = byNode.get(entry.nodeIndex);
+    if (!existing || basisRank(entry.basis) < basisRank(existing.basis)) {
+      byNode.set(entry.nodeIndex, entry);
+    }
+  }
+  return [...byNode.values()].sort(
+    (left, right) =>
+      basisRank(left.basis) - basisRank(right.basis) ||
+      Number(recordedRegionNodeIndices.has(right.nodeIndex)) -
+        Number(recordedRegionNodeIndices.has(left.nodeIndex)) ||
+      left.nodeIndex - right.nodeIndex,
+  );
+}
+
+function basisRank(basis: ReplayDivergenceSuggestionBasis): number {
+  return BASIS_RANK[basis];
+}

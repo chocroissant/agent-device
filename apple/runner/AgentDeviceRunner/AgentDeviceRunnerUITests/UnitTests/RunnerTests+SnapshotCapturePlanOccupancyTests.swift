@@ -1,0 +1,789 @@
+import XCTest
+import AgentDeviceSnapshotPresentation
+
+#if AGENT_DEVICE_RUNNER_UNIT_TESTS && os(iOS)
+import ObjectiveC.runtime
+
+/// Per-run gate for `RunnerBlockingSnapshotStub`: the swizzled IMP cannot capture a test-local
+/// semaphore, and one shared across runs would carry leftover signals into the next run.
+private enum RunnerBlockingSnapshotGate {
+  static var release = DispatchSemaphore(value: 0)
+  static var entered = DispatchSemaphore(value: 0)
+}
+
+/// Stands in for `-[XCUIElement snapshotWithError:]` so the tree tier's XPC grinds the way it does
+/// on a live Bluesky feed: it blocks the main thread until the test releases it, then fails like a
+/// read the AX server gave up on. The swap is process-wide while installed, which serial XCTest
+/// execution tolerates.
+private final class RunnerBlockingSnapshotStub: NSObject {
+  /// Far past the plan deadline, so only the test's own release ends the block; it only stops a
+  /// stuck test from holding the main thread.
+  private static let leakGuard: TimeInterval = 75
+
+  @objc(snapshotWithError:)
+  func snapshot() throws -> XCUIElementSnapshot {
+    RunnerBlockingSnapshotGate.entered.signal()
+    _ = RunnerBlockingSnapshotGate.release.wait(timeout: .now() + Self.leakGuard)
+    throw NSError(
+      domain: "AgentDeviceRunner.tests",
+      code: 1,
+      userInfo: [NSLocalizedDescriptionKey: "blocked tree snapshot released"]
+    )
+  }
+}
+
+/// Records when each `RunnerSlowSweepQueryStub` query started. The swizzled IMP cannot capture
+/// test-local state, so each run resets it.
+private enum RunnerSlowSweepQueryGate {
+  /// Shorter than `flatInteractiveQueryBudget`, so a sweep that stops at its slice deadline never
+  /// outlives the slice; a full sweep of these outlasts the slice, so one that ignores it does.
+  static let queryDuration: TimeInterval = 0.06
+  private static let lock = NSLock()
+  private static var starts: [Date] = []
+
+  static func reset() {
+    lock.lock()
+    starts = []
+    lock.unlock()
+  }
+
+  static func recordStart() {
+    lock.lock()
+    starts.append(Date())
+    lock.unlock()
+  }
+
+  static func recordedStarts() -> [Date] {
+    lock.lock()
+    defer { lock.unlock() }
+    return starts
+  }
+}
+
+/// Stands in for `-[XCUIElementQuery allElementsBoundByIndex]` so every query the sweep runs holds
+/// the main thread for a fixed time and finds nothing.
+private final class RunnerSlowSweepQueryStub: NSObject {
+  @objc var allElementsBoundByIndex: [XCUIElement] {
+    RunnerSlowSweepQueryGate.recordStart()
+    Thread.sleep(forTimeInterval: RunnerSlowSweepQueryGate.queryDuration)
+    return []
+  }
+}
+
+/// Stands in for `-[XCUIElement snapshotWithError:]` with the #758 signature itself: an immediate
+/// `kAXErrorIllegalArgument` failure, the read the AX server gives up on. Unlike the blocking stub,
+/// this one answers at once, so a plan runs its real classification with no abandoned work.
+private final class RunnerIllegalArgumentSnapshotStub: NSObject {
+  @objc(snapshotWithError:)
+  func snapshot() throws -> XCUIElementSnapshot {
+    throw NSError(
+      domain: "XCTestPrivateSymbols",
+      code: -1,
+      userInfo: [
+        NSLocalizedDescriptionKey:
+          "Failure obtaining snapshot (Failure: Error kAXErrorIllegalArgument getting snapshot for element)"
+      ]
+    )
+  }
+}
+
+/// The root-read delay exhausts the collapsed-tab query's processing slice. All other facts are
+/// fixed, so XCTest's viewport, orientation, keyboard, and large-tree XPCs cannot consume the slice.
+private enum RunnerSlowRootSnapshotGate {
+  static let delay: TimeInterval = 3
+  static var delayed = false
+  static var root: XCUIElementSnapshot?
+}
+
+private final class RunnerSlowRootSnapshotStub: NSObject {
+  @objc(snapshotWithError:)
+  func snapshot() throws -> XCUIElementSnapshot {
+    RunnerSlowRootSnapshotGate.delayed = true
+    Thread.sleep(forTimeInterval: RunnerSlowRootSnapshotGate.delay)
+    guard let root = RunnerSlowRootSnapshotGate.root else {
+      throw NSError(domain: "AgentDeviceRunner.tests", code: 2)
+    }
+    return root
+  }
+}
+
+/// XCTest getters used by the plan's prerequisites and query-sweep fallback. The method swaps are
+/// process-wide and restored after this serial XCTest case, as the blocking snapshot stub is above.
+private final class RunnerSnapshotFactsStub: NSObject {
+  @objc var frame: CGRect { CGRect(x: 0, y: 0, width: 390, height: 844) }
+  @objc var exists: Bool { false }
+  @objc var allElementsBoundByIndex: [XCUIElement] { [] }
+  @objc class func interfaceOrientation(forApplication application: AnyObject) -> Int { 1 }
+}
+
+extension RunnerTests {
+  /// The Bluesky feed shape: the tree XPC grinds past its slice. The plan must recover through
+  /// private AX without queueing the query sweep behind the abandoned XPC, and a fresh process's
+  /// first capture must not be penalized for the slice it lost.
+  func testAbandonedTreeCaptureSkipsQuerySweepAndHonorsWarmupExemption() throws {
+    guard
+      let snapshotMethod = class_getInstanceMethod(
+        XCUIApplication.self,
+        #selector(XCUIElement.snapshot)
+      ),
+      let stubMethod = class_getInstanceMethod(
+        RunnerBlockingSnapshotStub.self,
+        #selector(RunnerBlockingSnapshotStub.snapshot)
+      )
+    else {
+      XCTFail("unable to install the blocking snapshot stub")
+      return
+    }
+    app.launchArguments = ["--agent-device-selector-read-regression"]
+    app.launch()
+    // Resolve the application element while nothing is stubbed: on a fresh simulator the first
+    // resolution is slow, and it must not be the block the plan abandons.
+    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    XCTAssertFalse(app.frame.isEmpty)
+    snapshotXCTestPenaltyWarmupExemption.isPending = true
+    let captureTarget = MainActor.assumeIsolated {
+      mainOwned.app = app
+      mainOwned.bundleId = "com.callstack.agentdevice.runner.tree-capture-test"
+      return takeSnapshotCaptureTarget(app: app)
+    }
+    RunnerBlockingSnapshotGate.release = DispatchSemaphore(value: 0)
+    RunnerBlockingSnapshotGate.entered = DispatchSemaphore(value: 0)
+    let originalImplementation = method_getImplementation(snapshotMethod)
+    method_setImplementation(snapshotMethod, method_getImplementation(stubMethod))
+    defer {
+      RunnerBlockingSnapshotGate.release.signal()
+      method_setImplementation(snapshotMethod, originalImplementation)
+      clearSnapshotXCTestChannelPenalty(reason: "test-cleanup")
+      clearPrivateAXAcceptedDepth(reason: "test-cleanup")
+      MainActor.assumeIsolated {
+        invalidateCachedTarget(reason: "unit_test_cleanup")
+      }
+      app.terminate()
+    }
+
+    final class ResultBox {
+      var payload: DataPayload?
+      var error: Error?
+      var abandonedAfterPlan: Int?
+      var penalizedAfterPlan: Bool?
+      var blockingTreeEntered = false
+    }
+    let box = ResultBox()
+    let planned = expectation(description: "capture plan answered while the tree XPC grinds")
+    DispatchQueue(label: "agent-device.runner.tests.plan-occupancy").async {
+      do {
+        box.payload = try self.runSnapshotCapturePlan(
+          Self.regularVisiblePlan,
+          target: captureTarget,
+          options: PresentationOptions(interactiveOnly: false, depth: nil, scope: nil, raw: false),
+          terminal: .sparseWithFatalOnAXFailure,
+          deadline: Date().addingTimeInterval(12)
+        )
+      } catch {
+        box.error = error
+      }
+      self.mainThreadWorkLock.lock()
+      box.abandonedAfterPlan = self.abandonedMainThreadWorkCount
+      self.mainThreadWorkLock.unlock()
+      box.penalizedAfterPlan = self.isSnapshotXCTestChannelPenalized(bundleId: captureTarget.bundleId)
+      box.blockingTreeEntered = RunnerBlockingSnapshotGate.entered.wait(timeout: .now()) == .success
+      RunnerBlockingSnapshotGate.release.signal()
+      planned.fulfill()
+    }
+
+    wait(for: [planned], timeout: 60)
+    let drainDeadline = Date().addingTimeInterval(3)
+    while hasAbandonedMainThreadWork(), Date() < drainDeadline {
+      sleepFor(0.005)
+    }
+
+    XCTAssertNil(box.error)
+    XCTAssertTrue(box.blockingTreeEntered, "the tree XPC must enter before the plan answers")
+    let quality = try XCTUnwrap(box.payload?.snapshotQuality)
+    XCTAssertEqual(quality.backend, SnapshotBackendKind.privateAX.rawValue)
+    XCTAssertEqual(quality.state, .recovered)
+    XCTAssertTrue(
+      quality.reason?.contains("tree capture exceeded") == true,
+      "the tree XPC, not the viewport read, must be the abandoned block: \(quality.reason ?? "nil")"
+    )
+    XCTAssertGreaterThan(box.payload?.nodes?.count ?? 0, 1)
+    XCTAssertEqual(
+      box.abandonedAfterPlan,
+      1,
+      "only the tree XPC may be abandoned; a query sweep queued behind it would make it 2"
+    )
+    XCTAssertEqual(
+      box.penalizedAfterPlan,
+      false,
+      "the fresh-process warmup exemption must cover the tree tier's slice timeout"
+    )
+    XCTAssertFalse(hasAbandonedMainThreadWork())
+    guard case .idle = currentMainThreadBusyState() else {
+      return XCTFail("expected the runner idle once the tree XPC drained")
+    }
+  }
+
+  /// A non-interactive query sweep runs its queries on the main thread one at a time. It must stop
+  /// starting them at the slice deadline its caller waits for, not at the plan deadline, or it holds
+  /// the main thread after the plan has answered (#2783).
+  func testNonInteractiveQuerySweepStopsAtTheSliceItsCallerWaitsFor() throws {
+    let sweepQueryCount = 19
+    XCTAssertLessThan(RunnerSlowSweepQueryGate.queryDuration, Self.flatInteractiveQueryBudget)
+    XCTAssertGreaterThan(
+      RunnerSlowSweepQueryGate.queryDuration * Double(sweepQueryCount),
+      Self.flatInteractiveFallbackBudget
+    )
+    guard
+      let queryMethod = class_getInstanceMethod(
+        XCUIElementQuery.self,
+        #selector(getter: XCUIElementQuery.allElementsBoundByIndex)
+      ),
+      let stubMethod = class_getInstanceMethod(
+        RunnerSlowSweepQueryStub.self,
+        #selector(getter: RunnerSlowSweepQueryStub.allElementsBoundByIndex)
+      )
+    else {
+      XCTFail("unable to install the slow sweep query stub")
+      return
+    }
+    app.launchArguments = ["--agent-device-selector-read-regression"]
+    app.launch()
+    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    XCTAssertFalse(app.frame.isEmpty)
+    let captureTarget = MainActor.assumeIsolated {
+      mainOwned.app = app
+      mainOwned.bundleId = "com.callstack.agentdevice.runner.query-sweep-slice-test"
+      return takeSnapshotCaptureTarget(app: app)
+    }
+    RunnerSlowSweepQueryGate.reset()
+    let originalImplementation = method_getImplementation(queryMethod)
+    method_setImplementation(queryMethod, method_getImplementation(stubMethod))
+    defer {
+      method_setImplementation(queryMethod, originalImplementation)
+      clearSnapshotXCTestChannelPenalty(reason: "test-cleanup")
+      MainActor.assumeIsolated {
+        invalidateCachedTarget(reason: "unit_test_cleanup")
+      }
+      app.terminate()
+    }
+
+    final class ResultBox {
+      var payload: DataPayload?
+      var error: Error?
+      var returnedAt: Date?
+      var abandonedAtReturn: Bool?
+    }
+    let box = ResultBox()
+    let planned = expectation(description: "query-sweep plan answered")
+    DispatchQueue(label: "agent-device.runner.tests.query-sweep-slice").async {
+      do {
+        box.payload = try self.runSnapshotCapturePlan(
+          [.querySweep],
+          target: captureTarget,
+          options: PresentationOptions(interactiveOnly: false, depth: nil, scope: nil, raw: false),
+          terminal: .sparseWithFatalOnAXFailure,
+          deadline: Date().addingTimeInterval(20)
+        )
+      } catch {
+        box.error = error
+      }
+      box.returnedAt = Date()
+      box.abandonedAtReturn = self.hasAbandonedMainThreadWork()
+      planned.fulfill()
+    }
+
+    wait(for: [planned], timeout: 30)
+    let drainDeadline = Date().addingTimeInterval(3)
+    while hasAbandonedMainThreadWork(), Date() < drainDeadline {
+      sleepFor(0.005)
+    }
+    let starts = RunnerSlowSweepQueryGate.recordedStarts()
+
+    XCTAssertNil(box.error)
+    XCTAssertEqual(box.payload?.snapshotQuality?.backend, SnapshotBackendKind.querySweep.rawValue)
+    XCTAssertEqual(
+      box.abandonedAtReturn,
+      false,
+      "the sweep must finish inside the slice its caller waits for"
+    )
+    let returnedAt = try XCTUnwrap(box.returnedAt)
+    XCTAssertTrue(
+      starts.allSatisfy { $0 <= returnedAt },
+      "no sweep query may start after the plan answered"
+    )
+    XCTAssertLessThan(starts.count, sweepQueryCount, "the slice must cut the sweep short")
+    XCTAssertFalse(hasAbandonedMainThreadWork())
+  }
+
+  /// A query sweep that stops at its own slice deadline collected a partial tree, not an answer, so
+  /// it is a tier timeout: the plan must arm the XCTest-channel penalty and let private AX answer,
+  /// keeping the partial sweep only as the fallback. Accepting it because it carries more nodes than
+  /// the sparse threshold ships a hierarchy-free capture and leaves every later capture of the same
+  /// screen to pay for the full sweep again (#2781).
+  func testQuerySweepThatEndsOnItsSliceDeadlinePenalizesChannelAndReachesPrivateAX() throws {
+    guard
+      let queryMethod = class_getInstanceMethod(
+        XCUIElementQuery.self,
+        #selector(getter: XCUIElementQuery.allElementsBoundByIndex)
+      ),
+      let stubMethod = class_getInstanceMethod(
+        RunnerSlowSweepQueryStub.self,
+        #selector(getter: RunnerSlowSweepQueryStub.allElementsBoundByIndex)
+      )
+    else {
+      XCTFail("unable to install the slow sweep query stub")
+      return
+    }
+    app.launchArguments = ["--agent-device-selector-read-regression"]
+    app.launch()
+    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    MainActor.assumeIsolated {
+      mainOwned.app = app
+      mainOwned.bundleId = "com.callstack.agentdevice.runner.query-sweep-timeout-test"
+    }
+    snapshotXCTestPenaltyWarmupExemption.isPending = false
+    clearSnapshotXCTestChannelPenalty(reason: "test-setup")
+    RunnerSlowSweepQueryGate.reset()
+    let captureTarget = MainActor.assumeIsolated { takeSnapshotCaptureTarget(app: app) }
+    let originalImplementation = method_getImplementation(queryMethod)
+    method_setImplementation(queryMethod, method_getImplementation(stubMethod))
+    defer {
+      method_setImplementation(queryMethod, originalImplementation)
+      clearSnapshotXCTestChannelPenalty(reason: "test-cleanup")
+      clearPrivateAXAcceptedDepth(reason: "test-cleanup")
+      MainActor.assumeIsolated {
+        invalidateCachedTarget(reason: "unit_test_cleanup")
+      }
+      app.terminate()
+    }
+
+    final class ResultBox {
+      var payload: DataPayload?
+      var error: Error?
+      var abandonedAtReturn = false
+      var penalizedAtReturn = false
+      var sweepStartsAfterFirstPlan = 0
+      var secondPayload: DataPayload?
+      var secondError: Error?
+    }
+    let box = ResultBox()
+    let planned = expectation(description: "slow-sweep plan answered")
+    DispatchQueue(label: "agent-device.runner.tests.query-sweep-timeout").async {
+      do {
+        box.payload = try self.runSnapshotCapturePlan(
+          [.querySweep, .privateAX],
+          target: captureTarget,
+          options: PresentationOptions(interactiveOnly: false, depth: nil, scope: nil, raw: false),
+          terminal: .sparseWithFatalOnAXFailure,
+          deadline: Date().addingTimeInterval(20)
+        )
+      } catch {
+        box.error = error
+      }
+      box.abandonedAtReturn = self.hasAbandonedMainThreadWork()
+      box.penalizedAtReturn = self.isSnapshotXCTestChannelPenalized(bundleId: captureTarget.bundleId)
+      box.sweepStartsAfterFirstPlan = RunnerSlowSweepQueryGate.recordedStarts().count
+      do {
+        box.secondPayload = try self.runSnapshotCapturePlan(
+          Self.regularVisiblePlan,
+          target: captureTarget,
+          options: PresentationOptions(interactiveOnly: false, depth: nil, scope: nil, raw: false),
+          terminal: .sparseWithFatalOnAXFailure,
+          deadline: Date().addingTimeInterval(20)
+        )
+      } catch {
+        box.secondError = error
+      }
+      planned.fulfill()
+    }
+
+    wait(for: [planned], timeout: 60)
+    XCTAssertNil(box.error)
+    let quality = box.payload?.snapshotQuality
+    XCTAssertEqual(
+      quality?.backend,
+      SnapshotBackendKind.privateAX.rawValue,
+      "a sweep that ended on its slice deadline is a tier timeout, not an accepted capture"
+    )
+    XCTAssertEqual(quality?.state, .recovered)
+    XCTAssertGreaterThan(box.payload?.nodes?.count ?? 0, 1, "private AX answers with a real tree")
+    XCTAssertFalse(box.abandonedAtReturn, "the sweep must answer inside its own main-thread hop")
+    XCTAssertTrue(
+      box.penalizedAtReturn,
+      "the tier timeout must arm the XCTest-channel penalty for the captured target"
+    )
+
+    XCTAssertNil(box.secondError)
+    XCTAssertEqual(
+      box.secondPayload?.snapshotQuality?.backend,
+      SnapshotBackendKind.privateAX.rawValue,
+      "the armed penalty must defer the next plan's XCTest tiers, not re-run the sweep"
+    )
+    XCTAssertEqual(
+      RunnerSlowSweepQueryGate.recordedStarts().count,
+      box.sweepStartsAfterFirstPlan,
+      "the deferred plan may start no sweep query at all"
+    )
+    XCTAssertFalse(hasAbandonedMainThreadWork())
+  }
+
+  /// The Save Password sheet shape: the channel is penalized and private AX cannot match the app
+  /// behind the out-of-process sheet. The deferred plan recovers through the bounded tree and
+  /// reports the bounded slice as its reason. That the sweep stays off the plan is the plan's own
+  /// contract (`effectiveSnapshotCapturePlan`).
+  func testPenalizedPlanRecoversThroughTheBoundedTreeWhenPrivateAXReadsNothing() throws {
+    let captureTarget = try launchPenalizedPrivateAXBlindTarget(
+      bundleId: "com.callstack.agentdevice.runner.penalized-tree-recovery-test"
+    )
+    defer { tearDownPenalizedPrivateAXBlindTarget() }
+
+    let payload = try runDeferredPlanOffMain(target: captureTarget)
+
+    let quality = try XCTUnwrap(payload.snapshotQuality)
+    XCTAssertEqual(quality.reasonCode, "budget")
+    if quality.state == .sparse {
+      throw XCTSkip("the bounded tree did not answer within its slice on this host")
+    }
+    XCTAssertEqual(quality.state, .recovered)
+    XCTAssertEqual(quality.backend, SnapshotBackendKind.recursiveTree.rawValue)
+    XCTAssertGreaterThan(payload.nodes?.count ?? 0, 1, "the bounded tree answers with a real tree")
+    let timing = try XCTUnwrap(quality.timing)
+    guard timing.acquisitionMs <= SnapshotCaptureStep.boundedTreeSliceBudget * 1_000 else {
+      throw XCTSkip("the accepted tree's total acquisition exceeded the fast-probe threshold on this host")
+    }
+    XCTAssertFalse(
+      isSnapshotXCTestChannelPenalized(bundleId: captureTarget.bundleId),
+      "an accepted fast tree probe must clear the existing penalty early"
+    )
+  }
+
+  /// When the bounded tree also grinds past its slice, the plan ends sparse, and the verdict still
+  /// names the bounded slice the capture ran on rather than the seeded pre-selection.
+  func testPenalizedPlanThatEndsSparseAfterTheBoundedTreeReportsTheBudget() throws {
+    guard
+      let snapshotMethod = class_getInstanceMethod(
+        XCUIApplication.self,
+        #selector(XCUIElement.snapshot)
+      ),
+      let stubMethod = class_getInstanceMethod(
+        RunnerBlockingSnapshotStub.self,
+        #selector(RunnerBlockingSnapshotStub.snapshot)
+      )
+    else {
+      XCTFail("unable to install the blocking snapshot stub")
+      return
+    }
+    let captureTarget = try launchPenalizedPrivateAXBlindTarget(
+      bundleId: "com.callstack.agentdevice.runner.penalized-tree-timeout-test"
+    )
+    RunnerBlockingSnapshotGate.release = DispatchSemaphore(value: 0)
+    RunnerBlockingSnapshotGate.entered = DispatchSemaphore(value: 0)
+    let originalImplementation = method_getImplementation(snapshotMethod)
+    method_setImplementation(snapshotMethod, method_getImplementation(stubMethod))
+    defer {
+      RunnerBlockingSnapshotGate.release.signal()
+      method_setImplementation(snapshotMethod, originalImplementation)
+      let drainDeadline = Date().addingTimeInterval(3)
+      while hasAbandonedMainThreadWork(), Date() < drainDeadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+      }
+      tearDownPenalizedPrivateAXBlindTarget()
+    }
+
+    let originalPenaltyUntil = snapshotXCTestChannelPenalty.until
+    let payload = try runDeferredPlanOffMain(target: captureTarget) {
+      RunnerBlockingSnapshotGate.release.signal()
+    }
+    XCTAssertEqual(
+      snapshotXCTestChannelPenalty.until,
+      originalPenaltyUntil,
+      "the bounded recovery probe must not renew its own penalty when its tree work is abandoned"
+    )
+
+    let quality = try XCTUnwrap(payload.snapshotQuality)
+    XCTAssertEqual(quality.state, .sparse)
+    XCTAssertEqual(quality.reasonCode, "budget")
+  }
+
+  /// #3885 follow-up: a capture pinned to the XCTest tree backend that the tree rejects with the
+  /// #758 signature ends sparse, and the verdict must name the rejection. Seeding the pin into the
+  /// failure slot reported 'requested-backend' — the daemon and the caller read a hostile-screen
+  /// failure as "nothing degraded, the pin was honored", and the host turned the same payload into
+  /// a viewport error that hid the typed reason. The plan runs inline on main: the verdict-slot
+  /// decision is thread-independent and the stub answers at once, so no occupancy machinery is
+  /// part of what this classifies.
+  @MainActor
+  func testTreePinnedCaptureTheAxServerRejectsReportsTheRejection() throws {
+    guard
+      let snapshotMethod = class_getInstanceMethod(
+        XCUIApplication.self,
+        #selector(XCUIElement.snapshot)
+      ),
+      let stubMethod = class_getInstanceMethod(
+        RunnerIllegalArgumentSnapshotStub.self,
+        #selector(RunnerIllegalArgumentSnapshotStub.snapshot)
+      )
+    else {
+      XCTFail("unable to install the illegal-argument snapshot stub")
+      return
+    }
+    app.launchArguments = ["--agent-device-selector-read-regression"]
+    app.launch()
+    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    mainOwned.app = app
+    mainOwned.bundleId = "com.callstack.agentdevice.runner.pinned-tree-ax-reject-test"
+    let originalImplementation = method_getImplementation(snapshotMethod)
+    method_setImplementation(snapshotMethod, method_getImplementation(stubMethod))
+    defer {
+      method_setImplementation(snapshotMethod, originalImplementation)
+      clearSnapshotXCTestChannelPenalty(reason: "test-cleanup")
+      invalidateCachedTarget(reason: "unit_test_cleanup")
+      app.terminate()
+    }
+
+    let payload = try runSnapshotCapturePlan(
+      Self.regularVisiblePlan,
+      target: takeSnapshotCaptureTarget(app: app),
+      options: PresentationOptions(
+        interactiveOnly: false,
+        depth: nil,
+        scope: nil,
+        raw: false,
+        preferredBackend: SnapshotBackendKind.recursiveTree.rawValue
+      ),
+      terminal: .sparseWithFatalOnAXFailure
+    )
+
+    let quality = try XCTUnwrap(payload.snapshotQuality)
+    XCTAssertEqual(quality.state, .sparse)
+    XCTAssertEqual(
+      quality.reasonCode,
+      "ax-rejected",
+      "the tier's own rejection must replace the pin seed: \(quality.reason ?? "nil")"
+    )
+    XCTAssertEqual(quality.backend, SnapshotBackendKind.recursiveTree.rawValue)
+    // The rejected verdict also declares the channel unavailable, which gates the
+    // synthesized-gesture probe and the XCTest coordinate fallback (#3885 follow-up).
+    XCTAssertEqual(mainOwned.accessibilityHealth, .unavailable)
+  }
+
+  /// The healthy side of the same pin: a tree that answers keeps reporting the pin itself as the
+  /// verdict reason (the perf suite's `snapshot-forced-tree` step reads exactly that as proof the
+  /// pin was honored), so the rejection fix must not silence it. Runs inline on main like the
+  /// rejection test above.
+  @MainActor
+  func testTreePinnedCaptureThatServesTheScreenStillReportsThePin() throws {
+    app.launchArguments = ["--agent-device-selector-read-regression"]
+    app.launch()
+    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    mainOwned.app = app
+    mainOwned.bundleId = "com.callstack.agentdevice.runner.pinned-tree-healthy-test"
+    defer {
+      clearSnapshotXCTestChannelPenalty(reason: "test-cleanup")
+      invalidateCachedTarget(reason: "unit_test_cleanup")
+      app.terminate()
+    }
+
+    let payload = try runSnapshotCapturePlan(
+      Self.regularVisiblePlan,
+      target: takeSnapshotCaptureTarget(app: app),
+      options: PresentationOptions(
+        interactiveOnly: false,
+        depth: nil,
+        scope: nil,
+        raw: false,
+        preferredBackend: SnapshotBackendKind.recursiveTree.rawValue
+      ),
+      terminal: .sparseWithFatalOnAXFailure
+    )
+
+    let quality = try XCTUnwrap(payload.snapshotQuality)
+    if quality.reasonCode == "budget" {
+      throw XCTSkip("the tree tier lost its slice to host slowness before it could answer")
+    }
+    XCTAssertEqual(quality.state, .healthy)
+    XCTAssertEqual(quality.backend, SnapshotBackendKind.recursiveTree.rawValue)
+    XCTAssertEqual(quality.reasonCode, "requested-backend")
+  }
+
+  /// A childless tab bar needs a query whose estimated cost exceeds the remaining processing slice.
+  /// The plan must reject that incomplete tree even though its visible buttons otherwise look healthy.
+  func testPlanMovesPastATreeTierWhoseCollapsedTabQueryCannotStart() throws {
+    let swaps: [(Method?, Method?)] = [
+      (class_getInstanceMethod(XCUIApplication.self, #selector(XCUIElement.snapshot)),
+       class_getInstanceMethod(RunnerSlowRootSnapshotStub.self, #selector(RunnerSlowRootSnapshotStub.snapshot))),
+      (class_getInstanceMethod(XCUIElement.self, #selector(getter: XCUIElement.frame)),
+       class_getInstanceMethod(RunnerSnapshotFactsStub.self, #selector(getter: RunnerSnapshotFactsStub.frame))),
+      (class_getInstanceMethod(XCUIElement.self, #selector(getter: XCUIElement.exists)),
+       class_getInstanceMethod(RunnerSnapshotFactsStub.self, #selector(getter: RunnerSnapshotFactsStub.exists))),
+      (class_getInstanceMethod(XCUIElementQuery.self, #selector(getter: XCUIElementQuery.allElementsBoundByIndex)),
+       class_getInstanceMethod(RunnerSnapshotFactsStub.self, #selector(getter: RunnerSnapshotFactsStub.allElementsBoundByIndex))),
+      (class_getClassMethod(RunnerSynthesizedGesture.self, #selector(RunnerSynthesizedGesture.interfaceOrientation(forApplication:))),
+       class_getClassMethod(RunnerSnapshotFactsStub.self, #selector(RunnerSnapshotFactsStub.interfaceOrientation(forApplication:)))),
+    ]
+    var originals: [(Method, IMP)] = []
+    let previousPrivateAX = privateAXAcquisitionOverrideForTesting
+    defer {
+      for (method, original) in originals.reversed() { method_setImplementation(method, original) }
+      RunnerSlowRootSnapshotGate.root = nil
+      privateAXAcquisitionOverrideForTesting = previousPrivateAX
+      clearSnapshotXCTestChannelPenalty(reason: "test-cleanup")
+      MainActor.assumeIsolated { invalidateCachedTarget(reason: "unit_test_cleanup") }
+    }
+    for (method, stub) in swaps {
+      let method = try XCTUnwrap(method)
+      let stub = try XCTUnwrap(stub)
+      originals.append((method, method_setImplementation(method, method_getImplementation(stub))))
+    }
+    let captureTarget = MainActor.assumeIsolated {
+      let windowFrame = CGRect(x: 0, y: 0, width: 390, height: 844)
+      let buttons: [XCUIElementSnapshot] = (0..<13).map { index in
+        ElementAttributesFixture(
+          .button,
+          CGRect(x: 20, y: 20 + index * 45, width: 100, height: 30),
+          label: "Row \(index)"
+        )
+      }
+      let tabBar = ElementAttributesFixture(.tabBar, CGRect(x: 0, y: 790, width: 390, height: 50))
+      RunnerSlowRootSnapshotGate.root = ElementAttributesFixture(
+        .application, windowFrame, label: "Fixture",
+        children: [ElementAttributesFixture(.window, windowFrame, children: buttons + [tabBar])]
+      )
+      mainOwned.app = app
+      mainOwned.bundleId = "com.callstack.agentdevice.runner.collapsed-tab-query-test"
+      return takeSnapshotCaptureTarget(app: app)
+    }
+    privateAXAcquisitionOverrideForTesting = { nil }
+    snapshotXCTestPenaltyWarmupExemption.isPending = false
+    clearSnapshotXCTestChannelPenalty(reason: "test-setup")
+    RunnerSlowRootSnapshotGate.delayed = false
+
+    let payload = try runDeferredPlanOffMain(
+      target: captureTarget,
+      deadline: Date().addingTimeInterval(2 * RunnerSlowRootSnapshotGate.delay - 0.2)
+    )
+
+    XCTAssertTrue(RunnerSlowRootSnapshotGate.delayed, "the plan read the root tree through the stub")
+    let quality = try XCTUnwrap(payload.snapshotQuality)
+    XCTAssertEqual(quality.reasonCode, "budget", "the tree tier ran out of its processing slice")
+    XCTAssertNotEqual(quality.state, .healthy, "a tree without its collapsed tab items is not healthy")
+  }
+
+  /// A due recovery probe runs inside the capture, ahead of private AX. Its abandoned tree work is
+  /// charged to that capture: the plan answers while the work is outstanding, so that response's
+  /// occupancy stamp reports it. The probe cannot renew the penalty, and the next plan inside the
+  /// interval defers without entering the tree.
+  func testDueRecoveryProbeRunsInsideTheCaptureAndChargesItsAbandonedWorkToIt() throws {
+    let captureTarget = try launchPenalizedPrivateAXBlindTarget(
+      bundleId: "com.callstack.agentdevice.runner.due-probe-test"
+    )
+    defer { tearDownPenalizedPrivateAXBlindTarget() }
+    let options = PresentationOptions(interactiveOnly: false, depth: nil, scope: nil, raw: false)
+    let acquisition = try XCTUnwrap(privateAXSnapshotAcquisition(
+      target: captureTarget, hint: SnapshotPresentation.captureHint(for: options),
+      deadline: Date().addingTimeInterval(10)
+    ))
+    privateAXAcquisitionOverrideForTesting = { acquisition }
+    let snapshotMethod = try XCTUnwrap(class_getInstanceMethod(XCUIApplication.self, #selector(XCUIElement.snapshot)))
+    let stubMethod = try XCTUnwrap(class_getInstanceMethod(RunnerBlockingSnapshotStub.self, #selector(RunnerBlockingSnapshotStub.snapshot)))
+    let original = method_getImplementation(snapshotMethod)
+    RunnerBlockingSnapshotGate.release = DispatchSemaphore(value: 0)
+    RunnerBlockingSnapshotGate.entered = DispatchSemaphore(value: 0)
+    method_setImplementation(snapshotMethod, method_getImplementation(stubMethod))
+    defer {
+      RunnerBlockingSnapshotGate.release.signal()
+      method_setImplementation(snapshotMethod, original)
+      waitForAbandonedMainThreadWorkToDrain()
+    }
+    snapshotXCTestChannelPenalty.claimProbe(
+      at: Date(timeIntervalSinceNow: -SnapshotXCTestChannelPenalty.recoveryProbeInterval)
+    )
+    let expiry = snapshotXCTestChannelPenalty.until
+    final class Occupancy { var atAnswer = false }
+    let occupancy = Occupancy()
+
+    let probed = try runDeferredPlanOffMain(target: captureTarget) {
+      occupancy.atAnswer = self.hasAbandonedMainThreadWork()
+      RunnerBlockingSnapshotGate.release.signal()
+    }
+
+    XCTAssertEqual(RunnerBlockingSnapshotGate.entered.wait(timeout: .now()), .success, "the probe ran before the answer")
+    XCTAssertTrue(occupancy.atAnswer, "the capture that ran the probe answers as busy")
+    XCTAssertEqual(probed.snapshotQuality?.backend, SnapshotBackendKind.privateAX.rawValue)
+    XCTAssertEqual(probed.snapshotQuality?.reasonCode, "deferred")
+    XCTAssertEqual(snapshotXCTestChannelPenalty.until, expiry, "a failed probe must not renew the penalty")
+    XCTAssertFalse(isSnapshotXCTestRecoveryProbeDue(bundleId: captureTarget.bundleId))
+    waitForAbandonedMainThreadWorkToDrain()
+
+    let deferred = try runDeferredPlanOffMain(target: captureTarget)
+    XCTAssertEqual(deferred.snapshotQuality?.backend, SnapshotBackendKind.privateAX.rawValue)
+    XCTAssertEqual(RunnerBlockingSnapshotGate.entered.wait(timeout: .now()), .timedOut, "no probe inside the interval")
+  }
+
+  private func waitForAbandonedMainThreadWorkToDrain() {
+    let deadline = Date().addingTimeInterval(3)
+    while hasAbandonedMainThreadWork(), Date() < deadline {
+      RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+    }
+  }
+
+  private func launchPenalizedPrivateAXBlindTarget(bundleId: String) throws -> SnapshotCaptureTarget {
+    app.launchArguments = ["--agent-device-selector-read-regression"]
+    app.launch()
+    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    XCTAssertFalse(app.frame.isEmpty)
+    MainActor.assumeIsolated {
+      mainOwned.app = app
+      mainOwned.bundleId = bundleId
+    }
+    snapshotXCTestPenaltyWarmupExemption.isPending = false
+    let captureTarget = MainActor.assumeIsolated { takeSnapshotCaptureTarget(app: app) }
+    penalizeSnapshotXCTestChannel(bundleId: captureTarget.bundleId, reason: "test-setup")
+    privateAXAcquisitionOverrideForTesting = { nil }
+    return captureTarget
+  }
+
+  private func tearDownPenalizedPrivateAXBlindTarget() {
+    privateAXAcquisitionOverrideForTesting = nil
+    clearSnapshotXCTestChannelPenalty(reason: "test-cleanup")
+    clearPrivateAXAcceptedDepth(reason: "test-cleanup")
+    MainActor.assumeIsolated {
+      invalidateCachedTarget(reason: "unit_test_cleanup")
+    }
+    app.terminate()
+  }
+
+  /// Runs the regular plan for `target` off the main thread, as the command queue does, and
+  /// returns its payload; `afterPlan` runs on that queue once the plan has answered.
+  private func runDeferredPlanOffMain(
+    target: SnapshotCaptureTarget,
+    deadline: Date = Date().addingTimeInterval(20),
+    afterPlan: @escaping () -> Void = {}
+  ) throws -> DataPayload {
+    final class ResultBox {
+      var payload: DataPayload?
+      var error: Error?
+    }
+    let box = ResultBox()
+    let planned = expectation(description: "deferred plan answered")
+    DispatchQueue(label: "agent-device.runner.tests.deferred-plan").async {
+      do {
+        box.payload = try self.runSnapshotCapturePlan(
+          Self.regularVisiblePlan,
+          target: target,
+          options: PresentationOptions(interactiveOnly: false, depth: nil, scope: nil, raw: false),
+          terminal: .sparseWithFatalOnAXFailure,
+          deadline: deadline
+        )
+      } catch {
+        box.error = error
+      }
+      afterPlan()
+      planned.fulfill()
+    }
+    wait(for: [planned], timeout: 60)
+    if let error = box.error { throw error }
+    return try XCTUnwrap(box.payload)
+  }
+}
+#endif

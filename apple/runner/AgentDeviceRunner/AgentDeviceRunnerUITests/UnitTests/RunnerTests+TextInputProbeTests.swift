@@ -1,0 +1,275 @@
+import XCTest
+
+extension RunnerTests {
+#if AGENT_DEVICE_RUNNER_UNIT_TESTS && os(iOS)
+  /// One text-input lookup walks the lit windows once, however many input types it queries.
+  @MainActor
+  func testTextInputProbeWalksTheLitWindowsOnce() throws {
+    try withLitPanelWindow(frame: CGRect(x: 0, y: 0, width: 669, height: 951)) { windowListReads in
+      setRequestLitPanel(from: try runnerCommandFixture(
+        #"{"command":"type","litPanel":{"displayId":3,"widthPt":669,"heightPt":951}}"#
+      ))
+      _ = try probeTextInputs(app: app, point: CGPoint(x: 10, y: 10), contentTranslation: .none)
+      XCTAssertEqual(windowListReads(), 1)
+    }
+  }
+
+  /// A content-vector read on a lit-panel request that nothing booked yet books the request's
+  /// window and answers its origin, instead of refusing for want of an earlier booking.
+  @MainActor
+  func testUnbookedLitPanelContentTranslationBooksTheRequestWindow() throws {
+    try withLitPanelWindow(frame: CGRect(x: 0, y: 80, width: 669, height: 871)) { _ in
+      setRequestLitPanel(from: try runnerCommandFixture(#"{"command":"type","litPanel":{"displayId":3,"widthPt":669,"heightPt":951}}"#))
+      guard case .known(let vector) = liveContentTranslation(app: app) else { return XCTFail("no vector") }
+      XCTAssertEqual(vector, CGSize(width: 0, height: 80))
+      XCTAssertNotNil(litPanelState.surface)
+    }
+  }
+
+  func testTextInputProbePreservesEnclosingRunnerWait() {
+    app.launchArguments = ["--agent-device-text-entry-regression"]
+    app.launch()
+    defer {
+      textInputProbeIssueForTesting = nil
+      app.terminate()
+    }
+    let field = app.textFields["agent-device-hardware-keyboard-input"]
+    XCTAssertTrue(field.waitForFixtureExistence(timeout: appExistenceTimeout))
+    let point = CGPoint(x: field.frame.midX, y: field.frame.midY)
+    let completed = expectation(description: "optional probe completed inside runner wait")
+    DispatchQueue.main.async {
+      self.textInputProbeIssueForTesting = XCTIssue(type: .assertionFailure, compactDescription: "Optional probe issue during runner wait")
+      _ = try? self.probeTextInputs(app: self.app, point: point, contentTranslation: .none)
+      completed.fulfill()
+    }
+    guard XCTWaiter.wait(for: [completed], timeout: 5) == .completed else {
+      return XCTFail("Optional probe interrupted the runner wait")
+    }
+    XCTAssertNil(textInputProbeIssues)
+    NSLog("AGENT_DEVICE_RUNNER_OPTIONAL_PROBE_WAIT_COMPLETED")
+  }
+
+  func testTextInputProbeIssueScopeIsThreadBound() {
+    let issue = XCTIssue(type: .assertionFailure, compactDescription: "Issue scope thread check")
+    XCTAssertFalse(containTextInputProbeIssue(issue))
+    let scope = TextInputProbeIssues()
+    suppressedIssueLock.lock()
+    textInputProbeIssues = scope
+    suppressedIssueLock.unlock()
+    defer {
+      suppressedIssueLock.lock()
+      textInputProbeIssues = nil
+      suppressedIssueLock.unlock()
+    }
+    let finished = DispatchSemaphore(value: 0)
+    let result = ProbeThreadResult()
+    Thread.detachNewThread {
+      result.contained = self.containTextInputProbeIssue(issue)
+      finished.signal()
+    }
+    guard finished.wait(timeout: .now() + 2) == .success else {
+      return XCTFail("Background issue classification did not finish")
+    }
+    XCTAssertFalse(result.contained)
+    XCTAssertEqual(scope.count, 0)
+    XCTAssertTrue(containTextInputProbeIssue(issue))
+    XCTAssertEqual(scope.count, 1)
+  }
+
+  @MainActor
+  func testHealthyCoordinateTapPreservesBareTypingWitness() throws {
+    app.launchArguments = ["--agent-device-text-entry-regression"]
+    app.launch()
+    defer {
+      invalidateCachedTarget(reason: "unit_test_cleanup")
+      app.terminate()
+    }
+    let field = app.textFields["agent-device-hardware-keyboard-input"]
+    XCTAssertTrue(field.waitForFixtureExistence(timeout: appExistenceTimeout))
+    let frame = field.frame
+    mainOwned.app = app
+    mainOwned.bundleId = "com.callstack.agentdevice.runner"
+    mainOwned.processIdentifier = try XCTUnwrap(Self.processIdentifier(of: app))
+    clearSnapshotXCTestChannelPenalty(reason: "fresh-runner")
+    let failures = currentXCTestFailureCount()
+    let tap = try runnerCommandFixture(
+      #"{"appBundleId":"com.callstack.agentdevice.runner","command":"tap","commandId":"tap-healthy-probe","x":\#(frame.midX),"y":\#(frame.midY),"synthesized":true}"#
+    )
+    let tapped = try execute(command: tap)
+    XCTAssertTrue(tapped.ok, String(describing: tapped.error))
+    XCTAssertNotNil(textEntryTapWitness)
+    XCTAssertFalse(isSnapshotXCTestChannelPenalized(bundleId: mainOwned.bundleId))
+    try XCTSkipIf(isKeyboardVisible(app: app), "software keyboard is up; hidden-keyboard witness cannot be exercised")
+    let type = try runnerCommandFixture(#"{"appBundleId":"com.callstack.agentdevice.runner","command":"type","commandId":"type-healthy-probe","text":"probe-witness","textEntryMode":"append"}"#)
+    let typed = try execute(command: type)
+    XCTAssertTrue(typed.ok, String(describing: typed.error))
+    XCTAssertEqual(typed.data?.textEntryRoute, "xctest-element")
+    XCTAssertNil(textEntryTapWitness, "the type must consume the tap witness it was addressed by")
+    XCTAssertEqual(field.value as? String, "probe-witness")
+    XCTAssertFalse(didRecordXCTestFailure(since: failures))
+  }
+
+  @MainActor
+  func testFreshCoordinateTapEvidenceSkipsProbeAndClearsTypingWitness() throws {
+    app.launchArguments = ["--agent-device-text-entry-regression", "--agent-device-text-entry-tap-witness"]
+    app.launch()
+    defer {
+      textInputProbeIssueForTesting = nil
+      invalidateCachedTarget(reason: "unit_test_cleanup")
+      app.terminate()
+    }
+    mainOwned.app = app
+    mainOwned.bundleId = "com.callstack.agentdevice.runner"
+    mainOwned.processIdentifier = try XCTUnwrap(Self.processIdentifier(of: app))
+    clearSnapshotXCTestChannelPenalty(reason: "fresh-runner")
+    let field = app.textFields["agent-device-hardware-keyboard-input"]
+    XCTAssertTrue(field.waitForFixtureExistence(timeout: appExistenceTimeout))
+    let fieldFrame = field.frame
+    let fieldTap = try runnerCommandFixture(
+      #"{"appBundleId":"com.callstack.agentdevice.runner","command":"tap","commandId":"tap-field-before-exclusion","x":\#(fieldFrame.midX),"y":\#(fieldFrame.midY),"synthesized":true}"#
+    )
+    XCTAssertTrue(try execute(command: fieldTap).ok)
+    XCTAssertNotNil(textEntryTapWitness)
+    let button = app.buttons["agent-device-tap-witness"]
+    let frame = button.frame
+    textInputProbeIssueForTesting = XCTIssue(type: .assertionFailure, compactDescription: "excluded point must not query text inputs")
+    let tap = try runnerCommandFixture(
+      #"{"appBundleId":"com.callstack.agentdevice.runner","command":"tap","commandId":"tap-excluded-point","x":\#(frame.midX),"y":\#(frame.midY),"synthesized":true,"coordinateTapTextInputEvidence":{"targetBundleId":"com.callstack.agentdevice.runner","point":{"x":\#(frame.midX),"y":\#(frame.midY)},"textInputRects":[{"x":\#(fieldFrame.minX),"y":\#(fieldFrame.minY),"width":\#(fieldFrame.width),"height":\#(fieldFrame.height)}]}}"#
+    )
+    let response = try execute(command: tap)
+    XCTAssertTrue(response.ok, String(describing: response.error))
+    XCTAssertNotNil(textInputProbeIssueForTesting, "skipping must bypass all optional text-input queries")
+    textInputProbeIssueForTesting = nil
+    XCTAssertNil(textEntryTapWitness, "a skipped probe must clear the preceding field's typing authorization")
+    XCTAssertEqual(app.staticTexts["agent-device-tap-witness-presses"].label, "presses=1")
+    try XCTSkipIf(isKeyboardVisible(app: app), "software keyboard is up; hidden-keyboard authorization cannot be exercised")
+    let type = try runnerCommandFixture(#"{"appBundleId":"com.callstack.agentdevice.runner","command":"type","commandId":"type-after-exclusion","text":"must-not-type","textEntryMode":"append"}"#)
+    let typed = try execute(command: type)
+    XCTAssertFalse(typed.ok)
+    XCTAssertEqual(typed.error?.code, "TEXT_INPUT_NOT_FOCUSED")
+    XCTAssertEqual(field.value as? String, "")
+  }
+
+  @MainActor
+  func testCoordinateTapEvidenceContainingInputPreservesBareTypingWitness() throws {
+    app.launchArguments = ["--agent-device-text-entry-regression"]
+    app.launch()
+    defer {
+      invalidateCachedTarget(reason: "unit_test_cleanup")
+      app.terminate()
+    }
+    let field = app.textFields["agent-device-hardware-keyboard-input"]
+    XCTAssertTrue(field.waitForFixtureExistence(timeout: appExistenceTimeout))
+    let frame = field.frame
+    mainOwned.app = app
+    mainOwned.bundleId = "com.callstack.agentdevice.runner"
+    mainOwned.processIdentifier = try XCTUnwrap(Self.processIdentifier(of: app))
+    clearSnapshotXCTestChannelPenalty(reason: "fresh-runner")
+    let tap = try runnerCommandFixture(
+      #"{"appBundleId":"com.callstack.agentdevice.runner","command":"tap","commandId":"tap-input-evidence","x":\#(frame.midX),"y":\#(frame.midY),"synthesized":true,"coordinateTapTextInputEvidence":{"targetBundleId":"com.callstack.agentdevice.runner","point":{"x":\#(frame.midX),"y":\#(frame.midY)},"textInputRects":[{"x":\#(frame.minX),"y":\#(frame.minY),"width":\#(frame.width),"height":\#(frame.height)}]}}"#
+    )
+    XCTAssertTrue(try execute(command: tap).ok)
+    XCTAssertNotNil(textEntryTapWitness)
+    try XCTSkipIf(isKeyboardVisible(app: app), "software keyboard is up; hidden-keyboard witness cannot be exercised")
+    let type = try runnerCommandFixture(#"{"appBundleId":"com.callstack.agentdevice.runner","command":"type","commandId":"type-input-evidence","text":"evidence-witness","textEntryMode":"append"}"#)
+    let response = try execute(command: type)
+    XCTAssertTrue(response.ok, String(describing: response.error))
+    XCTAssertEqual(response.data?.textEntryRoute, "xctest-element")
+    XCTAssertEqual(field.value as? String, "evidence-witness")
+  }
+
+  func testTextInputProbeContainmentExcludesRequiredReadsAndLaterIssues() {
+    app.launchArguments = ["--agent-device-text-entry-regression"]
+    app.launch()
+    defer {
+      textInputProbeIssueForTesting = nil
+      app.terminate()
+    }
+    let field = app.textFields["agent-device-hardware-keyboard-input"]
+    XCTAssertTrue(field.waitForFixtureExistence(timeout: appExistenceTimeout))
+    let point = CGPoint(x: field.frame.midX, y: field.frame.midY)
+    let expected = XCTIssue(type: .assertionFailure, compactDescription: "Required query failure must escape optional containment")
+    let options = XCTExpectedFailure.Options()
+    var observed = 0
+    options.issueMatcher = { issue in
+      guard issue.type == expected.type, issue.compactDescription == expected.compactDescription else { return false }
+      observed += 1
+      return true
+    }
+    XCTExpectFailure("Required read and later issue belong to their caller", options: options) {
+      textInputProbeIssueForTesting = expected
+      _ = try? textInputCandidatesAt(app: app, point: point, contentTranslation: .none)
+      _ = try? probeTextInputs(app: app, point: point, contentTranslation: .none)
+      record(expected)
+    }
+    XCTAssertEqual(observed, 2)
+  }
+
+  func testSuppressedAxIssueMakesTextInputProbeUnavailable() throws {
+    app.launchArguments = ["--agent-device-text-entry-regression"]
+    app.launch()
+    defer {
+      textInputProbeIssueForTesting = nil
+      app.terminate()
+    }
+    let field = app.textFields["agent-device-hardware-keyboard-input"]
+    XCTAssertTrue(field.waitForFixtureExistence(timeout: appExistenceTimeout))
+    let frame = field.frame
+    textInputProbeIssueForTesting = XCTIssue(type: .assertionFailure, compactDescription: "Failed to get matching snapshot: kAXErrorIllegalArgument")
+    let outcome = try probeTextInputs(app: app, point: CGPoint(x: frame.midX, y: frame.midY), contentTranslation: .none)
+    guard case .unavailable = outcome else {
+      return XCTFail("A suppressed AX issue must discard the matching candidate")
+    }
+  }
+
+  @MainActor
+  func testFreshCoordinateTapContainsUnavailableTextInputProbe() throws {
+    app.launchArguments = ["--agent-device-text-entry-regression"]
+    app.launch()
+    defer {
+      textInputProbeIssueForTesting = nil
+      clearSnapshotXCTestChannelPenalty(reason: "test-cleanup")
+      invalidateCachedTarget(reason: "unit_test_cleanup")
+      app.terminate()
+    }
+    let target = app.staticTexts["Agent Device Runner"]
+    XCTAssertTrue(target.waitForFixtureExistence(timeout: appExistenceTimeout))
+    let frame = target.frame
+    mainOwned.app = app
+    mainOwned.bundleId = "com.callstack.agentdevice.runner"
+    mainOwned.processIdentifier = try XCTUnwrap(Self.processIdentifier(of: app))
+    clearSnapshotXCTestChannelPenalty(reason: "fresh-runner")
+    let failures = currentXCTestFailureCount()
+    textInputProbeIssueForTesting = XCTIssue(type: .assertionFailure, compactDescription: "Injected optional text input query failure")
+    let command = try runnerCommandFixture(
+      #"{"appBundleId":"com.callstack.agentdevice.runner","command":"tap","commandId":"tap-probe-unavailable","x":\#(frame.midX),"y":\#(frame.midY),"synthesized":true}"#
+    )
+    let response = try execute(command: command)
+    XCTAssertTrue(response.ok, String(describing: response.error))
+    XCTAssertFalse(didRecordXCTestFailure(since: failures))
+    XCTAssertFalse(isSnapshotXCTestChannelPenalized(bundleId: mainOwned.bundleId))
+    XCTAssertNil(textEntryTapWitness)
+    let type = try runnerCommandFixture(#"{"appBundleId":"com.callstack.agentdevice.runner","command":"type","commandId":"type-after-unavailable-probe","text":"must-not-type","textEntryMode":"append"}"#)
+    let typed = try execute(command: type)
+    XCTAssertFalse(typed.ok)
+    XCTAssertEqual(typed.error?.code, "TEXT_INPUT_NOT_FOCUSED")
+    let field = app.textFields["agent-device-hardware-keyboard-input"]
+    let fieldFrame = field.frame
+    let nextTap = try runnerCommandFixture(
+      #"{"appBundleId":"com.callstack.agentdevice.runner","command":"tap","commandId":"tap-after-probe-recovery","x":\#(fieldFrame.midX),"y":\#(fieldFrame.midY),"synthesized":true}"#
+    )
+    XCTAssertTrue(try execute(command: nextTap).ok)
+    XCTAssertNotNil(textEntryTapWitness)
+    let retype = try runnerCommandFixture(#"{"appBundleId":"com.callstack.agentdevice.runner","command":"type","commandId":"type-after-probe-recovery","text":"must-not-type","textEntryMode":"append"}"#)
+    let retyped = try execute(command: retype)
+    XCTAssertTrue(retyped.ok, String(describing: retyped.error))
+    XCTAssertEqual(field.value as? String, "must-not-type")
+  }
+#endif
+}
+
+#if AGENT_DEVICE_RUNNER_UNIT_TESTS && os(iOS)
+private final class ProbeThreadResult: @unchecked Sendable {
+  var contained = false
+}
+#endif

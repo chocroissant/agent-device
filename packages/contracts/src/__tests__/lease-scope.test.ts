@@ -1,0 +1,434 @@
+import assert from 'node:assert/strict';
+import { test } from 'vitest';
+import {
+  findMissingProxyLeaseFields,
+  isInactiveLeaseError,
+  leaseDeviceKey,
+  leaseProviderRequiringRuntime,
+  leaseScopeFromOptions,
+  leaseScopeFromRequest,
+  leaseScopeToAllocateRequest,
+  leaseScopeToCommandFlags,
+  leaseScopeToConnectionMetadata,
+  leaseScopeToLeaseRpcParams,
+  leaseScopeToRequestMeta,
+  parseLeaseDeviceKey,
+  readLeaseAllocateProviderFlags,
+  readLeaseDevice,
+  readLeaseDeviceSpec,
+  requireLeaseDeviceSpec,
+} from '../lease-scope.ts';
+
+test('leaseScopeFromOptions normalizes public aliases and projects request meta', () => {
+  const scope = leaseScopeFromOptions({
+    tenant: 'tenant-a',
+    runId: 'run-1',
+    leaseId: 'lease-1',
+    ttlMs: 120_000,
+    leaseBackend: 'ios-instance',
+    provider: 'proxy',
+    deviceKey: 'ios:SIM-001',
+    clientId: 'client-a',
+  });
+
+  assert.deepEqual(scope, {
+    tenantId: 'tenant-a',
+    runId: 'run-1',
+    leaseId: 'lease-1',
+    leaseTtlMs: 120_000,
+    leaseBackend: 'ios-instance',
+    leaseProvider: 'proxy',
+    deviceKey: 'ios:SIM-001',
+    clientId: 'client-a',
+  });
+  assert.deepEqual(leaseScopeToRequestMeta(scope), {
+    tenantId: 'tenant-a',
+    runId: 'run-1',
+    leaseId: 'lease-1',
+    leaseTtlMs: 120_000,
+    leaseBackend: 'ios-instance',
+    leaseProvider: 'proxy',
+    deviceKey: 'ios:SIM-001',
+    clientId: 'client-a',
+  });
+  assert.deepEqual(leaseScopeToCommandFlags(scope), {
+    tenant: 'tenant-a',
+    runId: 'run-1',
+    leaseId: 'lease-1',
+    leaseBackend: 'ios-instance',
+    leaseProvider: 'proxy',
+    deviceKey: 'ios:SIM-001',
+    clientId: 'client-a',
+  });
+});
+
+test('retainOnClose travels from options to request meta, allocate request and rpc params', () => {
+  const scope = leaseScopeFromOptions({ tenant: 'tenant-a', runId: 'run-1', retainOnClose: true });
+
+  assert.equal(scope.leaseRetainOnClose, true);
+  assert.equal(leaseScopeToRequestMeta(scope)?.leaseRetainOnClose, true);
+  assert.equal(leaseScopeToAllocateRequest(scope).retainOnClose, true);
+  assert.equal(
+    leaseScopeToLeaseRpcParams(scope, 'lease_allocate', { includeTokenParam: false }).retainOnClose,
+    true,
+  );
+  assert.equal(
+    'retainOnClose' in
+      leaseScopeToLeaseRpcParams(scope, 'lease_release', { includeTokenParam: false }),
+    false,
+  );
+  assert.equal(
+    'leaseRetainOnClose' in leaseScopeFromOptions({ tenant: 'tenant-a', runId: 'run-1' }),
+    false,
+  );
+});
+
+test('leaseScopeFromRequest prefers metadata and falls back to legacy flags', () => {
+  assert.deepEqual(
+    leaseScopeFromRequest({
+      meta: {
+        tenantId: 'tenant-meta',
+        leaseProvider: 'limrun',
+      },
+      flags: {
+        tenant: 'tenant-flag',
+        runId: 'run-flag',
+        leaseId: 'lease-flag',
+        provider: 'proxy',
+        deviceKey: 'ios:SIM-001',
+        clientId: 'client-a',
+      },
+    }),
+    {
+      tenantId: 'tenant-meta',
+      runId: 'run-flag',
+      leaseId: 'lease-flag',
+      leaseProvider: 'limrun',
+      deviceKey: 'ios:SIM-001',
+      clientId: 'client-a',
+    },
+  );
+});
+
+test('leaseScopeToLeaseRpcParams projects canonical provider and command-specific fields', () => {
+  const scope = leaseScopeFromOptions({
+    tenant: 'tenant-a',
+    runId: 'run-1',
+    leaseId: 'lease-1',
+    leaseTtlMs: 60_000,
+    leaseBackend: 'android-instance',
+    leaseProvider: 'proxy',
+    deviceKey: 'android:emulator-5554',
+    clientId: 'client-a',
+  });
+
+  assert.deepEqual(
+    leaseScopeToLeaseRpcParams(scope, 'lease_allocate', {
+      includeTokenParam: true,
+      token: 'token',
+      session: 'default',
+    }),
+    {
+      token: 'token',
+      session: 'default',
+      tenantId: 'tenant-a',
+      runId: 'run-1',
+      leaseProvider: 'proxy',
+      clientId: 'client-a',
+      deviceKey: 'android:emulator-5554',
+      leaseId: 'lease-1',
+      ttlMs: 60_000,
+      backend: 'android-instance',
+    },
+  );
+  assert.deepEqual(
+    leaseScopeToLeaseRpcParams(scope, 'lease_release', {
+      includeTokenParam: false,
+      token: 'token',
+      session: 'default',
+    }),
+    {
+      session: 'default',
+      tenantId: 'tenant-a',
+      runId: 'run-1',
+      leaseProvider: 'proxy',
+      clientId: 'client-a',
+      deviceKey: 'android:emulator-5554',
+      leaseId: 'lease-1',
+    },
+  );
+});
+
+test('leaseScopeToConnectionMetadata returns only connection lease fields', () => {
+  assert.deepEqual(
+    leaseScopeToConnectionMetadata(
+      leaseScopeFromOptions({
+        tenant: 'tenant-a',
+        runId: 'run-1',
+        leaseId: 'lease-1',
+        leaseProvider: 'proxy',
+        deviceKey: 'ios:SIM-001',
+        clientId: 'client-a',
+      }),
+    ),
+    {
+      leaseProvider: 'proxy',
+      deviceKey: 'ios:SIM-001',
+      clientId: 'client-a',
+    },
+  );
+  assert.equal(leaseScopeToConnectionMetadata({}), undefined);
+});
+
+test('findMissingProxyLeaseFields enforces complete proxy ownership scope', () => {
+  assert.deepEqual(
+    findMissingProxyLeaseFields({
+      tenantId: 'tenant-a',
+      runId: 'run-1',
+      leaseProvider: 'proxy',
+      clientId: 'client-a',
+    }),
+    ['leaseId', 'deviceKey'],
+  );
+  assert.deepEqual(
+    findMissingProxyLeaseFields({
+      leaseProvider: 'limrun',
+    }),
+    [],
+  );
+});
+
+test('readLeaseAllocateProviderFlags carries the provider-allocation flags and drops the rest', () => {
+  assert.deepEqual(
+    readLeaseAllocateProviderFlags({
+      session: 'default',
+      token: 'secret',
+      runId: 'run-a',
+      deviceKey: 'dk-1',
+      provider: 'browserstack',
+      ttlMs: 1000,
+      platform: 'ios',
+      device: 'iPhone 15',
+      providerApp: 'bs://abc',
+      providerOsVersion: '17',
+      providerDeviceType: 'real',
+      providerProject: 'MyProject',
+      providerBuild: 'Build-1',
+      providerSessionName: 'smoke',
+      providerDeviceOrientation: 'landscape',
+      providerGeoLocation: '52.5,13.4',
+      providerLanguage: 'en',
+      providerNoResignApp: true,
+      awsRegion: 'us-west-2',
+      awsProjectArn: 'arn:aws:devicefarm:0',
+      awsInteractionMode: 'NO_VIDEO',
+    }),
+    {
+      platform: 'ios',
+      device: 'iPhone 15',
+      providerApp: 'bs://abc',
+      providerOsVersion: '17',
+      providerDeviceType: 'real',
+      providerProject: 'MyProject',
+      providerBuild: 'Build-1',
+      providerSessionName: 'smoke',
+      providerDeviceOrientation: 'landscape',
+      providerGeoLocation: '52.5,13.4',
+      providerLanguage: 'en',
+      providerNoResignApp: true,
+      awsRegion: 'us-west-2',
+      awsProjectArn: 'arn:aws:devicefarm:0',
+      awsInteractionMode: 'NO_VIDEO',
+    },
+  );
+  assert.deepEqual(
+    readLeaseAllocateProviderFlags({ providerApp: 'bs://abc', providerBuild: undefined }),
+    { providerApp: 'bs://abc' },
+  );
+  assert.deepEqual(readLeaseAllocateProviderFlags(undefined), {});
+});
+
+test('readLeaseAllocateProviderFlags carries a named or invalid spec key as given, and drops one that names nothing', () => {
+  assert.deepEqual(
+    readLeaseAllocateProviderFlags({
+      platform: 'android',
+      osVersion: '34',
+      imageTag: 'google_apis_playstore',
+      physical: true,
+    }),
+    { platform: 'android', osVersion: '34', imageTag: 'google_apis_playstore', physical: true },
+  );
+  assert.deepEqual(
+    readLeaseAllocateProviderFlags({ osVersion: '', imageTag: ' ', physical: false }),
+    {},
+  );
+  // An invalid key still reaches the daemon, which refuses it rather than never seeing it.
+  assert.deepEqual(readLeaseAllocateProviderFlags({ osVersion: 26, physical: 'yes' }), {
+    osVersion: 26,
+    physical: 'yes',
+  });
+});
+
+test('readLeaseDeviceSpec decides each key is named, not named, or invalid', () => {
+  assert.deepEqual(
+    readLeaseDeviceSpec({
+      osVersion: '>=26',
+      imageTag: 'google_apis',
+      deviceMode: 'full',
+      deviceBaseline: 'logged-in',
+      physical: true,
+    }),
+    {
+      spec: {
+        osVersion: '>=26',
+        imageTag: 'google_apis',
+        deviceMode: 'full',
+        deviceBaseline: 'logged-in',
+        physical: true,
+      },
+      keys: ['osVersion', 'imageTag', 'deviceMode', 'deviceBaseline', 'physical'],
+      invalidKeys: [],
+    },
+  );
+  const notNamed = { spec: {}, keys: [], invalidKeys: [] };
+  assert.deepEqual(readLeaseDeviceSpec(undefined), notNamed);
+  assert.deepEqual(readLeaseDeviceSpec({}), notNamed);
+  assert.deepEqual(
+    readLeaseDeviceSpec({
+      osVersion: '',
+      imageTag: '  ',
+      deviceMode: '',
+      deviceBaseline: ' ',
+      physical: false,
+    }),
+    notNamed,
+  );
+  assert.deepEqual(
+    readLeaseDeviceSpec({
+      osVersion: 26,
+      imageTag: null,
+      deviceMode: true,
+      deviceBaseline: 1,
+      physical: 'yes',
+    }),
+    {
+      spec: {},
+      keys: [],
+      invalidKeys: ['osVersion', 'imageTag', 'deviceMode', 'deviceBaseline', 'physical'],
+    },
+  );
+  assert.deepEqual(readLeaseDeviceSpec({ osVersion: '18', physical: 1 }), {
+    spec: { osVersion: '18' },
+    keys: ['osVersion'],
+    invalidKeys: ['physical'],
+  });
+});
+
+test('readLeaseDeviceSpec uses a named value as given and names nothing for a blank one', () => {
+  assert.deepEqual(readLeaseDeviceSpec({ osVersion: ' 34 ', imageTag: '\t' }), {
+    spec: { osVersion: ' 34 ' },
+    keys: ['osVersion'],
+    invalidKeys: [],
+  });
+});
+
+test('requireLeaseDeviceSpec refuses an invalid key with device-spec-invalid', () => {
+  assert.deepEqual(requireLeaseDeviceSpec({ osVersion: '', physical: true }), {
+    spec: { physical: true },
+    keys: ['physical'],
+  });
+  assert.throws(() => requireLeaseDeviceSpec({ physical: 'yes' }), {
+    code: 'INVALID_ARGS',
+    details: { reason: 'device-spec-invalid', keys: ['physical'] },
+  });
+});
+
+test('readLeaseDevice reads the granted facts and rejects an echo missing one', () => {
+  const pixel = { model: 'Pixel 9', osVersion: '34', imageTag: 'google_apis', physical: false };
+  assert.deepEqual(readLeaseDevice(pixel), pixel);
+  const iphone = { model: 'iPhone 17 Pro', osVersion: '26.0', physical: true };
+  assert.deepEqual(readLeaseDevice(iphone), iphone);
+  assert.equal(readLeaseDevice({ model: 'iPhone 17 Pro', osVersion: '26.0' }), undefined);
+  assert.equal(readLeaseDevice({ osVersion: '26.0', physical: true }), undefined);
+  assert.equal(
+    readLeaseDevice({ model: 'iPhone 17 Pro', osVersion: '26.0', physical: 'yes' }),
+    undefined,
+  );
+  assert.equal(readLeaseDevice(undefined), undefined);
+});
+
+test('readLeaseDevice reads the granted baseline and drops a malformed one', () => {
+  const device = { model: 'iPhone 17 Pro', osVersion: '26.0', physical: false };
+  const withBaseline = { ...device, baseline: { name: 'logged-in', version: 3 } };
+  assert.deepEqual(readLeaseDevice(withBaseline), withBaseline);
+  const paddedBaseline = { ...device, baseline: { name: ' logged-in ', version: 3 } };
+  assert.deepEqual(readLeaseDevice(paddedBaseline), paddedBaseline);
+  for (const baseline of [
+    { name: 'logged-in', version: 0 },
+    { name: 'logged-in', version: 1.5 },
+    { name: 'logged-in', version: '3' },
+    { name: ' ', version: 3 },
+    { version: 3 },
+    'logged-in',
+  ]) {
+    assert.deepEqual(readLeaseDevice({ ...device, baseline }), device);
+  }
+});
+
+test('isInactiveLeaseError recognizes the lease being gone, and refuses a request mismatch', () => {
+  for (const reason of ['LEASE_NOT_FOUND', 'LEASE_EXPIRED', 'LEASE_REVOKED']) {
+    assert.equal(
+      isInactiveLeaseError({ code: 'UNAUTHORIZED', details: { reason } }),
+      true,
+      `${reason} says the lease is no longer usable`,
+    );
+  }
+  // A mismatch is about the request that asked, not the lease: the lease may be perfectly alive and
+  // held by this same client under another request, so a beat must keep renewing on this answer.
+  assert.equal(
+    isInactiveLeaseError({ code: 'UNAUTHORIZED', details: { reason: 'LEASE_SCOPE_MISMATCH' } }),
+    false,
+    'a scope mismatch is not the lease being gone',
+  );
+  // Both halves are required: the code alone is any unauthorized call, and the reason alone could
+  // ride on an error the client has no business acting on.
+  assert.equal(isInactiveLeaseError({ code: 'UNAUTHORIZED', details: {} }), false);
+  assert.equal(
+    isInactiveLeaseError({ code: 'COMMAND_FAILED', details: { reason: 'LEASE_NOT_FOUND' } }),
+    false,
+  );
+  assert.equal(isInactiveLeaseError(new Error('LEASE_NOT_FOUND')), false);
+  assert.equal(isInactiveLeaseError(undefined), false);
+});
+
+test('parseLeaseDeviceKey reads back every field leaseDeviceKey writes', () => {
+  const devices = [
+    { platform: 'ios', target: 'tv', id: 'SIM-001' },
+    { platform: 'android', target: 'mobile', id: 'emulator-5554' },
+    { platform: 'android', target: 'mobile', id: '192.168.1.20:5555' },
+    { platform: 'macos', target: 'desktop', id: 'host:a:b' },
+  ];
+  for (const device of devices) {
+    assert.deepEqual(parseLeaseDeviceKey(leaseDeviceKey(device)), device);
+  }
+  assert.deepEqual(parseLeaseDeviceKey(leaseDeviceKey({ platform: 'ios', id: 'SIM-002' })), {
+    platform: 'ios',
+    target: 'mobile',
+    id: 'SIM-002',
+  });
+  for (const malformed of [undefined, '', 'ios', 'ios:SIM-001', 'ios:mobile:', ':mobile:id']) {
+    assert.equal(parseLeaseDeviceKey(malformed), undefined, `${malformed} is not a device key`);
+  }
+});
+
+test('leaseProviderRequiringRuntime exempts only provider-less, proxy, and cloud leases', () => {
+  assert.equal(leaseProviderRequiringRuntime({}), undefined);
+  assert.equal(leaseProviderRequiringRuntime({ leaseBackend: 'ios-instance' }), undefined);
+  assert.equal(leaseProviderRequiringRuntime({ leaseProvider: 'proxy' }), undefined);
+  assert.equal(leaseProviderRequiringRuntime({ leaseProvider: 'cloud' }), undefined);
+  assert.equal(leaseProviderRequiringRuntime({ leaseProvider: 'testmu' }), 'testmu');
+  assert.equal(
+    leaseProviderRequiringRuntime({ leaseProvider: 'Cloud', leaseBackend: 'ios-instance' }),
+    'Cloud',
+  );
+});

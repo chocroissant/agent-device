@@ -1,0 +1,395 @@
+import { IOS_SYSTEM_SURFACE_HOSTS } from '@agent-device/contracts/ios-system-surface';
+import {
+  assertProducedRunnerRequests,
+  bindTestCommandHost,
+  IOS_DEVICE,
+  IOS_SIMULATOR,
+  MACOS_DEVICE,
+  TVOS_SIMULATOR,
+} from '@agent-device/test-kit';
+import fs from 'node:fs';
+import path from 'node:path';
+import { test } from 'vitest';
+import { buildGesturePlan } from '@agent-device/contracts/gesture-plan';
+import type { GesturePlan } from '@agent-device/contracts/gesture-plan-types';
+import type { Interactor, PressPointOptions } from '@agent-device/contracts/interactor-types';
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import { createAppleInteractor } from '../interactor.ts';
+import { resolveIosPhysicalDeviceControl } from '../core/physical-device-control.ts';
+import { runAppleRunnerCommand } from '../core/runner-client.ts';
+import { queryAppleRunnerSelector } from '../core/runner-selector-query.ts';
+import { captureScreenshotViaRunner } from '../core/screenshot.ts';
+import { withAppleRunnerProvider, type RunnerCommand } from '@agent-device/apple-runner';
+import {
+  recordingRunnerProvider,
+  singlePointerPanPlan,
+  type RecordedRunnerCall,
+} from './recording-runner-provider.ts';
+import { mkdtempForTest } from './tmp-dir.ts';
+import { createRunnerSnapshotBridge } from '../runner-snapshot-bridge.ts';
+import {
+  deriveIosCaptureHint,
+  createIosSnapshotRequest,
+} from '@agent-device/capture-kit/ios-snapshot-planning';
+
+bindTestCommandHost();
+
+// Every Apple runner request site outside `@agent-device/apple-runner`, driven through its production entry point and
+// pinned to contracts/fixtures/runner-requests.json. The drives never write a request themselves;
+// packages/apple-runner/src/__tests__/index-runner-requests.test.ts reads this source to keep it that way.
+
+const APP = 'com.example.app';
+const XCTEST_DEVICE: DeviceInfo = { ...IOS_DEVICE, iosPhysicalDeviceBackend: 'xctest' };
+
+type InteractorDrive = readonly [DeviceInfo, (interactor: Interactor) => Promise<unknown>];
+
+function press(overrides: Partial<PressPointOptions> = {}) {
+  return (interactor: Interactor) =>
+    interactor.pressPoint!(
+      { x: 10, y: 20 },
+      {
+        button: 'primary',
+        count: 1,
+        intervalMs: 0,
+        holdMs: 0,
+        jitterPx: 0,
+        doubleTap: false,
+        ...overrides,
+      },
+    );
+}
+
+const INTERACTOR_SITES: Record<string, InteractorDrive> = {
+  'ios-simulator.interactions-tap.synthesized': [IOS_SIMULATOR, (i) => i.tap(10, 20)],
+  'macos.interactions-tap.coordinate': [MACOS_DEVICE, (i) => i.tap(10, 20)],
+  'ios-simulator.interactions-focus.synthesized': [IOS_SIMULATOR, (i) => i.focus(10, 20)],
+  'macos.interactions-focus.coordinate': [MACOS_DEVICE, (i) => i.focus(10, 20)],
+  'ios-simulator.interactions-single-press-tap.synthesized': [IOS_SIMULATOR, press()],
+  'ios-simulator.interactions-single-press-tap.text-input-evidence': [
+    IOS_SIMULATOR,
+    press({
+      coordinateTapTextInputEvidence: {
+        targetBundleId: APP,
+        point: { x: 10, y: 20 },
+        textInputRects: [{ x: 0, y: 100, width: 200, height: 44 }],
+      },
+    }),
+  ],
+  'macos.interactions-single-press-tap.coordinate': [MACOS_DEVICE, press()],
+  'ios-simulator.interactions-tap-element-selector.expected-point': [
+    IOS_SIMULATOR,
+    (i) =>
+      i.tapElementSelector!({
+        key: 'label',
+        value: 'Go',
+        allowNonHittableCoordinateFallback: true,
+        expectedPoint: { x: 10, y: 20 },
+      }),
+  ],
+  'ios-simulator.interactions-double-tap.single': [IOS_SIMULATOR, (i) => i.doubleTap!(10, 20)],
+  'ios-simulator.interactions-long-press.duration': [
+    IOS_SIMULATOR,
+    (i) => i.longPress(10, 20, 600),
+  ],
+  'ios-simulator.interactions-type.append': [IOS_SIMULATOR, (i) => i.type('hello', 10)],
+  'ios-simulator.interactions-type.newline': [IOS_SIMULATOR, (i) => i.type('\n')],
+  'ios-simulator.interactions-fill.replace': [IOS_SIMULATOR, (i) => i.fill(10, 20, 'hello', 10)],
+  'ios-simulator.interactions-fill.non-hittable-fallback': [
+    IOS_SIMULATOR,
+    (i) => i.fill(10, 20, 'hello', undefined, { allowNonHittableCoordinateFallback: true }),
+  ],
+  'ios-simulator.interactions-gesture-viewport.read': [IOS_SIMULATOR, (i) => i.gestureViewport!()],
+  'ios-simulator.interactions-press-series.tap': [
+    IOS_SIMULATOR,
+    press({ count: 2, intervalMs: 50 }),
+  ],
+  'ios-simulator.interactions-press-series.double-tap': [
+    IOS_SIMULATOR,
+    press({ count: 2, intervalMs: 50, doubleTap: true }),
+  ],
+  'ios-simulator.interactions-press-series.long-press': [
+    IOS_SIMULATOR,
+    press({ count: 2, intervalMs: 50, holdMs: 600 }),
+  ],
+  'macos.interactions-mouse-click.secondary': [MACOS_DEVICE, press({ button: 'secondary' })],
+  'macos.interactions-mouse-click.middle': [MACOS_DEVICE, press({ button: 'middle' })],
+  'ios-simulator.interactions-single-press-double-tap.single': [
+    IOS_SIMULATOR,
+    press({ doubleTap: true }),
+  ],
+  'ios-simulator.interactions-single-press-long-press.hold': [
+    IOS_SIMULATOR,
+    press({ holdMs: 600 }),
+  ],
+  'macos.interactions-drag.single': [
+    MACOS_DEVICE,
+    (i) => i.performGesture!(singlePointerPanPlan()),
+  ],
+  'tvos.interactions-swipe.single': [
+    TVOS_SIMULATOR,
+    (i) => i.performGesture!(singlePointerPanPlan()),
+  ],
+  'ios-simulator.interactions-gesture.single': [
+    IOS_SIMULATOR,
+    (i) => i.performGesture!(singlePointerPanPlan()),
+  ],
+  'ios-simulator.interactions-gesture.multi': [
+    IOS_SIMULATOR,
+    (i) => i.performGesture!(pinchPlan()),
+  ],
+  'ios-simulator.interactions-gesture.tap': [IOS_SIMULATOR, (i) => i.performGesture!(tapPlan())],
+  'ios-simulator.interactions-gesture.screen-edge': [
+    IOS_SIMULATOR,
+    (i) =>
+      i.performGesture!(
+        buildGesturePlan(
+          { intent: 'fling', preset: 'right-edge' },
+          { x: 0, y: 0, width: 390, height: 844 },
+        ),
+      ),
+  ],
+  'tvos.interactions-scroll.remote-press': [
+    TVOS_SIMULATOR,
+    (i) => i.scroll('down', { durationMs: 300 }),
+  ],
+  'ios-simulator.interactions-scroll.amount': [IOS_SIMULATOR, (i) => i.scroll('down')],
+  'ios-simulator.interactions-scroll.pixels': [
+    IOS_SIMULATOR,
+    (i) => i.scroll('up', { pixels: 200, durationMs: 300 }),
+  ],
+  'ios-simulator.interactions-scroll.inertial': [
+    IOS_SIMULATOR,
+    (i) => i.scroll('left', { amount: 0.5, releaseBehavior: 'inertial' }),
+  ],
+  'macos.desktop-scroll.amount': [
+    MACOS_DEVICE,
+    (i) => i.scroll('down', { amount: 0.5, durationMs: 300 }),
+  ],
+  'macos.desktop-scroll.pixels': [
+    MACOS_DEVICE,
+    (i) => i.scroll('up', { pixels: 200, durationMs: 300 }),
+  ],
+  'ios-simulator.interactor-find-text.text': [
+    IOS_SIMULATOR,
+    (i) => i.findText!('Ready', { appBundleId: APP }),
+  ],
+  'tvos.interactor-back.remote-press': [TVOS_SIMULATOR, (i) => i.back()],
+  'ios-simulator.interactor-back.in-app': [IOS_SIMULATOR, (i) => i.back()],
+  'ios-simulator.interactor-back.system': [IOS_SIMULATOR, (i) => i.back('system')],
+  'tvos.interactor-home.remote-press': [TVOS_SIMULATOR, (i) => i.home!()],
+  'ios-simulator.interactor-home.press': [IOS_SIMULATOR, (i) => i.home!()],
+  'ios-simulator.interactor-set-orientation.rotate': [
+    IOS_SIMULATOR,
+    (i) => i.setOrientation('landscape-left'),
+  ],
+  'ios-simulator.interactor-app-state.read': [IOS_SIMULATOR, (i) => i.appState!()],
+  'ios-simulator.interactor-app-switcher.open': [IOS_SIMULATOR, (i) => i.appSwitcher!()],
+  'ios-simulator.interactor-action-button.press': [IOS_SIMULATOR, (i) => i.actionButton!()],
+  'ios-simulator.interactor-volume-up.press': [IOS_SIMULATOR, (i) => i.volumeUp!()],
+  'ios-simulator.interactor-volume-down.press': [IOS_SIMULATOR, (i) => i.volumeDown!()],
+  'tvos.interactor-tv-remote.hold': [TVOS_SIMULATOR, (i) => i.tvRemote!('select', 500)],
+  'ios-simulator.interactor-keyboard-dismiss.dismiss': [IOS_SIMULATOR, (i) => i.keyboardDismiss!()],
+  'ios-simulator.interactor-keyboard-enter.return': [IOS_SIMULATOR, (i) => i.keyboardEnter!()],
+  'ios-simulator.interactor-write-clipboard.text': [
+    IOS_SIMULATOR,
+    (i) => i.writeClipboard!('one-time code 246810'),
+  ],
+  'ios-simulator.interactor-snapshot.every-option': [
+    IOS_SIMULATOR,
+    (i) =>
+      i.snapshot({
+        appBundleId: APP,
+        interactiveOnly: true,
+        preferredBackend: 'tree',
+        customActions: true,
+        depth: 3,
+        scope: 'Go',
+        raw: true,
+      }),
+  ],
+  'ios-simulator.interactor-read-text.point': [
+    IOS_SIMULATOR,
+    (i) => i.readTextAtPoint!({ x: 10, y: 20 }, { appBundleId: APP }),
+  ],
+  'ios-simulator.alert.get': [IOS_SIMULATOR, (i) => i.readAlert!({ appBundleId: APP })],
+  'ios-simulator.alert.accept': [IOS_SIMULATOR, (i) => i.acceptAlert!({ appBundleId: APP })],
+  'ios-simulator.alert.dismiss': [IOS_SIMULATOR, (i) => i.dismissAlert!({ appBundleId: APP })],
+};
+
+type ScopedDrive = readonly [DeviceInfo, (outPath: string) => Promise<unknown>];
+
+const SCOPED_SITES: Record<string, ScopedDrive> = {
+  'ios-simulator.runner-selector-query.label': [
+    IOS_SIMULATOR,
+    () => queryAppleRunnerSelector(IOS_SIMULATOR, { key: 'label', value: 'Go' }, APP, {}),
+  ],
+  'macos.screenshot-runner.fullscreen': [
+    MACOS_DEVICE,
+    (outPath) =>
+      captureScreenshotViaRunner(MACOS_DEVICE, outPath, APP, true, undefined, process.env),
+  ],
+  'ios-device.physical-device-screenshot.coredevice-file': [
+    IOS_DEVICE,
+    (outPath) => captureScreenshotViaRunner(IOS_DEVICE, outPath, APP, true, undefined, process.env),
+  ],
+  'ios-device.physical-device-screenshot.xctest-inline': [
+    XCTEST_DEVICE,
+    (outPath) =>
+      captureScreenshotViaRunner(XCTEST_DEVICE, outPath, APP, undefined, undefined, process.env),
+  ],
+  'ios-device.physical-device-control.activate': [
+    XCTEST_DEVICE,
+    () =>
+      resolveIosPhysicalDeviceControl(XCTEST_DEVICE).launchApp(XCTEST_DEVICE, APP, {
+        runRunnerCommand: runAppleRunnerCommand,
+      }),
+  ],
+  'ios-device.physical-device-control.terminate': [
+    XCTEST_DEVICE,
+    () =>
+      resolveIosPhysicalDeviceControl(XCTEST_DEVICE).terminateApp(XCTEST_DEVICE, APP, {
+        runRunnerCommand: runAppleRunnerCommand,
+      }),
+  ],
+};
+
+test('every Apple request site builds exactly its golden runner request', async () => {
+  const captured: Array<readonly [string, RunnerCommand]> = [];
+  for (const [name, [device, drive]] of Object.entries(INTERACTOR_SITES)) {
+    const calls: RecordedRunnerCall[] = [];
+    await drive(
+      createAppleInteractor(
+        device,
+        { appBundleId: APP },
+        { env: process.env, cwd: process.cwd() },
+        recordingRunnerProvider(calls),
+      ),
+    );
+    captured.push([name, onlyRequest(name, calls)]);
+  }
+  const observationCalls: RecordedRunnerCall[] = [];
+  await createAppleInteractor(
+    IOS_SIMULATOR,
+    { appBundleId: APP },
+    { env: process.env, cwd: process.cwd() },
+    recordingRunnerProvider(observationCalls, {
+      snapshot: {
+        nodes: [{ index: 0, type: 'Application', rect: { x: 0, y: 0, width: 390, height: 844 } }],
+        observation: {
+          mode: 'observe-only',
+          activationPerformed: false,
+          appState: 'runningForeground',
+          appStateSource: 'xcuiapplication-state',
+        },
+      },
+    }),
+  ).snapshot({ appBundleId: APP, observeOnly: true });
+  captured.push([
+    'ios-simulator.interactor-snapshot.observe-only',
+    onlyRequest('ios-simulator.interactor-snapshot.observe-only', observationCalls),
+  ]);
+  const dir = await mkdtempForTest('agent-device-runner-requests-');
+  const runnerScreenshot = path.join(dir, 'runner.png');
+  fs.writeFileSync(runnerScreenshot, '');
+  for (const [name, [device, drive]] of Object.entries(SCOPED_SITES)) {
+    const calls: RecordedRunnerCall[] = [];
+    const provider = recordingRunnerProvider(calls, {
+      screenshot: { message: runnerScreenshot, imageBase64: 'AA==' },
+    });
+    await withAppleRunnerProvider(provider, { deviceId: device.id }, () =>
+      drive(path.join(dir, `${name}.png`)),
+    );
+    captured.push([name, onlyRequest(name, calls)]);
+  }
+  for (const [name, drive] of Object.entries(SNAPSHOT_BRIDGE_SITES)) {
+    const calls: RecordedRunnerCall[] = [];
+    await drive(
+      createRunnerSnapshotBridge({
+        device: IOS_SIMULATOR,
+        provider: recordingRunnerProvider(calls),
+      }),
+    );
+    captured.push([name, onlyRequest(name, calls)]);
+  }
+  assertProducedRunnerRequests(import.meta.filename, captured);
+});
+
+// Each drive sends one bridge read; the recording runner answers it with no envelope, which the
+// bridge reports as a failed read rather than a request it did not send.
+const SNAPSHOT_BRIDGE_SITES: Record<
+  string,
+  (bridge: ReturnType<typeof createRunnerSnapshotBridge>) => Promise<unknown>
+> = {
+  'ios-simulator.runner-snapshot-bridge.target': (bridge) =>
+    bridge.resolveTarget(IOS_SIMULATOR, APP, new AbortController().signal).catch(() => undefined),
+  'ios-simulator.runner-snapshot-bridge.describe': (bridge) =>
+    bridge.source.acquire({
+      target: {
+        appBundleId: APP,
+        targetId: `${IOS_SIMULATOR.id}:${APP}`,
+        pid: 41,
+        processStartTime: '1700000000.000001',
+        generation: '41:1700000000.000001',
+      },
+      hint: deriveIosCaptureHint(createIosSnapshotRequest({ interactiveOnly: true })),
+    }),
+  'ios-simulator.runner-snapshot-bridge.describe-surface-hosts': (bridge) =>
+    bridge.source.acquire({
+      target: {
+        appBundleId: APP,
+        targetId: `${IOS_SIMULATOR.id}:${APP}`,
+        pid: 41,
+        processStartTime: '1700000000.000001',
+        generation: '41:1700000000.000001',
+      },
+      hint: deriveIosCaptureHint(createIosSnapshotRequest({ interactiveOnly: true })),
+      surfaceHostExecutables: IOS_SYSTEM_SURFACE_HOSTS.map((host) => host.processExecutable),
+    }),
+};
+
+function onlyRequest(name: string, calls: RecordedRunnerCall[]): RunnerCommand {
+  if (calls.length !== 1) throw new Error(`${name} sent ${calls.length} runner requests`);
+  return calls[0]!.command;
+}
+
+function tapPlan(): GesturePlan {
+  const contact = (pointerId: 0 | 1 | 2, x: number, y: number) => ({
+    pointerId,
+    samples: [
+      { offsetMs: 0, point: { x, y } },
+      { offsetMs: 50, point: { x, y } },
+    ],
+  });
+  return {
+    topology: 'multi',
+    intent: 'tap',
+    durationMs: 50,
+    viewport: { x: 0, y: 0, width: 390, height: 844 },
+    pointers: [contact(0, 100, 300), contact(1, 200, 450), contact(2, 300, 600)],
+  };
+}
+
+function pinchPlan(): GesturePlan {
+  return {
+    topology: 'multi',
+    intent: 'pinch',
+    durationMs: 250,
+    viewport: { x: 0, y: 0, width: 390, height: 844 },
+    pointers: [
+      {
+        pointerId: 0,
+        samples: [
+          { offsetMs: 0, point: { x: 150, y: 422 } },
+          { offsetMs: 250, point: { x: 100, y: 422 } },
+        ],
+      },
+      {
+        pointerId: 1,
+        samples: [
+          { offsetMs: 0, point: { x: 240, y: 422 } },
+          { offsetMs: 250, point: { x: 290, y: 422 } },
+        ],
+      },
+    ],
+  };
+}

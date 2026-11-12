@@ -1,0 +1,220 @@
+import type {
+  IosTargetActivation,
+  IosTargetActivationPriorState,
+  IosTargetActivationReason,
+  IosSnapshotObservation,
+  SnapshotCaptureBackend,
+  SnapshotQualityState,
+  SnapshotQualityVerdict,
+  SnapshotQualityNote,
+} from '@agent-device/kernel/snapshot';
+import type { AndroidSnapshotBackendMetadata } from './snapshot-types.ts';
+
+/**
+ * The verdict and activation names this host has to speak, each keyed against its kernel union so a name added
+ * there without a key here is a compile error. They cannot be one shared kernel predicate: the
+ * eager-closure gate keeps `kernel/snapshot.ts` out of `facades/capture.ts` (#2872).
+ */
+const DECLARED_STATES: Record<SnapshotQualityState, true> = {
+  healthy: true,
+  recovered: true,
+  sparse: true,
+};
+const DECLARED_BACKENDS: Record<SnapshotCaptureBackend, true> = {
+  tree: true,
+  queries: true,
+  'private-ax': true,
+  'android-helper': true,
+};
+
+const DECLARED_ACTIVATION_REASONS: Record<IosTargetActivationReason, true> = {
+  bundle_changed: true,
+  stale_target: true,
+  missing_after_wait: true,
+  interaction_foreground_guard: true,
+};
+const DECLARED_ACTIVATION_PRIOR_STATES: Record<IosTargetActivationPriorState, true> = {
+  unknown: true,
+  notRunning: true,
+  runningBackgroundSuspended: true,
+  runningBackground: true,
+};
+
+export type SnapshotCaptureAnalysis = {
+  rawNodeCount: number;
+  maxDepth: number;
+};
+
+export type SnapshotCaptureFreshness = {
+  action: string;
+  retryCount: number;
+  staleAfterRetries: boolean;
+  reason?: 'empty-interactive' | 'sharp-drop' | 'stuck-route';
+};
+
+export type SnapshotCaptureAnnotations = {
+  analysis?: SnapshotCaptureAnalysis;
+  androidSnapshot?: AndroidSnapshotBackendMetadata;
+  freshness?: SnapshotCaptureFreshness;
+  quality?: SnapshotQualityVerdict;
+  qualityNotes?: SnapshotQualityNote[];
+  warnings?: string[];
+  /** The Apple runner re-activated the session app while serving this capture (#2682). */
+  targetActivation?: IosTargetActivation;
+  observation?: IosSnapshotObservation;
+};
+
+export type PublicSnapshotCaptureAnnotations = Pick<
+  SnapshotCaptureAnnotations,
+  'androidSnapshot' | 'warnings' | 'targetActivation' | 'observation'
+> & {
+  snapshotQuality?: SnapshotQualityVerdict;
+  snapshotQualityNotes?: SnapshotQualityNote[];
+};
+
+export function snapshotCaptureAnnotationsFrom(
+  source: Partial<Omit<SnapshotCaptureAnnotations, 'quality'>> & { quality?: unknown },
+): SnapshotCaptureAnnotations {
+  const quality = readPublishedSnapshotQualityVerdict(source.quality);
+  return {
+    ...(source.analysis ? { analysis: source.analysis } : {}),
+    ...(source.androidSnapshot ? { androidSnapshot: source.androidSnapshot } : {}),
+    ...(source.freshness ? { freshness: source.freshness } : {}),
+    ...(quality ? { quality } : {}),
+    ...(source.qualityNotes?.length ? { qualityNotes: source.qualityNotes } : {}),
+    ...(source.warnings ? { warnings: source.warnings } : {}),
+    ...(source.targetActivation ? { targetActivation: source.targetActivation } : {}),
+    ...(source.observation ? { observation: source.observation } : {}),
+  };
+}
+
+export function publicSnapshotCaptureAnnotations(
+  annotations: Partial<SnapshotCaptureAnnotations>,
+): PublicSnapshotCaptureAnnotations {
+  return {
+    ...(annotations.androidSnapshot ? { androidSnapshot: annotations.androidSnapshot } : {}),
+    ...(annotations.quality ? { snapshotQuality: annotations.quality } : {}),
+    ...(annotations.qualityNotes?.length ? { snapshotQualityNotes: annotations.qualityNotes } : {}),
+    ...(annotations.warnings && annotations.warnings.length > 0
+      ? { warnings: annotations.warnings }
+      : {}),
+    ...(annotations.targetActivation ? { targetActivation: annotations.targetActivation } : {}),
+    ...(annotations.observation ? { observation: annotations.observation } : {}),
+  };
+}
+
+export function readSerializedSnapshotCaptureAnnotations(
+  data: Record<string, unknown>,
+): PublicSnapshotCaptureAnnotations {
+  const androidSnapshot = readObject(data.androidSnapshot);
+  // Declared exception to kernel's shared `readResponseWarnings` (see its doc): this facade
+  // pins its eager module closure, and absent-or-non-array keeps the serialized tri-state.
+  // `snapshot-capture-annotations.test.ts` cross-checks this filter against the shared parser.
+  const warnings = Array.isArray(data.warnings)
+    ? data.warnings.filter((entry): entry is string => typeof entry === 'string')
+    : undefined;
+  const quality = readPublishedSnapshotQualityVerdict(data.snapshotQuality);
+  const qualityNotes = readSnapshotQualityNotes(data.snapshotQualityNotes);
+  const targetActivation = readTargetActivation(data.targetActivation);
+  const observation = readSnapshotObservation(data.observation);
+  return publicSnapshotCaptureAnnotations({
+    ...(androidSnapshot
+      ? { androidSnapshot: androidSnapshot as AndroidSnapshotBackendMetadata }
+      : {}),
+    ...(quality ? { quality } : {}),
+    ...(qualityNotes ? { qualityNotes } : {}),
+    ...(warnings ? { warnings } : {}),
+    ...(targetActivation ? { targetActivation } : {}),
+    ...(observation ? { observation } : {}),
+  });
+}
+
+export function readSnapshotObservation(value: unknown): IosSnapshotObservation | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  return raw.mode === 'observe-only' &&
+    raw.activationPerformed === false &&
+    raw.appState === 'runningForeground' &&
+    raw.appStateSource === 'xcuiapplication-state'
+    ? {
+        mode: 'observe-only',
+        activationPerformed: false,
+        appState: raw.appState,
+        appStateSource: raw.appStateSource,
+      }
+    : undefined;
+}
+
+/** Re-read of a fact this module projected; the declared keys are the only ones it publishes. */
+function readTargetActivation(value: unknown): IosTargetActivation | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    !isDeclared(DECLARED_ACTIVATION_REASONS, raw.reason) ||
+    !isDeclared(DECLARED_ACTIVATION_PRIOR_STATES, raw.priorState)
+  ) {
+    return undefined;
+  }
+  const pid = raw.otherActiveApplicationPid;
+  return {
+    reason: raw.reason,
+    priorState: raw.priorState,
+    ...(Number.isSafeInteger(pid) && (pid as number) > 0
+      ? { otherActiveApplicationPid: pid as number }
+      : {}),
+  };
+}
+
+/**
+ * Re-read of a fact this module published, in the shape `readTargetActivation` above uses: the two
+ * names that decide presentation are checked, the rest is forwarded as published. capture-kit's
+ * `readSnapshotQualityVerdict` normalizes an untrusted runner payload field by field; the two
+ * readings are pinned to each other in `snapshot-quality-verdict.test.ts`.
+ */
+function readPublishedSnapshotQualityVerdict(value: unknown): SnapshotQualityVerdict | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Record<string, unknown>;
+  if (!isDeclared(DECLARED_STATES, raw.state) || !isDeclared(DECLARED_BACKENDS, raw.backend)) {
+    return undefined;
+  }
+  return raw as SnapshotQualityVerdict;
+}
+
+function isDeclared<Key extends string, Value>(
+  vocabulary: Record<Key, Value>,
+  value: unknown,
+): value is Key {
+  return typeof value === 'string' && Object.hasOwn(vocabulary, value);
+}
+
+function readObject(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+export function readSnapshotQualityNotes(value: unknown): SnapshotQualityNote[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const notes: SnapshotQualityNote[] = [];
+  for (const entry of value.slice(0, 1)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const raw = entry as Record<string, unknown>;
+    if (raw.code !== 'regular-geometry-clipped') continue;
+    if (
+      typeof raw.clippedNodeCount !== 'number' ||
+      !Number.isSafeInteger(raw.clippedNodeCount) ||
+      raw.clippedNodeCount < 0 ||
+      typeof raw.droppedNodeCount !== 'number' ||
+      !Number.isSafeInteger(raw.droppedNodeCount) ||
+      raw.droppedNodeCount < 0 ||
+      raw.clippedNodeCount + raw.droppedNodeCount === 0
+    )
+      continue;
+    notes.push({
+      code: raw.code,
+      clippedNodeCount: raw.clippedNodeCount,
+      droppedNodeCount: raw.droppedNodeCount,
+    });
+  }
+  return notes.length > 0 ? notes : undefined;
+}

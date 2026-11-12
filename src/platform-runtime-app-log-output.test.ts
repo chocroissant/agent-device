@@ -1,0 +1,248 @@
+import fs from 'node:fs';
+
+import path from 'node:path';
+import { withCommandHost } from '@agent-device/host-kit/command';
+import { afterEach, expect, test } from 'vitest';
+import { openAppLogOutput, readAppLogOutputTail } from './platform-runtime-app-log-output.ts';
+import { readRecentAppLogLines } from './platform-runtime-network-host.ts';
+import {
+  bindTestCommandHost,
+  createLiveTestHostEnvironment,
+  mkdtempForTestSync,
+} from '@agent-device/test-kit';
+
+bindTestCommandHost();
+
+const roots: string[] = [];
+
+afterEach(() => {
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('reads a bounded trusted app.log suffix and rejects paths outside sessions', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-output-');
+  roots.push(root);
+  const sessionsDir = path.join(root, 'sessions');
+  const sessionDir = path.join(sessionsDir, 'one');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const outputPath = path.join(sessionDir, 'app.log');
+  fs.writeFileSync(outputPath, 'before\nshared\n');
+
+  expect(await readAppLogOutputTail(sessionsDir, outputPath, 7)).toBe('shared\n');
+  await expect(
+    readAppLogOutputTail(sessionsDir, path.join(root, 'outside', 'app.log'), 10),
+  ).rejects.toThrow('outside the daemon-owned sessions directory');
+  await expect(
+    openAppLogOutput(
+      sessionsDir,
+      path.join(sessionDir, 'other.log'),
+      createLiveTestHostEnvironment(),
+    ),
+  ).rejects.toThrow('outside the daemon-owned sessions directory');
+});
+
+test('rejects a symlinked session directory that escapes the sessions root', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-symlink-');
+  roots.push(root);
+  const sessionsDir = path.join(root, 'sessions');
+  const outside = path.join(root, 'outside');
+  fs.mkdirSync(sessionsDir);
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(sessionsDir, 'linked'));
+  await expect(
+    openAppLogOutput(
+      sessionsDir,
+      path.join(sessionsDir, 'linked', 'app.log'),
+      createLiveTestHostEnvironment(),
+    ),
+  ).rejects.toThrow('resolves outside');
+});
+
+test('rejects a final app.log symlink before append and preserves the outside file', async () => {
+  const fixture = finalSymlinkFixture('append');
+  await expect(
+    openAppLogOutput(fixture.sessionsDir, fixture.outputPath, createLiveTestHostEnvironment()),
+  ).rejects.toThrow('symbolic link');
+  expect(fs.readFileSync(fixture.outsidePath, 'utf8')).toBe('outside-append');
+});
+
+test('rejects a final app.log symlink before tail read and preserves the outside file', async () => {
+  const fixture = finalSymlinkFixture('tail');
+  await expect(readAppLogOutputTail(fixture.sessionsDir, fixture.outputPath, 100)).rejects.toThrow(
+    'regular file',
+  );
+  expect(fs.readFileSync(fixture.outsidePath, 'utf8')).toBe('outside-tail');
+});
+
+test('aligns a bounded UTF-8 suffix to the first complete line', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-tail-');
+  roots.push(root);
+  const sessionsDir = path.join(root, 'sessions');
+  const sessionDir = path.join(sessionsDir, 'one');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  const outputPath = path.join(sessionDir, 'app.log');
+  fs.writeFileSync(outputPath, 'old\n🙂partial\nshared\n');
+
+  expect(await readAppLogOutputTail(sessionsDir, outputPath, 17)).toBe('shared\n');
+});
+
+test('rejects an asynchronous stream-open failure without an unhandled error', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-open-');
+  roots.push(root);
+  const sessionsDir = path.join(root, 'sessions');
+  const outputPath = path.join(sessionsDir, 'one', 'app.log');
+  fs.mkdirSync(outputPath, { recursive: true });
+
+  await expect(
+    openAppLogOutput(sessionsDir, outputPath, createLiveTestHostEnvironment()),
+  ).rejects.toThrow('regular file');
+});
+
+function finalSymlinkFixture(label: string) {
+  const root = mkdtempForTestSync(`agent-device-app-log-${label}-`);
+  roots.push(root);
+  const sessionsDir = path.join(root, 'sessions');
+  const sessionDir = path.join(sessionsDir, 'one');
+  const outsidePath = path.join(root, 'outside.log');
+  const outputPath = path.join(sessionDir, 'app.log');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  fs.writeFileSync(outsidePath, `outside-${label}`);
+  fs.symlinkSync(outsidePath, outputPath);
+  return { sessionsDir, outputPath, outsidePath };
+}
+
+test('redacts with the patterns of the command host, not the process', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-redact-');
+  roots.push(root);
+  const sessionsDir = path.join(root, 'sessions');
+  const outputPath = path.join(sessionsDir, 'one', 'app.log');
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+
+  await withCommandHost(
+    {
+      host: { env: { AGENT_DEVICE_APP_LOG_REDACT_PATTERNS: 'secret-\\d+' }, cwd: root },
+      requestEnv: undefined,
+    },
+    async () => {
+      const sink = await openAppLogOutput(sessionsDir, outputPath, {
+        env: { AGENT_DEVICE_APP_LOG_REDACT_PATTERNS: 'secret-\\d+' },
+        cwd: root,
+      });
+      await sink.write('token secret-42 leaked\n');
+      await sink[Symbol.asyncDispose]();
+    },
+  );
+
+  expect(fs.readFileSync(outputPath, 'utf8')).toBe('token [REDACTED] leaked\n');
+});
+
+test('keeps commas inside quantifiers and classes in one redaction pattern', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-redact-comma-');
+  const sessionsDir = path.join(root, 'sessions');
+  const outputPath = path.join(sessionsDir, 'one', 'app.log');
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+
+  const sink = await openAppLogOutput(sessionsDir, outputPath, {
+    env: { AGENT_DEVICE_APP_LOG_REDACT_PATTERNS: String.raw`token=\w{8,32}, pin=[0-9,]+,a\,b` },
+    cwd: root,
+  });
+  await sink.write('token=abcdefghij pin=1,2,3 a,b x{8\n');
+  await sink[Symbol.asyncDispose]();
+
+  expect(fs.readFileSync(outputPath, 'utf8')).toBe('[REDACTED] [REDACTED] [REDACTED] x{8\n');
+});
+
+test('refuses an invalid redaction pattern before it opens app.log', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-redact-invalid-');
+  const sessionsDir = path.join(root, 'sessions');
+  const outputPath = path.join(sessionsDir, 'one', 'app.log');
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+
+  await expect(
+    openAppLogOutput(sessionsDir, outputPath, {
+      env: { AGENT_DEVICE_APP_LOG_REDACT_PATTERNS: 'secret-\\d+,,(' },
+      cwd: root,
+    }),
+  ).rejects.toMatchObject({
+    code: 'INVALID_ARGS',
+    details: { reason: 'app_log_redact_pattern_invalid', patternIndex: 2 },
+  });
+  expect(fs.existsSync(outputPath)).toBe(false);
+});
+
+test('a brace that is not a quantifier does not hide the next redaction pattern', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-redact-brace-');
+  const sessionsDir = path.join(root, 'sessions');
+  const outputPath = path.join(sessionsDir, 'one', 'app.log');
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+
+  const sink = await openAppLogOutput(sessionsDir, outputPath, {
+    env: { AGENT_DEVICE_APP_LOG_REDACT_PATTERNS: '(1{,2),33,(4},5),66' },
+    cwd: root,
+  });
+  await sink.write('1{,2 4},5 33 66 kept\n');
+  await sink[Symbol.asyncDispose]();
+
+  expect(fs.readFileSync(outputPath, 'utf8')).toBe(
+    '[REDACTED] [REDACTED] [REDACTED] [REDACTED] kept\n',
+  );
+});
+
+test('rotates app.log when an open sink crosses the size cap', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-rotate-');
+  roots.push(root);
+  const sessionsDir = path.join(root, 'sessions');
+  const outputPath = path.join(sessionsDir, 'one', 'app.log');
+  const env = { AGENT_DEVICE_APP_LOG_MAX_BYTES: '100' };
+
+  const sink = await openAppLogOutput(sessionsDir, outputPath, { env, cwd: root });
+  for (let index = 0; index < 10; index += 1) {
+    await sink.write(`${String(index).padStart(2, '0')} ${'x'.repeat(36)}\n`);
+  }
+  await sink[Symbol.asyncDispose]();
+
+  const current = fs.readFileSync(outputPath, 'utf8');
+  const rotated = fs.readFileSync(`${outputPath}.1`, 'utf8');
+  expect(Buffer.byteLength(current)).toBeLessThan(100);
+  expect(Buffer.byteLength(rotated)).toBeGreaterThanOrEqual(100);
+  expect(current.endsWith(`09 ${'x'.repeat(36)}\n`)).toBe(true);
+});
+
+test('counts marker appends from another writer toward the size cap', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-rotate-marker-');
+  roots.push(root);
+  const sessionsDir = path.join(root, 'sessions');
+  const outputPath = path.join(sessionsDir, 'one', 'app.log');
+  const env = { AGENT_DEVICE_APP_LOG_MAX_BYTES: '100' };
+
+  const sink = await openAppLogOutput(sessionsDir, outputPath, { env, cwd: root });
+  await sink.write(`${'a'.repeat(39)}\n`);
+  // `logs mark` appends to the same file through its own descriptor.
+  fs.appendFileSync(outputPath, `${'m'.repeat(79)}\n`);
+  await sink.write(`${'b'.repeat(39)}\n`);
+  await sink[Symbol.asyncDispose]();
+
+  expect(fs.existsSync(`${outputPath}.1`)).toBe(true);
+  expect(fs.readFileSync(outputPath, 'utf8')).toBe('');
+});
+
+test('rotates when the final partial line flushed at disposal crosses the cap', async () => {
+  const root = mkdtempForTestSync('agent-device-app-log-rotate-dispose-');
+  roots.push(root);
+  const sessionsDir = path.join(root, 'sessions');
+  const outputPath = path.join(sessionsDir, 'one', 'app.log');
+  const env = { AGENT_DEVICE_APP_LOG_MAX_BYTES: '100' };
+
+  const sink = await openAppLogOutput(sessionsDir, outputPath, { env, cwd: root });
+  await sink.write('p'.repeat(120));
+  await sink[Symbol.asyncDispose]();
+
+  expect(fs.readFileSync(`${outputPath}.1`, 'utf8')).toBe('p'.repeat(120));
+  expect(fs.readFileSync(outputPath, 'utf8')).toBe('');
+  expect(await readRecentAppLogLines(outputPath, 10)).toEqual({
+    path: outputPath,
+    exists: true,
+    text: '',
+    skippedLines: 0,
+  });
+});

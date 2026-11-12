@@ -1,0 +1,116 @@
+import type { HostEnvironment } from '@agent-device/kernel/source-value';
+import { randomBytes } from 'node:crypto';
+import { createDaemonProxyServer } from '@agent-device/proxy';
+import { buildDaemonHttpBaseUrl } from '@agent-device/contracts/daemon-http';
+import { ensureProxyUpstreamDaemon } from '@agent-device/daemon-client';
+import { AppError } from '@agent-device/kernel/errors';
+import { colorize, supportsColor } from '@agent-device/command-output';
+import type { CliFlags } from '@agent-device/contracts/command';
+import { writeCommandOutput } from './shared.ts';
+import type { ClientCommandHandler } from './router-types.ts';
+
+type ProxyStartup = {
+  proxyBaseUrl: string;
+  agentDeviceBaseUrl: string;
+  token: string;
+  upstreamBaseUrl: string;
+  stateDir: string;
+};
+
+export const proxyCommand: ClientCommandHandler = async ({
+  positionals,
+  flags,
+  host: clientHost,
+}) => {
+  if (positionals.length > 0) {
+    throw new AppError('INVALID_ARGS', 'proxy does not accept positional arguments.');
+  }
+  const startup = await startProxy(flags, clientHost);
+  await writeCommandOutput(flags, startup, () => renderProxyStartup(startup));
+  await waitForever();
+  return true;
+};
+
+async function startProxy(flags: CliFlags, clientHost: HostEnvironment): Promise<ProxyStartup> {
+  const daemon = await ensureProxyUpstreamDaemon({ stateDir: flags.stateDir, host: clientHost });
+  const upstreamBaseUrl = resolveLocalDaemonBaseUrl(daemon.httpPort);
+  const token = resolveProxyClientToken(flags);
+  const server = createDaemonProxyServer({
+    upstreamBaseUrl,
+    upstreamToken: daemon.token,
+    clientToken: token,
+  });
+  const host = flags.proxyHost?.trim() || '127.0.0.1';
+  const port = flags.proxyPort ?? 0;
+  await listen(server, host, port);
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new AppError('COMMAND_FAILED', 'Proxy did not bind to a TCP address.');
+  }
+  const proxyBaseUrl = `http://${formatHostForUrl(address.address)}:${address.port}`;
+  return {
+    proxyBaseUrl,
+    agentDeviceBaseUrl: buildDaemonHttpBaseUrl(proxyBaseUrl),
+    token,
+    upstreamBaseUrl,
+    stateDir: daemon.stateDir,
+  };
+}
+
+function resolveLocalDaemonBaseUrl(httpPort: number | undefined): string {
+  if (!httpPort) {
+    throw new AppError('COMMAND_FAILED', 'Local daemon HTTP endpoint is unavailable.', {
+      hint: 'Retry after cleaning daemon state, or run proxy with a fresh --state-dir.',
+    });
+  }
+  return `http://127.0.0.1:${httpPort}`;
+}
+
+function resolveProxyClientToken(flags: CliFlags): string {
+  return flags.daemonAuthToken?.trim() || randomBytes(32).toString('hex');
+}
+
+function listen(server: ReturnType<typeof createDaemonProxyServer>, host: string, port: number) {
+  return new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+}
+
+function formatHostForUrl(host: string): string {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
+export function renderProxyStartup(
+  startup: ProxyStartup,
+  options: { useColor?: boolean } = {},
+): string {
+  const useColor = options.useColor ?? supportsColor(process.env, process.stdout);
+  const checkmark = formatProxyOutputValue('✓', 'green', useColor);
+  const proxyBaseUrl = formatProxyOutputValue(startup.proxyBaseUrl, 'cyan', useColor);
+  const daemonBaseUrl = formatProxyOutputValue('<tunnel URL>', 'cyan', useColor);
+  const token = formatProxyOutputValue(startup.token, 'yellow', useColor);
+  return [
+    `${checkmark} Proxy listening at ${proxyBaseUrl}`,
+    '',
+    'Provide this to the agent-device instance connecting:',
+    '',
+    `Daemon base URL: ${daemonBaseUrl}`,
+    `Daemon auth token: ${token}`,
+  ].join('\n');
+}
+
+function formatProxyOutputValue(
+  value: string,
+  format: Parameters<typeof colorize>[1],
+  useColor: boolean,
+): string {
+  return useColor ? colorize(value, format, { validateStream: false }) : value;
+}
+
+function waitForever(): Promise<never> {
+  return new Promise(() => {});
+}

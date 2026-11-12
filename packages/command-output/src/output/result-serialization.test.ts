@@ -1,0 +1,139 @@
+import { test } from 'vitest';
+import assert from 'node:assert/strict';
+import {
+  serializeInstallFromSourceResult,
+  serializeOpenResult,
+  serializeSessionListEntry,
+} from './result-serialization.ts';
+
+test('serializeSessionListEntry preserves legacy android session payload shape', () => {
+  const data = serializeSessionListEntry({
+    name: 'qa',
+    createdAt: 123,
+    device: {
+      platform: 'android',
+      target: 'mobile',
+      id: 'emulator-5554',
+      name: 'Pixel 9',
+      identifiers: {
+        session: 'qa',
+        deviceId: 'emulator-5554',
+        deviceName: 'Pixel 9',
+        serial: 'emulator-5554',
+      },
+      android: {
+        serial: 'emulator-5554',
+      },
+    },
+    identifiers: {
+      session: 'qa',
+      deviceId: 'emulator-5554',
+      deviceName: 'Pixel 9',
+      serial: 'emulator-5554',
+    },
+  });
+
+  assert.deepEqual(data, {
+    name: 'qa',
+    platform: 'android',
+    target: 'mobile',
+    device: 'Pixel 9',
+    id: 'emulator-5554',
+    createdAt: 123,
+  });
+});
+
+test('serializeOpenResult includes android serial for open payloads', () => {
+  const data = serializeOpenResult({
+    session: 'qa',
+    device: {
+      platform: 'android',
+      target: 'mobile',
+      id: 'emulator-5554',
+      name: 'Pixel 9',
+      identifiers: {
+        session: 'qa',
+        deviceId: 'emulator-5554',
+        deviceName: 'Pixel 9',
+        serial: 'emulator-5554',
+      },
+      android: {
+        serial: 'emulator-5554',
+      },
+    },
+    identifiers: {
+      session: 'qa',
+      deviceId: 'emulator-5554',
+      deviceName: 'Pixel 9',
+      serial: 'emulator-5554',
+    },
+  });
+
+  assert.deepEqual(data, {
+    session: 'qa',
+    platform: 'android',
+    target: 'mobile',
+    device: 'Pixel 9',
+    id: 'emulator-5554',
+    serial: 'emulator-5554',
+    message: 'Opened: qa',
+  });
+});
+
+test('serializeOpenResult carries an answered launch confirmation', () => {
+  const data = serializeOpenResult({
+    session: 'qa',
+    appBundleId: 'com.example.app',
+    launchConfirmation: 'accepted',
+    identifiers: { session: 'qa', appId: 'com.example.app', appBundleId: 'com.example.app' },
+  });
+
+  assert.equal(data.launchConfirmation, 'accepted');
+});
+
+test('serializeOpenResult carries an unanswered launch confirmation with its reason', () => {
+  const data = serializeOpenResult({
+    session: 'qa',
+    appBundleId: 'com.example.app',
+    launchConfirmation: 'unanswered',
+    launchConfirmationReason: 'alert-unrecognized',
+    identifiers: { session: 'qa', appId: 'com.example.app', appBundleId: 'com.example.app' },
+  });
+
+  assert.equal(data.launchConfirmation, 'unanswered');
+  assert.equal(data.launchConfirmationReason, 'alert-unrecognized');
+});
+
+test('serializeOpenResult carries a probe-failure step without any confirmation outcome', () => {
+  const data = serializeOpenResult({
+    session: 'qa',
+    appBundleId: 'com.example.app',
+    launchConfirmationProbeFailure: 'runner',
+    identifiers: { session: 'qa', appId: 'com.example.app', appBundleId: 'com.example.app' },
+  });
+
+  assert.equal(data.launchConfirmationProbeFailure, 'runner');
+  assert.equal('launchConfirmation' in data, false);
+  assert.equal('launchConfirmationReason' in data, false);
+});
+
+test('serializeInstallFromSourceResult uses install-family package naming', () => {
+  const data = serializeInstallFromSourceResult({
+    launchTarget: 'com.example.demo',
+    appName: 'Demo',
+    appId: 'com.example.demo',
+    packageName: 'com.example.demo',
+    identifiers: {
+      appId: 'com.example.demo',
+      package: 'com.example.demo',
+    },
+  });
+
+  assert.deepEqual(data, {
+    launchTarget: 'com.example.demo',
+    appName: 'Demo',
+    appId: 'com.example.demo',
+    package: 'com.example.demo',
+    message: 'Installed: Demo',
+  });
+});

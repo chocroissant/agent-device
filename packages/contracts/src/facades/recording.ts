@@ -1,0 +1,22 @@
+export {
+  DEFAULT_RECORDING_EXPORT_QUALITY,
+  RECORDING_EXPORT_QUALITIES,
+  isRecordingExportQuality,
+  recordingQualityInputToExportQuality,
+} from '../recording-export-quality.ts';
+export type { RecordingExportQuality } from '../recording-export-quality.ts';
+export {
+  RECORDING_SCOPE_VALUES,
+  TRACE_ACTION_REQUIRED_MESSAGE,
+  parseTraceAction,
+  isRecordingScope,
+  isWholeScreenRecordingScope,
+} from '../recording-scope.ts';
+export type { RecordingScope } from '../recording-scope.ts';
+export type {
+  RecordingAppIdentity,
+  RecordingCommandResult,
+  RecordingStartCommandResult,
+  RecordingStopCommandResult,
+  TraceCommandResult,
+} from '../recording.ts';

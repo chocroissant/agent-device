@@ -1,0 +1,554 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import {
+  assertCatalogComplete,
+  CHECK_CATALOG,
+  fullCheckPlan,
+  getCheckSpec,
+  resolveCommand,
+} from './checks.ts';
+import { ALL_CHECKS, selectChecks, type CheckId, type SelectInput } from './model.ts';
+import { packageEntrySources } from '../build-entries.ts';
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const PACKAGE_ENTRY_FILES = packageEntrySources(
+  (
+    JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as {
+      exports: Record<string, { import?: string }>;
+    }
+  ).exports,
+);
+
+function plan(changedFiles: string[], extra: Partial<SelectInput> = {}) {
+  return selectChecks({
+    changedFiles,
+    packageEntryFiles: PACKAGE_ENTRY_FILES,
+    ...extra,
+  });
+}
+
+function ids(changedFiles: string[]): CheckId[] {
+  return plan(changedFiles).checks;
+}
+
+test('production source selects static/build gates, related tests, and the full unit suite', () => {
+  const result = plan(['packages/selectors/src/index.ts']);
+  assert.equal(result.failOpen, false);
+  for (const id of [
+    'format',
+    'lint',
+    'typecheck',
+    'layering',
+    'build',
+    'vitest-related',
+    'unit',
+  ] as const) {
+    assert.ok(result.checks.includes(id), `expected ${id}`);
+  }
+  assert.ok(!result.checks.includes('provider-integration'));
+  // Every selected check documents why it was chosen.
+  for (const id of result.checks) {
+    assert.ok(result.reasons.some((reason) => reason.check === id));
+  }
+});
+
+test('any production source selects the unit suite whose gates read sources as text', () => {
+  for (const file of [
+    'src/cli.ts',
+    'packages/daemon/src/index.ts',
+    'packages/kernel/src/errors.ts',
+  ]) {
+    const result = plan([file]);
+    assert.ok(
+      result.reasons.some(
+        (reason) => reason.check === 'unit' && reason.rule === 'own:unit-text-gates',
+      ),
+      file,
+    );
+  }
+});
+
+test('platform package source additionally selects provider-integration', () => {
+  const result = ids(['packages/platform-apple/src/core/app-resolution.ts']);
+  assert.ok(result.includes('provider-integration'));
+  assert.ok(result.includes('coverage'));
+  assert.ok(result.includes('vitest-related'));
+});
+
+test('unit test files delegate affected-test discovery to Vitest', () => {
+  const result = ids(['packages/daemon/src/selectors.test.ts']);
+  assert.ok(result.includes('vitest-related'));
+  assert.ok(!result.includes('unit'));
+  assert.ok(!result.includes('provider-integration'));
+});
+
+test('Vitest owns project and support-module relationships through one check', () => {
+  for (const file of [
+    'test/integration/provider-scenarios/foo.test.ts',
+    'test/integration/provider-scenarios/fixtures.ts',
+    'test/integration/interaction-contract/fixtures.ts',
+    'test/output-economy/fixtures.ts',
+    'src/__tests__/test-utils/session.ts',
+  ]) {
+    assert.ok(ids([file]).includes('vitest-related'), `expected Vitest ownership for ${file}`);
+  }
+});
+
+test('root node-integration support modules select the node integration suite', () => {
+  assert.ok(ids(['test/integration/test-helpers.ts']).includes('integration-node'));
+});
+
+test('the shared coverage declaration table selects the node integration suite and the macOS lane', () => {
+  const result = ids(['test/integration/command-coverage/declarations.ts']);
+  assert.ok(result.includes('integration-node'), 'expected integration-node ownership');
+  assert.ok(result.includes('macos-coverage'), 'expected macos-coverage ownership');
+  assert.ok(
+    !result.includes('vitest-related'),
+    'declarations.ts is resolved by node --test, not by Vitest',
+  );
+});
+
+test('android-adb stub test delegates project ownership to Vitest', () => {
+  const result = ids(['packages/platform-android/src/__tests__/notifications.test.ts']);
+  assert.ok(result.includes('vitest-related'));
+});
+
+test('Swift runner change selects both XCUITest platform builds', () => {
+  // Each platform build is its own gate in its own lane, so a Swift change owns both.
+  // (The Apple device lanes ride along: the runner is what those lanes boot — device-lanes.ts.)
+  assert.deepEqual(ids(['apple/runner/Sources/Runner/Main.swift']), [
+    'native-dupes',
+    'swift-runner-ios',
+    'swift-runner-macos',
+    'packaged-runner-swift',
+    'replay-ios',
+    'replay-ios-device',
+    'replay-macos',
+  ]);
+  assert.ok(ids(['packages/platform-apple/src/core/Support.swift']).includes('swift-runner-ios'));
+});
+
+test('a runner XCTest source also selects the test-list and package-source check', () => {
+  // Distinct from the rule above, which owns Swift *anywhere*: renaming a method under
+  // AgentDeviceRunnerUITests/ silently shrinks ios.yml's hand-written `-only-testing:` list
+  // (#1781 A7), and the platform builds cannot see that — they compile fine either way.
+  assert.deepEqual(
+    ids(['apple/runner/AgentDeviceRunner/AgentDeviceRunnerUITests/RunnerTests+Alert.swift']),
+    [
+      'native-dupes',
+      'swift-runner-ios',
+      'swift-runner-macos',
+      'xctest-selection',
+      'packaged-runner-swift',
+      'replay-ios',
+      'replay-ios-device',
+      'replay-macos',
+    ],
+  );
+  // The bug the file filter used to have: membership is the directory, not the name.
+  assert.ok(
+    ids([
+      'apple/runner/AgentDeviceRunner/AgentDeviceRunnerUITests/RunnerTapPointPolicy.swift',
+    ]).includes('xctest-selection'),
+  );
+  // Swift elsewhere in the runner still selects only the builds.
+  assert.ok(!ids(['apple/runner/Sources/Runner/Main.swift']).includes('xctest-selection'));
+});
+
+test('the scripts that rewrite runner Swift select the packaged-source check', () => {
+  // Every packaged byte comes out of these two, and the rewrite they perform is invisible to
+  // every other gate: no repo target compiles dist/apple/runner/**.
+  for (const file of [
+    'scripts/package-apple-runner-source.mjs',
+    'scripts/strip-swift-comments.mjs',
+  ]) {
+    assert.ok(ids([file]).includes('packaged-runner-swift'), file);
+  }
+  // Runner Swift outside the XCTest directory owns it too — the packager rewrites all of it.
+  assert.ok(ids(['apple/runner/Sources/Runner/Main.swift']).includes('packaged-runner-swift'));
+});
+
+test('the shared foreground geometry header selects the Apple runner builds', () => {
+  // The runner's event bridge includes this bridge header by relative path, so its bytes change
+  // the compiled runner on both platform lanes; a change nothing builds cannot be reviewed safely.
+  for (const check of [
+    'swift-runner-ios',
+    'swift-runner-macos',
+    'packaged-runner-swift',
+  ] as const) {
+    assert.ok(
+      ids(['apple/snapshot-bridge/ForegroundApplicationGeometry.h']).includes(check),
+      check,
+    );
+  }
+});
+
+test('Android helper change selects the android-helpers build', () => {
+  assert.deepEqual(ids(['android/snapshot-helper/src/Main.kt']), [
+    'native-dupes',
+    'android-helpers',
+    'replay-android',
+  ]);
+  assert.deepEqual(ids(['android/ime-helper/AndroidManifest.xml']), [
+    'native-dupes',
+    'android-helpers',
+    'replay-android',
+  ]);
+});
+
+test('Android package test fixture selects the unit suite instead of failing open', () => {
+  const fixture =
+    'packages/platform-android/src/__tests__/test-utils/fixtures/android-helper-apk.fixture';
+  const result = plan([fixture]);
+  assert.equal(result.failOpen, false);
+  assert.deepEqual(result.checks, ['unit']);
+  assert.deepEqual(
+    result.reasons.filter((reason) => reason.rule === 'own:android-package-test-fixture'),
+    [
+      {
+        check: 'unit',
+        path: fixture,
+        rule: 'own:android-package-test-fixture',
+        detail: 'Android package test fixtures are consumed by the unit suite',
+      },
+    ],
+  );
+});
+
+test('colocated Android binary fixtures select the unit suite instead of failing open', () => {
+  const fixtures = [
+    'packages/platform-android/src/fixtures/android-manifest-binary.fixture',
+    'packages/platform-android/src/fixtures/android-manifest-apk.apk',
+  ];
+  const result = plan(fixtures);
+  assert.equal(result.failOpen, false);
+  assert.deepEqual(result.checks, ['unit']);
+  assert.deepEqual(
+    result.reasons.map((reason) => reason.path),
+    fixtures,
+  );
+  // The rule is scoped to the Android package: the same shape elsewhere stays unowned.
+  assert.equal(
+    plan(['packages/platform-harmonyos/src/fixtures/android-manifest-binary.fixture']).failOpen,
+    true,
+  );
+});
+
+test('MCP metadata change selects the mcp-metadata check and the site build that serves it', () => {
+  assert.deepEqual(ids(['server.json']), ['mcp-metadata', 'docs-links']);
+});
+
+test('every package export maps to an existing build entry source', () => {
+  assert.ok(PACKAGE_ENTRY_FILES.includes('src/sdk/index.ts'));
+  for (const file of PACKAGE_ENTRY_FILES) {
+    assert.ok(fs.existsSync(path.join(repoRoot, file)), `${file} does not exist`);
+  }
+});
+
+test('public package surface change selects the build and the published-package gate via exports', () => {
+  const result = ids(['src/sdk/index.ts']);
+  assert.ok(result.includes('build'));
+  // A public entry is the one surface a consumer resolves by name, so building it is not enough:
+  // check:package proves it still imports from an install with no workspace links.
+  assert.ok(result.includes('package'));
+  assert.ok(ids(['src/ai-sdk/index.ts']).includes('package'));
+});
+
+test('docs-only change selects no checks and records the docs paths', () => {
+  const result = plan(['docs/adr/README.md', 'LICENSE', 'website/page.mdx.md']);
+  assert.equal(result.failOpen, false);
+  assert.deepEqual(result.checks, []);
+  assert.equal(result.docsOnlyPaths.length, 3);
+});
+
+test('user docs pages and README select the docs-links and docs-prose checks', () => {
+  for (const file of [
+    'README.md',
+    'website/docs/index.md',
+    'website/docs/docs/sessions.md',
+    'website/docs/404.mdx',
+  ]) {
+    const result = plan([file]);
+    assert.deepEqual(result.checks, ['docs-links', 'docs-prose'], file);
+    assert.deepEqual(result.docsOnlyPaths, []);
+  }
+  for (const file of [
+    'website/package.json',
+    'website/astro.config.mjs',
+    'website/src/content.config.ts',
+  ]) {
+    assert.deepEqual(plan([file]).checks, ['docs-links'], file);
+  }
+  assert.deepEqual(plan(['website/docs/docs/commands.md']).checks, [
+    'command-docs',
+    'docs-links',
+    'docs-prose',
+  ]);
+  // The capabilities page carries generated facts as well as prose, so it owns the
+  // drift gate on top of the prose and link gates.
+  assert.deepEqual(plan(['website/docs/docs/capabilities.md']).checks, [
+    'capabilities-matrix',
+    'docs-links',
+    'docs-prose',
+  ]);
+  assert.deepEqual(plan(['website/docs/public/logo.svg']).checks, []);
+});
+
+test('agent guidance owns its focused contract instead of disappearing as docs-only', () => {
+  for (const file of ['AGENTS.md', 'CONTEXT.md', 'docs/agents/testing.md', 'docs/adr/FORMAT.md']) {
+    const result = plan([file]);
+    assert.deepEqual(result.checks, ['agent-guidance']);
+    assert.deepEqual(result.docsOnlyPaths, []);
+  }
+});
+
+test('an ADR record owns the citation guard instead of disappearing as docs-only', () => {
+  const result = plan(['docs/adr/0011-interactive-replay.md']);
+  assert.deepEqual(result.checks, ['adr-citations']);
+  assert.deepEqual(result.docsOnlyPaths, []);
+});
+
+test('test app source selects root lint and format plus its isolated typecheck', () => {
+  const result = plan(['examples/test-app/app/index.tsx']);
+  assert.equal(result.failOpen, false);
+  // Plus the mobile lanes that install the fixture app it builds (device-lanes.ts).
+  assert.deepEqual(result.checks, [
+    'format',
+    'lint',
+    'test-app-typecheck',
+    'replay-ios',
+    'replay-ios-device',
+    'replay-android',
+  ]);
+});
+
+test('the image-size parser mitigation is selected when its defining files change', () => {
+  for (const file of [
+    'examples/test-app/patches/image-size@1.2.1.patch',
+    'examples/test-app/security/image-size-security.test.mjs',
+    'examples/test-app/pnpm-workspace.yaml',
+  ]) {
+    const result = plan([file]);
+    assert.equal(result.failOpen, false, `${file} must not fail open`);
+    assert.ok(
+      result.checks.includes('test-app-security'),
+      `expected test-app-security for ${file}`,
+    );
+  }
+});
+
+test('unknown path fails open to the full check set', () => {
+  const result = plan(['fixtures/unknown.data']);
+  assert.equal(result.failOpen, true);
+  assert.deepEqual(result.checks, [...ALL_CHECKS]);
+  assert.equal(result.failOpenReasons[0]?.rule, 'unknown-path');
+});
+
+test('a payload capture inside a package selects the unit lane', () => {
+  // Recorded tool responses checked in beside the module that parses them (#2683). Before this rule
+  // a capture edit failed the gate open, which punished adding evidence rather than the absence of it.
+  for (const file of [
+    'packages/platform-apple/src/core/__tests__/fixtures/ios-device-info-details.json',
+    'packages/platform-apple/src/snapshot-source/fixtures/wire-vocabulary.json',
+  ]) {
+    const result = plan([file]);
+    assert.equal(result.failOpen, false, file);
+    assert.ok(result.checks.includes('unit'), file);
+    assert.ok(
+      result.reasons.some((reason) => reason.rule === 'own:package-capture'),
+      file,
+    );
+  }
+});
+
+test('a non-.ts fixture under an owned root fails open (format alone is not ownership)', () => {
+  const result = plan(['test/integration/provider-scenarios/fixtures/device.json']);
+  assert.equal(result.failOpen, true);
+  assert.deepEqual(result.checks, [...ALL_CHECKS]);
+  assert.equal(result.failOpenReasons[0]?.rule, 'ambiguous-path');
+});
+
+test('a frozen replay-compat corpus script selects the unit lane and the provenance verifier', () => {
+  const result = plan(['test/replay-compat/scripts/examples/gesture-lab.v0.16.8.ad']);
+  assert.equal(result.failOpen, false);
+  assert.ok(result.checks.includes('unit'));
+  assert.ok(result.checks.includes('replay-compat'));
+});
+
+test('a replay-compat manifest edit selects the provenance verifier', () => {
+  const result = plan(['test/replay-compat/manifest.ts']);
+  assert.equal(result.failOpen, false);
+  assert.ok(result.checks.includes('replay-compat'));
+});
+
+test('skills guidance change is docs-only', () => {
+  const result = plan(['skills/agent-device/SKILL.md']);
+  assert.equal(result.failOpen, false);
+  assert.deepEqual(result.docsOnlyPaths, ['skills/agent-device/SKILL.md']);
+  assert.deepEqual(result.checks, []);
+});
+
+test('workspace package source selects static gates, fallow, layering, and the build', () => {
+  for (const file of [
+    'packages/kernel/src/errors.ts',
+    'packages/contracts/src/facades/device.ts',
+    'packages/capture-kit/src/app-log-live-handle.ts',
+  ]) {
+    const result = plan([file]);
+    assert.equal(result.failOpen, false, file);
+    for (const id of [
+      'format',
+      'lint',
+      'typecheck',
+      // Package source is inside fallow's scope; an extraction into packages/
+      // must not take a symbol's dead-code coverage with it.
+      'fallow',
+      'layering',
+      'build',
+      'vitest-related',
+    ] as const) {
+      assert.ok(result.checks.includes(id), `expected ${id} for ${file}`);
+    }
+  }
+});
+
+test('a workspace package manifest fails open — it rewires resolution globally', () => {
+  const result = plan(['packages/kernel/package.json']);
+  assert.equal(result.failOpen, true);
+  assert.equal(result.failOpenReasons[0]?.rule, 'workflow-tooling');
+});
+
+test('workflow/tooling and selector implementation changes fail open', () => {
+  assert.equal(plan(['.github/workflows/ci.yml']).failOpenReasons[0]?.rule, 'workflow-tooling');
+  assert.equal(plan(['package.json']).failOpenReasons[0]?.rule, 'workflow-tooling');
+  assert.equal(plan(['vitest.config.ts']).failOpenReasons[0]?.rule, 'workflow-tooling');
+  assert.equal(
+    plan(['scripts/check-affected/model.ts']).failOpenReasons[0]?.rule,
+    'selector-owning',
+  );
+  assert.deepEqual(plan(['docs/agents/testing.md']).checks, ['agent-guidance']);
+});
+
+test('a fail-open path in a mixed changeset forces the full set', () => {
+  const result = plan(['packages/selectors/src/index.ts', 'bin/agent-device.mjs']);
+  assert.equal(result.failOpen, true);
+  assert.deepEqual(result.checks, [...ALL_CHECKS]);
+});
+
+test('empty changeset selects nothing', () => {
+  const result = plan([]);
+  assert.equal(result.failOpen, false);
+  assert.deepEqual(result.checks, []);
+});
+
+test('catalog covers exactly the CheckId universe', () => {
+  assert.doesNotThrow(assertCatalogComplete);
+});
+
+test('every catalog command resolves against the real package scripts', () => {
+  // Against package.json rather than a fixture map: a fixture has to be updated by
+  // hand for every new gate, which is exactly the drift the registry exists to stop.
+  const scripts = (
+    JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as {
+      scripts: Record<string, string>;
+    }
+  ).scripts;
+  for (const spec of CHECK_CATALOG) {
+    assert.ok(resolveCommand(spec, scripts, 'origin/main').length >= 2, `${spec.id} must resolve`);
+  }
+  const fallow = CHECK_CATALOG.find((spec) => spec.id === 'fallow')!;
+  assert.deepEqual(resolveCommand(fallow, scripts, 'origin/dev'), [
+    'pnpm',
+    'run',
+    'check:fallow',
+    '--base',
+    'origin/dev',
+  ]);
+  assert.deepEqual(resolveCommand(fallow, scripts, undefined), ['pnpm', 'run', 'check:fallow']);
+});
+
+test('the full plan is the catalog without vitest-related, host-locked suites last', () => {
+  const { checks, failOpen } = fullCheckPlan();
+  assert.equal(failOpen, false);
+  assert.deepEqual(
+    [...checks].sort(),
+    CHECK_CATALOG.map((spec) => spec.id)
+      .filter((id) => id !== 'vitest-related')
+      .sort(),
+  );
+  const firstLocked = checks.findIndex((id) => getCheckSpec(id).hostLocked);
+  assert.ok(firstLocked > 0);
+  assert.ok(checks.slice(firstLocked).every((id) => getCheckSpec(id).hostLocked));
+});
+
+test('a missing package script makes command resolution throw', () => {
+  const spec = CHECK_CATALOG.find((entry) => entry.id === 'lint')!;
+  assert.throws(() => resolveCommand(spec, {}, 'origin/main'), /does not exist/);
+});
+
+test('unit and coverage checks preserve their package-script owners', () => {
+  const scripts = { 'check:unit': 'x', 'check:coverage-changed': 'x' };
+  const unit = CHECK_CATALOG.find((entry) => entry.id === 'unit')!;
+  const coverage = CHECK_CATALOG.find((entry) => entry.id === 'coverage')!;
+  assert.deepEqual(resolveCommand(unit, scripts, 'origin/main'), ['pnpm', 'run', 'check:unit']);
+  assert.deepEqual(resolveCommand(coverage, scripts, 'origin/main'), [
+    'pnpm',
+    'run',
+    'check:coverage-changed',
+  ]);
+});
+
+test('vitest-related delegates changed paths to Vitest instead of modeling projects', () => {
+  const related = CHECK_CATALOG.find((entry) => entry.id === 'vitest-related')!;
+  assert.deepEqual(
+    resolveCommand(related, {}, 'origin/main', {
+      changedFiles: ['src/a.ts', 'test/fixture.ts'],
+      unitSuiteRuns: false,
+    }),
+    [
+      'pnpm',
+      'exec',
+      'vitest',
+      'related',
+      '--run',
+      '--passWithNoTests',
+      'src/a.ts',
+      'test/fixture.ts',
+    ],
+  );
+  assert.equal(
+    resolveCommand(related, {}, 'origin/main', {
+      changedFiles: ['src/a.ts'],
+      unitSuiteRuns: true,
+    }).some((arg) => arg.startsWith('--maxWorkers=')),
+    false,
+    'worker sizing belongs to vitest.config.ts',
+  );
+});
+
+test('every configured scan root selects native duplication regardless of extension', () => {
+  const config: { path: string[] } = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, '.jscpd-native.json'), 'utf8'),
+  );
+  for (const root of config.path) {
+    for (const extension of ['mm', 'future']) {
+      const file = path.posix.join(root, 'duplication-probe', `Source.${extension}`);
+      assert.ok(
+        plan([file]).reasons.some(
+          (entry) => entry.check === 'native-dupes' && entry.rule === 'own:native-dupes',
+        ),
+        file,
+      );
+    }
+    const neighbor = path.posix.join(`${root}-neighbor`, 'Source.mm');
+    assert.ok(!plan([neighbor]).reasons.some((entry) => entry.rule === 'own:native-dupes'));
+  }
+  assert.ok(!ids(['packages/platform-apple/src/core/app-resolution.ts']).includes('native-dupes'));
+  for (const file of ['.jscpd-native.json', 'native-dupes-baseline.json']) {
+    assert.equal(plan([file]).failOpen, true);
+    assert.ok(ids([file]).includes('native-dupes-model'), file);
+  }
+});

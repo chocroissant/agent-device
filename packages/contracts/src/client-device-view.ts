@@ -1,0 +1,122 @@
+// The public API vocabulary for what a device and an open session look like to a client.
+
+import type {
+  AppleOS,
+  BootPickPolicy,
+  DeviceKind,
+  DeviceTarget,
+  PublicPlatform,
+} from '@agent-device/kernel/device';
+import type { AgentDeviceIdentifiers, DeviceCommandBaseOptions } from './client-connection.ts';
+
+export type AgentDeviceDevice = {
+  platform: PublicPlatform;
+  target: DeviceTarget;
+  kind: DeviceKind;
+  id: string;
+  name: string;
+  booted?: boolean;
+  /**
+   * Additive Apple-OS discriminant (iPhone/iPad/tvOS/visionOS/macOS). Present only for
+   * Apple devices; `platform` still carries the leaf (`ios`/`macos`).
+   */
+  appleOs?: AppleOS;
+  /** Hardware model, for example `iPhone 17 Pro` or `Pixel 9`, when discovery reports it. */
+  model?: string;
+  /** OS version, for example `26.1` or `16`, when discovery reports it. */
+  osVersion?: string;
+  identifiers: AgentDeviceIdentifiers;
+  /**
+   * Present when a host-local device claim currently blocks foreign use of
+   * this device (#1320). Provably dead owners are not projected — the next
+   * open reconciles and replaces them automatically.
+   */
+  claimedBy?: {
+    session: string;
+    workspace: string;
+  };
+  ios?: {
+    udid: string;
+  };
+  android?: {
+    serial: string;
+  };
+  harmonyos?: {
+    serial: string;
+  };
+  vega?: {
+    serial: string;
+  };
+};
+
+export type AgentDeviceCapabilitiesResult = {
+  device: AgentDeviceDevice;
+  availableCommands: string[];
+  targetReadiness?: { press: 'bounded-geometry' };
+};
+
+export type AgentDeviceSessionDevice = {
+  platform: PublicPlatform;
+  target: DeviceTarget;
+  id: string;
+  name: string;
+  /**
+   * Additive Apple-OS discriminant (iPhone/iPad/tvOS/visionOS/macOS). Present only for
+   * Apple devices; `platform` still carries the leaf (`ios`/`macos`).
+   */
+  appleOs?: AppleOS;
+  identifiers: AgentDeviceIdentifiers;
+  ios?: {
+    udid: string;
+    simulatorSetPath?: string | null;
+  };
+  android?: {
+    serial: string;
+  };
+  harmonyos?: {
+    serial: string;
+  };
+  vega?: {
+    serial: string;
+  };
+};
+
+export type AgentDeviceSession = {
+  name: string;
+  /**
+   * The exact value `--session` must carry to address this session, which is not always `name`:
+   * a session opened without `--session` is named `default` but stored — and addressed — as
+   * `cwd:<hash>:default` (#2031/#1394). Optional only because a daemon older than the field does
+   * not send it.
+   */
+  address?: string;
+  createdAt: number;
+  sessionStateDir?: string;
+  runnerLogPath?: string;
+  device: AgentDeviceSessionDevice;
+  identifiers: AgentDeviceIdentifiers;
+};
+
+export type StartupPerfSample = {
+  durationMs: number;
+  measuredAt: string;
+  method: string;
+  appTarget?: string;
+  appBundleId?: string;
+};
+
+export type DeviceBootOptions = DeviceCommandBaseOptions & {
+  headless?: boolean;
+  /**
+   * When the request names no device and several equally preferred devices match, all shut down,
+   * boot one instead of failing with `AMBIGUOUS_MATCH`. `newest`: mobile over TV, newest OS
+   * version, then the first name in name order, with numbers compared by value; that is not device
+   * age (stopped Android AVDs report no OS version, so the name decides). Several booted matches
+   * still fail. `selection.reason` reports the pick.
+   */
+  pick?: BootPickPolicy;
+  /** Startup budget in milliseconds: bounds the boot wait on a cold Simulator or emulator. */
+  timeoutMs?: number;
+};
+
+export type DeviceShutdownOptions = DeviceCommandBaseOptions;

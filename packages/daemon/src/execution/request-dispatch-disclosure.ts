@@ -1,0 +1,80 @@
+import type { DaemonResponse } from '@agent-device/kernel/contracts';
+import {
+  type AppError,
+  asAppError,
+  detailsAfterDispatchedSteps,
+  discloseDispatch,
+  type ErrorWireDetails,
+  BOUNDED_COMPOSITE_RESOURCE_UNSUPPORTED_REASON,
+} from '@agent-device/kernel/errors';
+import { resolveCommandDispatchDisclosure } from '@agent-device/command-registry/registry';
+import type { DaemonRequest } from '../core/daemon-request.ts';
+import type { RequestDispatchLedger } from '../core/request-dispatch-ledger.ts';
+
+type CommandDispatchVerdict = ReturnType<typeof resolveCommandDispatchDisclosure>;
+
+/**
+ * The daemon's verdict around one request. Once the request's ledger holds a returned mutation, its
+ * failure is `unknown` with the sent count added to `details.dispatchedSteps`, except that a typed
+ * composite resource refusal keeps `no` for its current step. Before that, the registry's
+ * {@link resolveCommandDispatchDisclosure} decides: a read is `no` over any producer verdict,
+ * because a resend repeats no app-visible action; a mutation keeps a producer verdict and is
+ * `unknown` when no producer classified the failure; any other command passes through. A
+ * delegating composite (`batch`, `replay`, `test`) passes through too: each nested request
+ * discloses itself, and a sent nested mutation makes the ledger nonzero.
+ */
+export async function discloseRequestDispatch<Response extends DaemonResponse | null>(
+  req: DaemonRequest,
+  ledger: RequestDispatchLedger,
+  dispatch: () => Promise<Response>,
+): Promise<Response> {
+  const verdict = resolveCommandDispatchDisclosure(req);
+  try {
+    const response = await dispatch();
+    if (!response || response.ok) return response;
+    const details = disclosedDetails(verdict, response.error.details, ledger);
+    if (details === response.error.details) return response;
+    return { ...response, error: { ...response.error, details } };
+  } catch (error) {
+    const failure = asAppError(error);
+    const details = disclosedDetails(verdict, failure.details, ledger);
+    if (details === failure.details) throw error;
+    failure.details = details;
+    throw failure;
+  }
+}
+
+function disclosedDetails(
+  verdict: CommandDispatchVerdict,
+  details: ErrorWireDetails | undefined,
+  ledger: RequestDispatchLedger,
+): ErrorWireDetails | undefined {
+  if (ledger.dispatchedSteps > 0) {
+    const disclosed = detailsAfterDispatchedSteps(details, ledger.dispatchedSteps);
+    return details?.reason === BOUNDED_COMPOSITE_RESOURCE_UNSUPPORTED_REASON &&
+      details.dispatched === 'no'
+      ? { ...disclosed, dispatched: 'no' }
+      : disclosed;
+  }
+  if (verdict === undefined) return details;
+  if (verdict === 'no') {
+    return details?.dispatched === 'no' ? details : { ...details, dispatched: 'no' };
+  }
+  return details?.dispatched === undefined ? { ...details, dispatched: 'unknown' } : details;
+}
+
+/** A failure response built before any dispatch: the requested operation never reached the device. */
+export function refusedBeforeDispatch<Response extends DaemonResponse>(
+  response: Response,
+): Response {
+  if (response.ok) return response;
+  return {
+    ...response,
+    error: { ...response.error, details: { ...response.error.details, dispatched: 'no' } },
+  };
+}
+
+/** A failure thrown before any dispatch: the requested operation never reached the device. */
+export function thrownBeforeDispatch(error: unknown): AppError {
+  return discloseDispatch(asAppError(error), 'no');
+}

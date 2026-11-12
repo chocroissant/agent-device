@@ -1,0 +1,448 @@
+// Catches: a platform package's private implementation loaded before the one canonical
+//   composition root assembles it, or a cross-boundary edge into another platform family's
+//   private surface — the six platform packages moved behind package facades (#2116-#2125)
+//   specifically to make eager loading and cross-family reach-ins visible, and only a source
+//   walk over every package's imports can confirm the boundary actually held.
+// Evidence: 838ed223b5 (#2116) moved the six W6 platform families behind package facades;
+//   ed26b31c94 (#2125) contracted the Apple platform surface to match.
+// Cost: 1030 LOC (377 rule + 653 test); shared with platform-composition-policy.ts (103 LOC)
+//   and platform-package-source-policy.ts (230 LOC), which this module orchestrates.
+// Kill criterion: none enforced today; retire only by maintainer decision that platform-family
+//   isolation (private manifests with exact exports, static imports only from the composition
+//   root, no sibling-family reach-ins, no top-level loadInventory/loadRuntime) no longer
+//   matters. Publishing the families separately would not replace it: the A4 spike found an
+//   undeclared workspace package still resolves through root node_modules and a relative tunnel
+//   into a sibling's src still compiles; project references are a build cache, not a boundary.
+
+import path from 'node:path';
+import { DAEMON_SOURCE_ROOT, isProductionSourceFile } from './tracked-sources.ts';
+import { PLATFORMS } from '@agent-device/kernel/device';
+import { parseImports, type LayeringViolation } from './model.ts';
+import {
+  APPLE_RUNNER_DIR,
+  APPLE_RUNNER_PACKAGE,
+  appleRunnerEntryImporterViolations,
+  appleRunnerPackageSiteViolations,
+} from './apple-runner-package-policy.ts';
+import { checkPlatformComposition } from './platform-composition-policy.ts';
+import { checkPlatformPackageSourcePolicy } from './platform-package-source-policy.ts';
+import { isTestOnlyExportSpecifier } from './package-export-surface.ts';
+import { retiredPathViolations } from './retired-zone-policy.ts';
+
+export const CANONICAL_PLATFORM_FAMILIES = PLATFORMS;
+type PlatformFamily = (typeof CANONICAL_PLATFORM_FAMILIES)[number];
+export type PlatformPackageDeclaration = {
+  dir: string;
+  family: string;
+  name: string;
+  private: boolean;
+  exportedSubpaths: readonly string[];
+};
+const COMPOSITION_FILE = 'src/platform-runtime.ts';
+const REQUEST_PROVIDER_COMPOSITION_FILE = 'src/platform-runtime/request-providers.ts';
+const COMPOSITION_FILES = new Set([COMPOSITION_FILE, REQUEST_PROVIDER_COMPOSITION_FILE]);
+const RULE = 'R13 platform-package-substrate';
+const RAW_PROCESS_SPECIFIERS = new Set(['child_process', 'node:child_process']);
+const PLATFORM_RUNTIME_HOST_FILES = new Set([
+  'src/platform-runtime-audio-probe-host.ts',
+  'src/platform-runtime-host-diagnostics.ts',
+  'src/platform-runtime-managed-web-backend.ts',
+  'src/platform-runtime-network-web-transport.ts',
+  'src/platform-runtime-operation-host.ts',
+  'src/platform-runtime-perf-host.ts',
+  'src/platform-runtime-resource-cleanup.ts',
+  'src/platform-runtime-screen-recording-harmony-host.ts',
+  'src/platform-runtime-screen-recording-web-host.ts',
+  'src/platform-runtime-toolchain-host.ts',
+]);
+
+// #2040: the Apple XCUITest runner client is a platform-owned implementation
+// facet. It lives in its own workspace package, '@agent-device/apple-runner', so it falls
+// outside the `platform-*` name match; this module polices it as the Apple-family runner
+// engine (one engine, not a per-OS split), not as a platform family of its own. Its single
+// entry is reachable from platform-apple's composition and from the named root consumers
+// below; platform-apple's own `runner/operations` and `runner-owner` subpaths remain the
+// enumerated seam through which daemon/root consumers reach the host-bound operations (the
+// runner-consumer migration behind the composition gateway has no owner today; if one retires
+// those direct consumers, the seam narrows with it — the facet itself is durable Apple
+// ownership, not a temporary exception).
+
+export function checkRetiredPlatformsZone(files: readonly string[]): LayeringViolation[] {
+  return retiredPathViolations(
+    files,
+    'src/platforms',
+    'retired-platforms-zone',
+    'src/platforms is retired; family code belongs in its platform package, shared mechanics in an owning substrate package, and cross-family tests in their root or package test owner',
+  );
+}
+const APPLE_RUNNER_TEST_HOST_FILE = 'packages/apple-runner/src/test-host';
+const ANDROID_MECHANICS_FACADE = '@agent-device/platform-android/mechanics';
+const ANDROID_HOST_FACET = '@agent-device/platform-android/adb-host';
+// The host port is bound by the root; daemon composition registers the helper's runtime state.
+const ANDROID_HOST_FACET_IMPORTERS: ReadonlySet<string> = new Set([
+  'src/platform-runtime-android-adb-host.ts',
+  'src/daemon-composition.ts',
+  'src/daemon-composition.test.ts',
+]);
+const ANDROID_DEVICE_BOOT_FACADE = '@agent-device/platform-android/device-boot';
+const MECHANICS_FACET_SUBPATHS: Readonly<Partial<Record<PlatformFamily, readonly string[]>>> = {
+  apple: [
+    '@agent-device/platform-apple/app-lifecycle',
+    '@agent-device/platform-apple/app-resolution',
+    '@agent-device/platform-apple/debug-symbols',
+    '@agent-device/platform-apple/doctor',
+    '@agent-device/platform-apple/install-artifact',
+    '@agent-device/platform-apple/macos',
+    '@agent-device/platform-apple/perf',
+    '@agent-device/platform-apple/physical-device',
+    '@agent-device/platform-apple/runner-owner',
+    '@agent-device/platform-apple/runner/operations',
+    '@agent-device/platform-apple/session-observation',
+    '@agent-device/platform-apple/snapshot-source',
+    '@agent-device/platform-apple/simctl',
+    '@agent-device/platform-apple/simulator',
+    '@agent-device/platform-apple/simulator-boot',
+    '@agent-device/platform-apple/tool-provider',
+  ],
+  android: [ANDROID_HOST_FACET, ANDROID_MECHANICS_FACADE, ANDROID_DEVICE_BOOT_FACADE],
+  harmonyos: ['@agent-device/platform-harmonyos/interactor'],
+  linux: ['@agent-device/platform-linux/interactor'],
+  web: ['@agent-device/platform-web/interactor'],
+};
+const INTERACTOR_COMPOSITION_FILE = 'src/core/interactors/register-builtins.ts';
+
+function isInteractorSubpathImport(
+  file: string,
+  site: { spec: string; dynamic: boolean },
+  family: string,
+): boolean {
+  return (
+    site.spec === `@agent-device/platform-${family}/interactor` &&
+    (MECHANICS_FACET_SUBPATHS[family as PlatformFamily] ?? []).includes(site.spec) &&
+    file === INTERACTOR_COMPOSITION_FILE &&
+    site.dynamic
+  );
+}
+
+function isAndroidFacetSubpathImport(file: string, specifier: string): boolean {
+  if (specifier === ANDROID_HOST_FACET) return ANDROID_HOST_FACET_IMPORTERS.has(file);
+  if (isPlatformTestOnlyImport(specifier)) return true;
+  if (!(MECHANICS_FACET_SUBPATHS.android ?? []).includes(specifier)) return false;
+  // The named facets are the implementation seam for root/core/SDK consumers. Daemon production
+  // code still reaches platform behavior through the request-bound runtime gateway; tests may
+  // import a facet to exercise the package-owned mechanics directly.
+  return !file.startsWith(DAEMON_SOURCE_ROOT) || !isProductionSourceFile(file);
+}
+
+// Test-only subpaths (fixtures, the runner test host) are R83's: it holds the export list and
+// bans production importers, so R13 neither requires nor polices them.
+function isPlatformTestOnlyImport(specifier: string): boolean {
+  return concretePlatformFamily(specifier) !== undefined && isTestOnlyExportSpecifier(specifier);
+}
+
+function isAppleFacadeSubpathImport(specifier: string): boolean {
+  return (
+    (MECHANICS_FACET_SUBPATHS.apple?.includes(specifier) ?? false) ||
+    isPlatformTestOnlyImport(specifier)
+  );
+}
+
+function violation(file: string, line: number, message: string): LayeringViolation {
+  return { rule: RULE, file, line, message };
+}
+
+function packageName(family: PlatformFamily): string {
+  return `@agent-device/platform-${family}`;
+}
+
+function packageDir(family: PlatformFamily): string {
+  return `packages/platform-${family}`;
+}
+
+function familyForPackageFile(file: string): string | undefined {
+  return /^packages\/platform-([^/]+)\//.exec(file)?.[1];
+}
+
+function concretePlatformFamily(specifier: string): string | undefined {
+  return /^@agent-device\/platform-([^/]+)(?:\/|$)/.exec(specifier)?.[1];
+}
+
+function resolvesOutsidePackage(file: string, specifier: string, family: string): boolean {
+  if (!specifier.startsWith('.')) return false;
+  const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(file), specifier));
+  return !resolved.startsWith(`packages/platform-${family}/`);
+}
+
+function resolvesToRequestProviderComposition(file: string, specifier: string): boolean {
+  if (!specifier.startsWith('.')) return false;
+  const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(file), specifier));
+  return resolved === REQUEST_PROVIDER_COMPOSITION_FILE;
+}
+
+function resolvesToAppleRunnerTestHost(file: string, specifier: string): boolean {
+  if (!specifier.startsWith('.')) return false;
+  const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(file), specifier));
+  return resolved.replace(/\.ts$/, '') === APPLE_RUNNER_TEST_HOST_FILE;
+}
+
+function isPackageOwnedFacadeTest(file: string, family: string, specifier: string): boolean {
+  return (
+    file.startsWith(`packages/platform-${family}/`) &&
+    (file.endsWith('.test.ts') || file.includes('/__tests__/')) &&
+    specifier === `@agent-device/platform-${family}`
+  );
+}
+
+// The web interactor reuses the selectors package's canonical positional-ref normalizer.
+const WEB_SELECTORS_PRODUCTION_SUBPATH = '@agent-device/selectors/interaction-positionals';
+
+function isWebPackageSelectorImport(file: string, family: string, specifier: string): boolean {
+  if (family !== 'web' || !file.startsWith('packages/platform-web/')) return false;
+  if (specifier === WEB_SELECTORS_PRODUCTION_SUBPATH) return true;
+  return (
+    (file.endsWith('.test.ts') || file.includes('/__tests__/')) &&
+    specifier === '@agent-device/selectors'
+  );
+}
+
+function isTestKitTestImport(file: string, specifier: string): boolean {
+  return specifier === '@agent-device/test-kit' && !isProductionSourceFile(file);
+}
+
+function checkDeclarations(packages: readonly PlatformPackageDeclaration[]): LayeringViolation[] {
+  const violations: LayeringViolation[] = [];
+  for (const family of CANONICAL_PLATFORM_FAMILIES) {
+    const expectedDir = packageDir(family);
+    const matches = packages.filter((pkg) => pkg.dir === expectedDir);
+    if (matches.length === 0) {
+      violations.push(
+        violation(expectedDir, 1, `missing canonical platform package ${expectedDir}`),
+      );
+      continue;
+    }
+    if (matches.length > 1) {
+      violations.push(violation(expectedDir, 1, `${expectedDir} is declared more than once`));
+      continue;
+    }
+    const declaration = matches[0]!;
+    const expectedName = packageName(family);
+    if (declaration.name !== expectedName) {
+      violations.push(
+        violation(
+          `${expectedDir}/package.json`,
+          1,
+          `${expectedDir} must be named '${expectedName}', found '${declaration.name}'`,
+        ),
+      );
+    }
+    if (!declaration.private) {
+      violations.push(
+        violation(`${expectedDir}/package.json`, 1, `${expectedDir} must be private`),
+      );
+    }
+    const expectedSubpaths = [expectedName, ...(MECHANICS_FACET_SUBPATHS[family] ?? [])];
+    const productionSubpaths = declaration.exportedSubpaths.filter(
+      (subpath) => !isTestOnlyExportSpecifier(subpath),
+    );
+    if (
+      productionSubpaths.length !== expectedSubpaths.length ||
+      expectedSubpaths.some((subpath) => !productionSubpaths.includes(subpath))
+    ) {
+      violations.push(
+        violation(
+          `${expectedDir}/package.json`,
+          1,
+          `${expectedDir} must export exactly its root façade '${expectedName}'` +
+            (expectedSubpaths.length > 1 ? ` plus its enumerated mechanics subpaths` : ''),
+        ),
+      );
+    }
+  }
+  for (const declaration of packages) {
+    if (!declaration.dir.startsWith('packages/platform-')) continue;
+    const family = declaration.dir.slice('packages/platform-'.length);
+    if (!(CANONICAL_PLATFORM_FAMILIES as readonly string[]).includes(family)) {
+      violations.push(
+        violation(declaration.dir, 1, `${declaration.dir} is not a canonical platform family`),
+      );
+    }
+  }
+  return violations;
+}
+
+function checkSource(file: string, source: string): LayeringViolation[] {
+  const violations: LayeringViolation[] = [];
+  const ownerFamily = familyForPackageFile(file);
+  // The Apple runner package is not a platform family: it owns its cache/lease files and usbmux
+  // sockets (fs/net/os), so the ambient-host rules do not apply to it, and its own substrate rules
+  // run per import site below.
+  if (ownerFamily && isProductionSourceFile(file)) {
+    violations.push(...checkPlatformPackageSourcePolicy(file, source, ownerFamily));
+  }
+  for (const site of parseImports(source)) {
+    if (resolvesToRequestProviderComposition(file, site.spec) && file !== COMPOSITION_FILE) {
+      violations.push(
+        violation(
+          file,
+          site.line,
+          `only ${COMPOSITION_FILE} may import the private request-provider composition submodule`,
+        ),
+      );
+    }
+    if (resolvesToAppleRunnerTestHost(file, site.spec) && isProductionSourceFile(file)) {
+      violations.push(
+        violation(
+          file,
+          site.line,
+          'apple-runner/src/test-host.ts binds the runner test dispatcher — only test files and __tests__ helpers may import it',
+        ),
+      );
+    }
+    if (file.startsWith(APPLE_RUNNER_DIR)) {
+      violations.push(...appleRunnerPackageSiteViolations(file, site));
+    }
+    violations.push(...appleRunnerEntryImporterViolations(file, site));
+    const importedFamily = concretePlatformFamily(site.spec);
+    if (file.startsWith('packages/contracts/') && importedFamily) {
+      violations.push(
+        violation(
+          file,
+          site.line,
+          `contracts may never import a concrete platform package ('${site.spec}')`,
+        ),
+      );
+    }
+    if (file.startsWith('packages/provision-kit/') && importedFamily) {
+      violations.push(
+        violation(
+          file,
+          site.line,
+          `only ${COMPOSITION_FILE} or its governed request-provider composition submodule may import '${site.spec}' outside its package-owned tests`,
+        ),
+      );
+    }
+    if (
+      importedFamily &&
+      !COMPOSITION_FILES.has(file) &&
+      // Named platform facades are the package's consumer seams. R11's
+      // workspace-dependency declarations bound the importer set to the root
+      // package.
+      !isAppleFacadeSubpathImport(site.spec) &&
+      !isAllowedPlatformRootImport(file, site, importedFamily) &&
+      !isPackageOwnedFacadeTest(file, importedFamily, site.spec) &&
+      !isAndroidFacetSubpathImport(file, site.spec) &&
+      !isInteractorSubpathImport(file, site, importedFamily)
+    ) {
+      violations.push(
+        violation(
+          file,
+          site.line,
+          site.spec === `@agent-device/platform-${importedFamily}`
+            ? `production static imports of '${site.spec}' are limited to ${COMPOSITION_FILE} and src/core/interactors/; other value edges require a deferred import from an approved platform-runtime host file`
+            : `only ${COMPOSITION_FILE} or its governed request-provider composition submodule may import '${site.spec}' outside its package-owned tests`,
+        ),
+      );
+    }
+    if (!ownerFamily) continue;
+    if (
+      site.spec.startsWith('@agent-device/') &&
+      !site.spec.startsWith('@agent-device/contracts/') &&
+      site.spec !== '@agent-device/capture-kit' &&
+      !site.spec.startsWith('@agent-device/capture-kit/') &&
+      !site.spec.startsWith('@agent-device/host-kit/') &&
+      !site.spec.startsWith('@agent-device/provision-kit/') &&
+      !site.spec.startsWith('@agent-device/kernel/') &&
+      site.spec !== '@agent-device/xml' &&
+      // platform-apple composes the Apple runner package; no other family may reach it.
+      !(ownerFamily === 'apple' && site.spec === APPLE_RUNNER_PACKAGE) &&
+      !isAppleFacadeSubpathImport(site.spec) &&
+      !isPackageOwnedFacadeTest(file, ownerFamily, site.spec) &&
+      !isWebPackageSelectorImport(file, ownerFamily, site.spec) &&
+      !isTestKitTestImport(file, site.spec)
+    ) {
+      violations.push(
+        violation(
+          file,
+          site.line,
+          `platform-${ownerFamily} may import workspace code only from capture-kit, host-kit, provision-kit, contracts, kernel, or xml; found '${site.spec}'`,
+        ),
+      );
+    }
+    if (importedFamily && importedFamily !== ownerFamily) {
+      violations.push(
+        violation(file, site.line, `platform-${ownerFamily} may not import sibling '${site.spec}'`),
+      );
+    }
+    if (
+      resolvesOutsidePackage(file, site.spec, ownerFamily) ||
+      /^agent-device(?:\/|$)/.test(site.spec)
+    ) {
+      violations.push(
+        violation(file, site.line, `platform-${ownerFamily} may not reach root or daemon code`),
+      );
+    }
+    // Production value-imports only: package tests fake process primitives
+    // (they intercept, not spawn), and the runner host port names ChildProcess
+    // as a type. The spawn ban is about mechanics bypassing the host-command
+    // port at runtime.
+    if (RAW_PROCESS_SPECIFIERS.has(site.spec) && isProductionSourceFile(file) && !site.typeOnly) {
+      violations.push(
+        violation(
+          file,
+          site.line,
+          `platform-${ownerFamily} may not import raw process primitives ('${site.spec}'); use the host-command port`,
+        ),
+      );
+    }
+    if (
+      file === `packages/platform-${ownerFamily}/src/index.ts` &&
+      !site.dynamic &&
+      !site.typeOnly
+    ) {
+      violations.push(
+        violation(
+          file,
+          site.line,
+          `platform-${ownerFamily} facade must not eagerly evaluate '${site.spec}'`,
+        ),
+      );
+    }
+  }
+  return violations;
+}
+
+function isAllowedPlatformRootImport(
+  file: string,
+  site: { spec: string; dynamic: boolean; typeOnly: boolean },
+  family: string,
+): boolean {
+  if (site.spec !== `@agent-device/platform-${family}`) return false;
+  return (
+    !isProductionSourceFile(file) ||
+    file.startsWith('src/core/interactors/') ||
+    (PLATFORM_RUNTIME_HOST_FILES.has(file) && (site.dynamic || site.typeOnly))
+  );
+}
+
+export function checkPlatformPackagePolicy(
+  sources: ReadonlyMap<string, string>,
+  packages: readonly PlatformPackageDeclaration[],
+  options: { untrackedProductionFiles?: readonly string[] } = {},
+): LayeringViolation[] {
+  return [
+    ...(options.untrackedProductionFiles ?? []).map((file) =>
+      violation(
+        file,
+        1,
+        'untracked production source is not committed-state layering evidence; commit the complete slice before running the gate',
+      ),
+    ),
+    ...checkDeclarations(packages),
+    ...checkPlatformComposition(sources.get(COMPOSITION_FILE)),
+    ...[...sources].flatMap(([file, source]) => checkSource(file, source)),
+  ];
+}
+
+export function platformPackagePolicySummary(): string {
+  return `R13 holds six private implementation-lazy platform packages above capture-kit behind one canonical composition root and its single private provider-composition submodule, with the android mechanics facet and the Apple runner package behind their enumerated seams; deferred or type-only edges are limited to the approved platform-runtime host watchlist and the dynamic-only HarmonyOS, Linux and Web interactor subpaths imported by ${INTERACTOR_COMPOSITION_FILE}`;
+}

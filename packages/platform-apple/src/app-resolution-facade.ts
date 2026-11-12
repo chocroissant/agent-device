@@ -1,0 +1,9 @@
+export { buildAppNotInstalledError } from './core/app-resolution-error.ts';
+export {
+  detectSoleRunningIosSimulatorApp,
+  findIosSimulatorInstalledApp,
+  invalidateIosAppResolutionCache,
+  resolveIosApp,
+  resolveIosSimulatorDeepLinkBundleId,
+} from './core/app-resolution.ts';
+export { resolveMacOsAppDeviceOpenTarget } from './os/macos/apps.ts';

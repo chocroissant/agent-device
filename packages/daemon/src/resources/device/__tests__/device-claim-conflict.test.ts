@@ -1,0 +1,101 @@
+import assert from 'node:assert/strict';
+import { test } from 'vitest';
+import { hostAppDevice, type DeviceInfo } from '@agent-device/kernel/device';
+import {
+  buildDeviceClaimConflictError,
+  buildDeviceClaimInspectionCommand,
+} from '../device-claim-conflict.ts';
+import type { InspectedDeviceClaim } from '@agent-device/daemon-contracts/device-claims';
+
+const device: DeviceInfo = {
+  platform: 'android',
+  id: 'emulator-5554',
+  name: 'Pixel',
+  kind: 'emulator',
+};
+
+function conflict(classification: InspectedDeviceClaim['classification']): InspectedDeviceClaim {
+  return {
+    fileName: 'claim.json',
+    deviceKey: 'local:android:none:emulator-5554',
+    classification,
+    claim: {
+      schemaVersion: 3,
+      claimOwnerKind: 'open-session',
+      deviceKey: 'local:android:none:emulator-5554',
+      device: { family: 'android', id: device.id, name: device.name, kind: device.kind },
+      session: 'checkout',
+      workspace: '/worktrees/checkout',
+      stateDir: '/state/checkout',
+      ownerPid: 4242,
+      ownerStartTime: 'start',
+      ownerToken: 'token',
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    },
+  };
+}
+
+test.each(['owner-process-dead', 'owner-process-reused', 'owner-state-dir-gone'] as const)(
+  'builds an exact --stale recovery command for %s',
+  (classification) => {
+    assert.equal(
+      buildDeviceClaimInspectionCommand(device, conflict(classification)),
+      'agent-device device status --platform android --serial emulator-5554 --stale',
+    );
+  },
+);
+
+test('routes conflict presentation through the canonical error response shape', () => {
+  const response = buildDeviceClaimConflictError(device, conflict('live'));
+  assert.equal(response.ok, false);
+  if (response.ok) return;
+  assert.equal(response.error.retriable, false);
+  assert.equal(
+    response.error.hint,
+    'Inspect the owner with: agent-device device status --platform android --serial emulator-5554',
+  );
+  assert.deepEqual(response.error.details?.recovery, {
+    command: 'agent-device device status --platform android --serial emulator-5554',
+  });
+});
+
+test('routes a provably dead owner to the exact stale release command', () => {
+  const response = buildDeviceClaimConflictError(device, conflict('owner-process-dead'));
+  assert.equal(response.ok, false);
+  if (response.ok) return;
+  assert.deepEqual(response.error.details?.recovery, {
+    command: 'agent-device device release --platform android --serial emulator-5554 --stale',
+  });
+  assert.match(String(response.error.hint), /settle its resources and release the claim with:/);
+});
+
+test('an app device refused by its host claim names the host as the device in the way', () => {
+  const mac: DeviceInfo = {
+    platform: 'apple',
+    appleOs: 'macos',
+    id: 'host-mac',
+    name: 'Host Mac',
+    kind: 'device',
+  };
+  const held = conflict('live');
+  const hostClaim: InspectedDeviceClaim = {
+    ...held,
+    deviceKey: 'local:apple:macos:host-mac',
+    claim: {
+      ...held.claim!,
+      deviceKey: 'local:apple:macos:host-mac',
+      device: { family: 'apple', appleOs: 'macos', id: mac.id, name: mac.name, kind: mac.kind },
+    },
+  };
+  const response = buildDeviceClaimConflictError(
+    hostAppDevice(mac, 'com.apple.TextEdit'),
+    hostClaim,
+  );
+  assert.equal(response.ok, false);
+  if (response.ok) return;
+  assert.match(response.error.message, /^macos device host-mac is owned by session "checkout"/);
+  assert.deepEqual(response.error.details?.recovery, {
+    command: 'agent-device device status --platform macos --udid host-mac',
+  });
+});

@@ -1,0 +1,466 @@
+import type { HostEnvironment } from '@agent-device/kernel/source-value';
+import type { DaemonResponse } from '@agent-device/kernel/contracts';
+import type { DaemonPlatformServices } from '../../../core/platform-services.ts';
+import { resolveRequestTargetDeviceSelection } from '../../../core/request-device-resolution.ts';
+import {
+  openApplicationRuntimeUse,
+  openApplicationWithRuntimeHintApplyAndClearUse,
+  openApplicationWithRuntimeHintApplyUse,
+  openApplicationWithRuntimeHintClearUse,
+  resolveOpenApplicationRuntimePlan,
+} from '@agent-device/contracts/application-lifecycle-runtime-plan';
+import { webSessionBackendKey, type DeviceInfo } from '@agent-device/kernel/device';
+import type { SessionSurface } from '@agent-device/contracts/session';
+import type { DaemonRequest } from '../../../core/daemon-request.ts';
+import type { SessionState } from '../../../core/session-state.ts';
+import { SessionStore } from '../../../core/session-store.ts';
+import { refreshSessionDeviceIfNeeded } from '../../../resources/session-device-resolution.ts';
+import { withKeyedLock } from '@agent-device/kernel/keyed-lock';
+import { requestWebSession } from '../../../core/session-tenant-scope.ts';
+import { isWebSession } from '../../web-session-names.ts';
+import { resolveOpenTargetDeviceOptions } from '../../../core/open-target-device-resolution.ts';
+import { bootStoppedLocalAndroidDevice } from '../../../core/stopped-local-android-device.ts';
+import { startupDeadlineAtMs } from '../../startup-deadline.ts';
+import {
+  invalidOpenArgs,
+  prepareOpenCommandDetails,
+  resolveOpenRuntimeHintPlan,
+  resolveOpenSurfaceResponse,
+  type ResolvedOpenRuntimeHintPlan,
+  validatePreResolvedOpenRequest,
+  validateResolvedOpenRequest,
+} from './session-open-prepare.ts';
+import {
+  composeOpenWithInitialSnapshot,
+  resolveForegroundOpenRequest,
+} from './session-open-foreground.ts';
+export { resolveForegroundOpenRequest };
+import { expireRefFrame } from '../../../core/ref-frame.ts';
+import type { DeviceClaimReconciler } from '@agent-device/daemon-contracts/device-claims';
+import type {
+  BindDeviceRuntime,
+  InspectDeviceRuntimeFacts,
+} from '../../../core/request-runtime-binding.ts';
+import { admitRuntimeOperations } from '../../../core/runtime-admission.ts';
+import { resolveExistingSessionDeviceSelection } from '@agent-device/device-selection/device-selection-resolver';
+import {
+  requireRuntimeBinding,
+  requireRuntimeFacts,
+} from '../../../core/session-runtime-admission.ts';
+import {
+  completeOpenCommand,
+  openNewSessionWithDeviceClaim,
+  renewOpenSessionClaim,
+  type OpenApplicationRuntime,
+  type SessionOpenResult,
+  type RuntimeHintApplyOperation,
+  type RuntimeHintClearOperation,
+} from './session-open-execution.ts';
+import { requireOpenSessionAdmission } from './session-open-state.ts';
+import { errorResponse } from '@agent-device/kernel/contracts';
+import type { CreateDaemonCommandSurface } from '@agent-device/contracts/daemon-command-surface';
+
+export type SessionOpenCommandInput = Readonly<{
+  host: HostEnvironment;
+  createCommandSurface: CreateDaemonCommandSurface;
+  req: DaemonRequest;
+  sessionName: string;
+  logPath: string;
+  sessionStore: SessionStore;
+  inspectFacts?: InspectDeviceRuntimeFacts;
+  platformServices: DaemonPlatformServices;
+  bindDevice?: BindDeviceRuntime;
+  reconcileOrphanedDeviceClaim: DeviceClaimReconciler;
+}>;
+
+// One lock table per session store, which is to say per daemon runtime.
+const firstSessionOpenLocksByStore = new WeakMap<SessionStore, Map<string, Promise<unknown>>>();
+
+function firstSessionOpenLocks(sessionStore: SessionStore): Map<string, Promise<unknown>> {
+  let locks = firstSessionOpenLocksByStore.get(sessionStore);
+  if (!locks) {
+    locks = new Map();
+    firstSessionOpenLocksByStore.set(sessionStore, locks);
+  }
+  return locks;
+}
+
+/**
+ * The key first opens serialize on. An app device keys by its host, so a whole-host open and an
+ * app device open never both pass the session check (ADR 0035). A web host has no whole-host open,
+ * so a web session device keys by itself and web sessions of one host open in parallel (ADR 0037).
+ */
+function firstSessionOpenLockKey(device: DeviceInfo): string {
+  return device.hostApp?.hostDeviceId ?? device.id;
+}
+
+type OpenRuntimeAdmission =
+  | Readonly<{
+      type: 'runtime';
+      runtime: OpenApplicationRuntime;
+      applyRuntimeHints?: RuntimeHintApplyOperation;
+      clearRuntimeHints?: RuntimeHintClearOperation;
+    }>
+  | Readonly<{ type: 'response'; response: DaemonResponse }>;
+
+type OpenRuntimePlanAdmission =
+  | Readonly<{ type: 'response'; response: DaemonResponse }>
+  | Readonly<{
+      type: 'runtime';
+      runtimeHintPlan: ResolvedOpenRuntimeHintPlan;
+      admission: Extract<OpenRuntimeAdmission, { type: 'runtime' }>;
+    }>;
+
+// The sole facts admission and binding seam for this handler. Facts are side-effect free; the
+// implementation remains unavailable until all required facts admit the selected owner. Only the
+// exact bind differs per plan, so each `open` use keeps its precise operation projection.
+async function admitOpenRuntime(params: {
+  device: DeviceInfo;
+  runtimeHintPlan: ResolvedOpenRuntimeHintPlan;
+  inspectFacts?: InspectDeviceRuntimeFacts;
+  platformServices: DaemonPlatformServices;
+  bindDevice?: BindDeviceRuntime;
+}): Promise<OpenRuntimeAdmission> {
+  const plan = resolveOpenApplicationRuntimePlan({
+    applyRuntimeHints: params.runtimeHintPlan.applyRuntimeHints,
+    clearRemovedRuntimeHints: params.runtimeHintPlan.clearRemovedRuntimeHints,
+  });
+  const admitted = await admitRuntimeOperations({
+    ...params,
+    command: 'open',
+    required: plan.use.required,
+  });
+  if (admitted.type === 'response') return admitted;
+  const bind = admitted.bind;
+  switch (plan.kind) {
+    case 'open': {
+      const runtime = await bind(params.device, openApplicationRuntimeUse);
+      return { type: 'runtime', runtime };
+    }
+    case 'open-apply-runtime-hints': {
+      const runtime = await bind(params.device, openApplicationWithRuntimeHintApplyUse);
+      return {
+        type: 'runtime',
+        runtime,
+        applyRuntimeHints: runtime.operations.applyRuntimeHints,
+      };
+    }
+    case 'open-clear-runtime-hints': {
+      const runtime = await bind(params.device, openApplicationWithRuntimeHintClearUse);
+      return {
+        type: 'runtime',
+        runtime,
+        clearRuntimeHints: runtime.operations.clearRuntimeHints,
+      };
+    }
+    case 'open-apply-and-clear-runtime-hints': {
+      const runtime = await bind(params.device, openApplicationWithRuntimeHintApplyAndClearUse);
+      return {
+        type: 'runtime',
+        runtime,
+        applyRuntimeHints: runtime.operations.applyRuntimeHints,
+        clearRuntimeHints: runtime.operations.clearRuntimeHints,
+      };
+    }
+  }
+}
+
+async function resolveOpenRuntimePlanAdmission(params: {
+  req: DaemonRequest;
+  sessionStore: SessionStore;
+  sessionName: string;
+  device: DeviceInfo;
+  existingSession?: SessionState;
+  inspectFacts?: InspectDeviceRuntimeFacts;
+  platformServices: DaemonPlatformServices;
+  bindDevice?: BindDeviceRuntime;
+}): Promise<OpenRuntimePlanAdmission> {
+  const runtimeHintPlan = resolveOpenRuntimeHintPlan(params);
+  if (runtimeHintPlan.type === 'response') return runtimeHintPlan;
+  const admission = await admitOpenRuntime({
+    device: params.device,
+    runtimeHintPlan: runtimeHintPlan.plan,
+    inspectFacts: params.inspectFacts,
+    platformServices: params.platformServices,
+    bindDevice: params.bindDevice,
+  });
+  if (admission.type === 'response') return admission;
+  return { type: 'runtime', runtimeHintPlan: runtimeHintPlan.plan, admission };
+}
+
+/** Read-only existing-session open decision shared with bounded resource admission. */
+export async function resolveExistingOpenRequest(params: {
+  req: DaemonRequest;
+  session: SessionState;
+  platformServices: DaemonPlatformServices;
+}): Promise<
+  | { type: 'response'; response: DaemonResponse }
+  | {
+      type: 'resolved';
+      requestedOpenTarget: string | undefined;
+      openTarget: string | undefined;
+      surface: SessionSurface;
+    }
+> {
+  const { req, session, platformServices } = params;
+  const foreground = await resolveForegroundOpenRequest({ req, hasExistingSession: true });
+  if (foreground.type === 'response') return foreground;
+  if (req.flags?.saveScript) {
+    return {
+      type: 'response',
+      response: errorResponse(
+        'INVALID_ARGS',
+        'open --save-script can only arm a fresh session. Use the current session without --save-script, or close it and start a fresh session.',
+      ),
+    };
+  }
+  const shouldRelaunch = req.flags?.relaunch === true;
+  const requestedOpenTarget = req.positionals?.[0];
+  const openTarget = requestedOpenTarget ?? (shouldRelaunch ? session.appName : undefined);
+  const surface = resolveOpenSurfaceResponse(
+    platformServices,
+    session.device,
+    req.flags?.surface,
+    openTarget,
+    session.surface,
+  );
+  if (typeof surface !== 'string') return { type: 'response', response: surface };
+  if (!openTarget && surface === 'app') {
+    return {
+      type: 'response',
+      response: shouldRelaunch
+        ? invalidOpenArgs('open --relaunch requires an app name or an active session app.')
+        : invalidOpenArgs('Session already active. Close it first or pass a new --session name.'),
+    };
+  }
+  const validation = await validateResolvedOpenRequest({
+    shouldRelaunch,
+    openTarget,
+    surface,
+    device: session.device,
+    platformServices,
+  });
+  if (validation) return { type: 'response', response: validation };
+  return { type: 'resolved', requestedOpenTarget, openTarget, surface };
+}
+
+// fallow-ignore-next-line complexity
+async function handleOpenCommand(params: SessionOpenCommandInput): Promise<SessionOpenResult> {
+  const { sessionName, logPath, sessionStore } = params;
+
+  const existingRef = sessionStore.lookup(sessionName);
+  const foregroundResolution = await resolveForegroundOpenRequest({
+    req: params.req,
+    hasExistingSession: Boolean(existingRef),
+  });
+  if (foregroundResolution.type === 'response')
+    return { type: 'response', response: foregroundResolution.response };
+  const req = foregroundResolution.type === 'resolved' ? foregroundResolution.req : params.req;
+
+  requireOpenSessionAdmission(sessionStore, sessionName, existingRef);
+  // One `--timeout` budget covers the whole startup: a cold AVD boot and the open preparation.
+  const startupDeadline = startupDeadlineAtMs(req.flags?.timeoutMs);
+  if (existingRef) {
+    const session = sessionStore.requireCurrent(existingRef);
+    // A reopen names its browser by the supplied name too: a blank one is no alias of the default.
+    if (isWebSession(session)) webSessionBackendKey(requestWebSession(req));
+    const resolved = await resolveExistingOpenRequest({
+      req,
+      session,
+      platformServices: params.platformServices,
+    });
+    if (resolved.type === 'response') return resolved;
+    const { requestedOpenTarget, openTarget, surface: surfaceResult } = resolved;
+
+    // Reopening renews the claim before anything touches the device, so no other daemon ever sees
+    // a device this session is actively coming back to as one its owner walked away from.
+    const admittedSession = sessionStore.requireCurrent(existingRef);
+    const lostClaim = await renewOpenSessionClaim(
+      admittedSession.device,
+      admittedSession.deviceClaim,
+      params.host.env,
+    );
+    if (lostClaim) return { type: 'response', response: lostClaim };
+
+    const device = await refreshSessionDeviceIfNeeded(
+      session.device,
+      params.platformServices,
+      params.host.env,
+    );
+    const selection = resolveExistingSessionDeviceSelection(device);
+    await req.internal?.retainDeviceExecutionLock?.(device.id);
+    const runtimePlanAdmission = await resolveOpenRuntimePlanAdmission({
+      req,
+      sessionStore,
+      sessionName,
+      device,
+      existingSession: session,
+      inspectFacts: params.inspectFacts,
+      platformServices: params.platformServices,
+      bindDevice: params.bindDevice,
+    });
+    if (runtimePlanAdmission.type === 'response')
+      return { type: 'response', response: runtimePlanAdmission.response };
+    const { admission, runtimeHintPlan } = runtimePlanAdmission;
+    // The preparation can boot a device, clear native hints, or warm a runner. An existing
+    // frame becomes stale before those effects, rather than after the later visible launch.
+    requireOpenSessionAdmission(sessionStore, sessionName, existingRef);
+    const preparedSession = sessionStore.requireCurrent(existingRef);
+    expireRefFrame(preparedSession);
+    const details = await prepareOpenCommandDetails({
+      req,
+      startupDeadlineAtMs: startupDeadline,
+      logPath,
+      surface: surfaceResult,
+      openTarget,
+      existingSession: preparedSession,
+      runtime: admission.runtime,
+      runtimeHintPlan,
+      clearRuntimeHints: admission.clearRuntimeHints,
+      foreground: false,
+    });
+    if (details.type === 'response') return { type: 'response', response: details.response };
+
+    // Preparation may have booted the device to reach this surface, and a boot an owner caused for
+    // its own reopen cannot later read as a boot its owner walked away from.
+    requireOpenSessionAdmission(sessionStore, sessionName, existingRef);
+    const reclaimed = await renewOpenSessionClaim(
+      device,
+      sessionStore.requireCurrent(existingRef).deviceClaim,
+      params.host.env,
+    );
+    if (reclaimed) return { type: 'response', response: reclaimed };
+
+    return await completeOpenCommand({
+      req,
+      sessionName,
+      sessionStore,
+      logPath,
+      device,
+      openTarget,
+      openPositionals: requestedOpenTarget
+        ? (req.positionals ?? [])
+        : openTarget
+          ? [openTarget]
+          : [],
+      appBundleId: details.details.appBundleId,
+      appName: details.details.appName,
+      runtimeHints: details.details.runtime,
+      lifecycle: admission.runtime,
+      applyRuntimeHints: admission.applyRuntimeHints,
+      surface: surfaceResult,
+      existingRef,
+      selection,
+    });
+  }
+
+  const shouldRelaunch = req.flags?.relaunch === true;
+  const openTarget = req.positionals?.[0];
+  if (shouldRelaunch && !openTarget)
+    return {
+      type: 'response',
+      response: invalidOpenArgs('open --relaunch requires an app argument.'),
+    };
+
+  const preResolvedValidation = await validatePreResolvedOpenRequest({
+    shouldRelaunch,
+    openTarget,
+    platform: req.flags?.platform === 'android' ? 'android' : undefined,
+    platformServices: params.platformServices,
+  });
+  if (preResolvedValidation) return { type: 'response', response: preResolvedValidation };
+
+  const resolved = await resolveRequestTargetDeviceSelection(
+    req,
+    resolveOpenTargetDeviceOptions(req, params.host.env),
+  );
+  await req.internal?.retainDeviceExecutionLock?.(resolved.device.id);
+  const surfaceResult = resolveOpenSurfaceResponse(
+    params.platformServices,
+    resolved.device,
+    req.flags?.surface,
+    openTarget,
+  );
+  if (typeof surfaceResult !== 'string') return { type: 'response', response: surfaceResult };
+
+  const validation = await validateResolvedOpenRequest({
+    shouldRelaunch,
+    openTarget,
+    surface: surfaceResult,
+    device: resolved.device,
+    platformServices: params.platformServices,
+  });
+  if (validation) return { type: 'response', response: validation };
+
+  const admitDevice = async (device: DeviceInfo) =>
+    await resolveOpenRuntimePlanAdmission({
+      req,
+      sessionStore,
+      sessionName,
+      device,
+      inspectFacts: params.inspectFacts,
+      platformServices: params.platformServices,
+      bindDevice: params.bindDevice,
+    });
+  let runtimePlanAdmission = await admitDevice(resolved.device);
+  if (runtimePlanAdmission.type === 'response')
+    return { type: 'response', response: runtimePlanAdmission.response };
+  // A stopped AVD boots before the session claim and the open locks, so the session, its claim
+  // and its locks all key on the booted serial rather than the AVD name.
+  const booted = await bootStoppedLocalAndroidDevice({
+    device: resolved.device,
+    owner: runtimePlanAdmission.admission.runtime.owner,
+    bindDevice: requireRuntimeBinding(params.bindDevice),
+    flags: req.flags ?? {},
+    env: params.host.env,
+    deadlineAtMs: startupDeadline,
+  });
+  const selection = booted ? { ...resolved, device: booted } : resolved;
+  const device = selection.device;
+  if (booted) {
+    await req.internal?.retainDeviceExecutionLock?.(device.id);
+    runtimePlanAdmission = await admitDevice(device);
+    if (runtimePlanAdmission.type === 'response')
+      return { type: 'response', response: runtimePlanAdmission.response };
+  }
+  const { admission, runtimeHintPlan } = runtimePlanAdmission;
+
+  return await withKeyedLock(
+    firstSessionOpenLocks(sessionStore),
+    firstSessionOpenLockKey(device),
+    async () =>
+      await openNewSessionWithDeviceClaim({
+        host: params.host,
+        req,
+        startupDeadlineAtMs: startupDeadline,
+        sessionName,
+        logPath,
+        sessionStore,
+        device,
+        surface: surfaceResult,
+        openTarget,
+        lifecycle: admission.runtime,
+        runtimeHintPlan,
+        applyRuntimeHints: admission.applyRuntimeHints,
+        clearRuntimeHints: admission.clearRuntimeHints,
+        reconcileOrphanedDeviceClaim: params.reconcileOrphanedDeviceClaim,
+        platformServices: params.platformServices,
+        selection,
+      }),
+  );
+}
+
+export async function handleSessionOpenCommands(
+  params: SessionOpenCommandInput,
+): Promise<DaemonResponse> {
+  const result = await handleOpenCommand(params);
+  const openResponse = result.response;
+  if (result.type !== 'opened' || params.req.flags?.foreground !== true) return openResponse;
+  return await composeOpenWithInitialSnapshot({
+    ...params,
+    inspectFacts: requireRuntimeFacts(params.inspectFacts),
+    bindDevice: requireRuntimeBinding(params.bindDevice),
+    openResponse,
+    ref: result.ref,
+  });
+}

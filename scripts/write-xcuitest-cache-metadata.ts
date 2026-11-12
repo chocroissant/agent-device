@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { withCommandHost } from '@agent-device/host-kit/command';
+import { captureHostEnvironment } from '@agent-device/host-kit/process';
+import { withDiagnosticsScope } from '@agent-device/host-kit/diagnostics';
+import { normalizeError } from '@agent-device/kernel/errors';
+import {
+  findRunnerXctestrun,
+  isRunnerXcuitestScriptPlatform,
+  requireCertifiedRunnerCacheArtifacts,
+  requireRunnerBuildSettingsMatchBuildLog,
+  resolveExistingRunnerProductPaths,
+  resolveExpectedRunnerCacheMetadata,
+  resolveRunnerScriptDevice,
+  writeRunnerCacheMetadataForArtifacts,
+} from '@agent-device/platform-apple/runner/operations';
+
+const USAGE =
+  'Usage: write-xcuitest-cache-metadata.ts <ios|macos|tvos|visionos> <derived> <destination> <build-log>';
+
+/**
+ * Publishes the cache metadata for a `scripts/build-xcuitest-apple.sh` build. The identity half
+ * resolves through the same owner the daemon uses; the recorded recipe is then checked against
+ * what `xcodebuild` echoed in the build log, so a script that drifted from that identity cannot
+ * have its products certified. The artifact half digests the bytes on disk now, after the
+ * isolation scan succeeded, so a manifest exists exactly for builds that passed the scan.
+ */
+type WriterInvocation = {
+  device: ReturnType<typeof resolveRunnerScriptDevice>;
+  derivedPath: string;
+  buildLogPath: string;
+};
+
+// fallow-ignore-next-line complexity
+function parseWriterInvocation(args: readonly string[]): WriterInvocation {
+  const [platform, derivedPath, destination, buildLogPath] = args;
+  if (!platform || !derivedPath || !destination || !buildLogPath) {
+    throw new Error(USAGE);
+  }
+  if (!isRunnerXcuitestScriptPlatform(platform)) {
+    throw new Error(`Unsupported platform: ${platform}`);
+  }
+  return {
+    device: resolveRunnerScriptDevice(platform, destination),
+    derivedPath: path.resolve(derivedPath),
+    buildLogPath: path.resolve(buildLogPath),
+  };
+}
+
+async function writeXcuitestCacheMetadata(
+  args: readonly string[],
+  cwd: string,
+): Promise<ReturnType<typeof resolveExpectedRunnerCacheMetadata>> {
+  const { device, derivedPath, buildLogPath } = parseWriterInvocation(args);
+  const metadata = resolveExpectedRunnerCacheMetadata(device, cwd);
+  requireRunnerBuildSettingsMatchBuildLog(metadata, buildLogPath);
+
+  const xctestrunPath = findRunnerXctestrun(derivedPath, device);
+  if (!xctestrunPath) {
+    throw new Error(`No .xctestrun found under ${derivedPath}`);
+  }
+  const productPaths = await resolveExistingRunnerProductPaths(xctestrunPath);
+  if (!productPaths || productPaths.length === 0) {
+    throw new Error(`Runner products referenced by ${xctestrunPath} are missing`);
+  }
+  requireCertifiedRunnerCacheArtifacts(
+    await writeRunnerCacheMetadataForArtifacts(derivedPath, metadata, xctestrunPath, productPaths),
+    derivedPath,
+  );
+  return metadata;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    const host = captureHostEnvironment(process);
+    // Runner configuration reads take the runtime's host (#3794); this script is the whole
+    // process here, so it seeds the runner state with the same host it enters as a command host.
+    const { setAppleRunnerHostEnvironment } =
+      await import('@agent-device/platform-apple/runner-owner');
+    setAppleRunnerHostEnvironment(host);
+    await withCommandHost(
+      { host, requestEnv: undefined },
+      async () =>
+        await withDiagnosticsScope(
+          { debug: true },
+          async () => await writeXcuitestCacheMetadata(process.argv.slice(2), host.cwd),
+        ),
+    );
+  } catch (error) {
+    console.error(JSON.stringify(normalizeError(error)));
+    process.exit(1);
+  }
+}

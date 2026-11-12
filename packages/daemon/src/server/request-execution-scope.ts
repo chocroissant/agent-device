@@ -1,0 +1,993 @@
+import { restrictRemoteHostInputs } from './remote-host-input-policy.ts';
+import type { EnvMap, HostEnvironment } from '@agent-device/kernel/source-value';
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import {
+  resolveSessionRequestLog,
+  resolveSessionRunnerLogPath,
+} from '@agent-device/daemon-contracts/session-artifact-paths';
+import {
+  createOwnerScopedDeviceClaimReconciler,
+  type ClaimRecoveryGatewayFactory,
+} from '@agent-device/daemon-contracts/device-claim-recovery';
+import type { DaemonResponse } from '@agent-device/kernel/contracts';
+import type { CommandFlags } from '@agent-device/contracts/command';
+import type { LeaseLifecycleProvider, ProviderAppCatalog } from '@agent-device/contracts/device';
+import type { TrackDownloadableArtifact } from '../resources/artifact-tracking.ts';
+import {
+  emitDiagnostic,
+  getDiagnosticsMeta,
+  updateDiagnosticsScope,
+} from '@agent-device/host-kit/diagnostics';
+import { AppError, errorMessage, normalizeError } from '@agent-device/kernel/errors';
+import {
+  type DaemonCommandContext,
+  contextFromFlags as contextFromFlagsWithLog,
+  requestCwd,
+} from '../core/context.ts';
+import { assertSessionSelectorMatches } from '../core/session-selector.ts';
+import {
+  resolveCallerScopeRoot,
+  resolveEffectiveSessionName,
+  resolveSessionScope,
+} from '../sessions/session-routing.ts';
+import { deriveWebSessionIdentity } from '../core/session-tenant-scope.ts';
+import {
+  assertRequestLeaseAdmissionPreflight,
+  scopeRequestSession,
+} from '../sessions/request-admission.ts';
+import { isBoundedCompositeRequest } from '../core/lease-context.ts';
+import {
+  admitRequestLeaseForLockedScope,
+  cleanupExpiredLeasedSession,
+  endLeasedSession,
+  inspectSessionProviderReleaseOnClose,
+  type LeaseEndReason,
+  type SessionTeardown,
+} from '../sessions/lease-lifecycle.ts';
+import {
+  existingSessionExecutionLockKeys,
+  prepareLockedRequestBinding,
+  resolveRequestExecutionLockPlan,
+  type RequestExecutionLockPlan,
+} from './request-binding.ts';
+import {
+  beginOpenDeviceWait,
+  findSessionDeviceConflict,
+  readOpenWaitBudgetMs,
+} from '../sessions/open-device-contention-wait.ts';
+import {
+  createRequestExecutionLocks,
+  withRequestExecutionLockKeys,
+} from './request-execution-locks.ts';
+import { isRequestCanceled, throwIfRequestCanceled } from '@agent-device/host-kit/request';
+import { finalizeDaemonResponse } from './request-finalization.ts';
+import { refreshRecordingHealth } from '../sessions/request-recording-health.ts';
+import { runAdmittedLeaseWork } from './request-lease-work.ts';
+import { assertMacOsAppLeaseProcess } from '../resources/macos-app-lease.ts';
+import {
+  getSessionCommandKind,
+  resolveCommandAndroidAvdSelection,
+  shouldBlockForInvalidRecording,
+  shouldLockSessionExecution,
+  shouldValidateSessionSelector,
+} from '../core/daemon-command-registry.ts';
+import {
+  buildRequestFinishedEvent,
+  buildRequestStartedEvent,
+  shouldRecordEventForRequest,
+} from '@agent-device/session-journal/session-event-log';
+import type { LeaseRegistry } from '../resources/lease-registry.ts';
+import { type SessionStore } from '../core/session-store.ts';
+import type { DaemonRequest } from '../core/daemon-request.ts';
+import type { SessionRef, SessionState } from '../core/session-state.ts';
+import { teardownSessionResources } from '../sessions/session-teardown.ts';
+import { finalizeBoundSessionApplicationLifecycle } from './application-lifecycle-recovery.ts';
+import { runtimeHintValues } from '../sessions/session-runtime.ts';
+import type { DeviceRuntimeGateway } from '@agent-device/contracts/platform-runtime';
+import type { PlatformRuntimeOperations } from '@agent-device/contracts/platform-runtime-operations';
+import type { PlatformRequestScope } from '@agent-device/contracts/platform-runtime-host';
+import {
+  createRequestRuntimeBindings,
+  type BindDeviceRuntime,
+  type BindExactDeviceRuntime,
+  type InspectDeviceRuntimeFacts,
+  type RequestRuntimeBindings,
+} from '../core/request-runtime-binding.ts';
+import {
+  createDeviceClaimAdmission,
+  type DeviceClaimAdmission,
+} from '../resources/device/device-claim-admission.ts';
+import {
+  applyCommandDefaults,
+  resolveCommandDeviceClaimPolicy,
+} from '@agent-device/command-registry/registry';
+import type { PlatformResourceCleanup } from '../core/platform-resource-cleanup.ts';
+import type { DaemonPlatformServices } from '../core/platform-services.ts';
+import {
+  assertDaemonPolicyAdmitsDevice,
+  assertDaemonPolicyAdmitsRequest,
+} from '../core/daemon-policy.ts';
+import type { DaemonPolicy } from '@agent-device/daemon-contracts/daemon-policy-file';
+import { deviceClaimConflictError } from '../resources/device/device-claim-conflict.ts';
+import {
+  requestDispatchLedger,
+  type RequestDispatchLedger,
+} from '../core/request-dispatch-ledger.ts';
+
+async function resolveFreshBoundedOpenDevice(req: DaemonRequest, env: EnvMap): Promise<DeviceInfo> {
+  const { resolveForegroundOpenRequest } =
+    await import('../sessions/session-lifecycle/internal/session-open.ts');
+  const foreground = await resolveForegroundOpenRequest({ req, hasExistingSession: false });
+  if (foreground.type === 'response') {
+    if (!foreground.response.ok) {
+      const { code, message, details } = foreground.response.error;
+      throw new AppError(code, message, details);
+    }
+    throw new AppError('INVALID_ARGS', 'Invalid open target');
+  }
+  const openReq = foreground.type === 'resolved' ? foreground.req : req;
+  const { resolveRequestTargetDeviceSelection } =
+    await import('../core/request-device-resolution.ts');
+  const { resolveOpenTargetDeviceOptions } =
+    await import('../core/open-target-device-resolution.ts');
+  return (
+    await resolveRequestTargetDeviceSelection(openReq, resolveOpenTargetDeviceOptions(openReq, env))
+  ).device;
+}
+
+async function resolveBoundedClaimDevice(
+  req: DaemonRequest,
+  session: SessionState | undefined,
+  env: EnvMap,
+  platformServices: DaemonPlatformServices,
+): Promise<DeviceInfo> {
+  const { resolveBootCommandSelection, resolveCommandDevice, requireSessionOrExplicitSelector } =
+    await import('../resources/session-device-resolution.ts');
+  if (req.command !== 'open') {
+    const guard = requireSessionOrExplicitSelector(req.command, session, req.flags);
+    if (guard && !guard.ok) {
+      const { code, message, details } = guard.error;
+      throw new AppError(code, message, details);
+    }
+  }
+  if (req.command === 'open') return await resolveFreshBoundedOpenDevice(req, env);
+  if (req.command === 'install_source' && session) return session.device;
+  const params = {
+    session,
+    req,
+    env,
+    platformServices,
+    androidAvdSelection: resolveCommandAndroidAvdSelection(req.command),
+  };
+  if (req.command === 'boot') return (await resolveBootCommandSelection(params)).device;
+  return await resolveCommandDevice(params);
+}
+
+// Production daemon wiring owns one LeaseRegistry per process; scoping locks by registry keeps
+// test and embedded routers isolated without changing process-level serialization there.
+const leaseRegistryExecutionLocks = new WeakMap<LeaseRegistry, Map<string, Promise<unknown>>>();
+const requestScopeFinalizers = new WeakMap<
+  RequestExecutionScope,
+  (response: DaemonResponse) => DaemonResponse
+>();
+
+export type RequestExecutionScope = AsyncDisposable & {
+  /** The environment and working directory of the daemon serving this request. */
+  host: HostEnvironment;
+  req: DaemonRequest;
+  command: string;
+  sessionName: string;
+  requestLogPath: string;
+  runnerLogPath: string;
+  startedAtMs: number;
+  runAdmitted<T>(task: () => Promise<T>): Promise<T>;
+  runLocked<T>(task: () => Promise<T>): Promise<T>;
+  retainDeviceExecutionLock(deviceId: string): Promise<void>;
+  bindDevice: BindDeviceRuntime;
+  /** Root-composed platform services for this request's asks that bind no device runtime. */
+  platformServices: DaemonPlatformServices;
+  inspectFacts: InspectDeviceRuntimeFacts;
+  bindExactDevice: BindExactDeviceRuntime;
+  /** The request's mutations, recorded by every bound operation this scope hands out. */
+  dispatchLedger: RequestDispatchLedger;
+  throwIfCanceled(): void;
+};
+
+export type LockedRequestScope = {
+  req: DaemonRequest;
+  sessionName: string;
+  logPath: string;
+  existingSession: SessionState | undefined;
+  retainDeviceExecutionLock(deviceId: string): Promise<void>;
+  bindDevice: BindDeviceRuntime;
+  platformServices: DaemonPlatformServices;
+  inspectFacts: InspectDeviceRuntimeFacts;
+  bindExactDevice: BindExactDeviceRuntime;
+  dispatchLedger: RequestDispatchLedger;
+  throwIfCanceled(): void;
+  contextFromFlags(
+    flags: CommandFlags | undefined,
+    appBundleId?: string,
+    traceLogPath?: string,
+  ): DaemonCommandContext;
+  handlerContextFromFlags(
+    flags: CommandFlags | undefined,
+    appBundleId?: string,
+    traceLogPath?: string,
+  ): DaemonCommandContext;
+};
+
+type LockedRequestScopeResult =
+  | { type: 'scope'; scope: LockedRequestScope }
+  | { type: 'response'; response: DaemonResponse };
+
+export async function createRequestExecutionScope(params: {
+  host: HostEnvironment;
+  req: DaemonRequest;
+  sessionStore: SessionStore;
+  leaseRegistry: LeaseRegistry;
+  leaseLifecycleProvider?: LeaseLifecycleProvider;
+  deviceRuntimeGateway: DeviceRuntimeGateway<PlatformRuntimeOperations>;
+  platformServices: DaemonPlatformServices;
+  claimRecoveryGateway: ClaimRecoveryGatewayFactory;
+  platformRequestScope: PlatformRequestScope;
+  platformResourceCleanup?: PlatformResourceCleanup;
+  providerAppCatalog?: ProviderAppCatalog;
+  daemonPolicy?: DaemonPolicy;
+}): Promise<RequestExecutionScope> {
+  const { sessionStore, leaseRegistry } = params;
+  const tenantScopedReq = scopeRequestSession(restrictRemoteHostInputs(params.req));
+  // A nested batch or replay step arrives with the identity of the request that spawned it, and its
+  // own name is already the store key.
+  const webSession =
+    params.req.internal?.webSession ??
+    deriveWebSessionIdentity(
+      params.req.session,
+      tenantScopedReq,
+      resolveSessionScope(tenantScopedReq),
+    );
+  let scopedReq = applyRequestCommandDefaults({
+    ...tenantScopedReq,
+    internal: { ...tenantScopedReq.internal, webSession },
+  });
+
+  const command = scopedReq.command;
+  const startedAtMs = Date.now();
+  // The one trait that says a request acts *through* a session rather than merely resolving one:
+  // it is what puts the session's execution lock in this request's plan, and therefore the only
+  // trait under which an activity stamp can be written while holding that lock.
+  const attachesToSession = shouldLockSessionExecution(command);
+  const sessionName = resolveEffectiveSessionName(scopedReq, sessionStore, {
+    // Inventory commands (`session list`, `devices`, `doctor`, …) route only to locate their own
+    // artifacts and never act through a session, so they must keep resolving an address even when
+    // the workspace owns several implicit sessions. Refusing them would refuse `session list`, the
+    // command an agent runs to resolve that ambiguity.
+    attachesToSession: getSessionCommandKind(command) !== 'inventory',
+  });
+  const diagnosticsMeta = getDiagnosticsMeta();
+  const sessionDir = sessionStore.resolveSessionDir(sessionName);
+  const requestLog = resolveSessionRequestLog({
+    sessionDir,
+    session: sessionName,
+    requestId: scopedReq.meta?.requestId ?? diagnosticsMeta.requestId,
+  });
+  const requestLogPath = requestLog.path;
+  const runnerLogPath = resolveSessionRunnerLogPath(sessionDir);
+  updateDiagnosticsScope({
+    session: sessionName,
+    logPath: requestLog.path,
+    logRecord: requestLog.ref,
+  });
+  emitDiagnostic({
+    level: 'info',
+    phase: 'request_start',
+    data: {
+      publicSession: scopedReq.session,
+      effectiveSession: sessionName,
+      command: scopedReq.command,
+      tenant: scopedReq.meta?.tenantId,
+      isolation: scopedReq.meta?.sessionIsolation,
+      requestLogPath,
+      runnerLogPath,
+    },
+  });
+  const shouldRecordRequestEvents = shouldRecordEventForRequest(scopedReq);
+  if (shouldRecordRequestEvents) {
+    sessionStore.recordEvent(
+      sessionName,
+      buildRequestStartedEvent({
+        req: scopedReq,
+      }),
+    );
+  }
+  try {
+    if (params.daemonPolicy) assertDaemonPolicyAdmitsRequest(params.daemonPolicy, scopedReq);
+    assertRequestLeaseAdmissionPreflight(scopedReq);
+    // Parse the budget once, before resolving the target device or taking any lock. The lock plan
+    // still supplies the device to wait for, but an out-of-range budget is refused before either.
+    const openWaitBudgetMs =
+      scopedReq.command === 'open' ? readOpenWaitBudgetMs(scopedReq) : undefined;
+    const lockPlan: RequestExecutionLockPlan = shouldLockSessionExecution(command)
+      ? await resolveRequestExecutionLockPlan({ req: scopedReq, sessionName, sessionStore })
+      : { keys: [], deviceId: undefined };
+    // An `--wait <ms>` open spends the first of its budget here, while the request holds no locks
+    // yet: the device execution lock is what every operation that could free the device also
+    // needs, so waiting after taking it would have an open block its own recovery.
+    const openWait = beginOpenDeviceWait({
+      req: scopedReq,
+      budgetMs: openWaitBudgetMs,
+      sessionName,
+      sessionStore,
+      deviceId: lockPlan.deviceId,
+    });
+    await openWait?.waitForDeviceOutsideLocks();
+    const executionLocks = getLeaseRegistryExecutionLocks(leaseRegistry);
+    const requestExecutionLocks = createRequestExecutionLocks({
+      locks: executionLocks,
+      initialKeys: lockPlan.keys,
+      scope: params.platformRequestScope,
+    });
+    const dispatchLedger = requestDispatchLedger(scopedReq);
+    const { claimAdmission, runtimeBindings } = createRequestDeviceAccess({
+      env: params.host.env,
+      req: scopedReq,
+      command,
+      sessionName,
+      dispatchLedger,
+      workspace: requestCwd(scopedReq, params.host),
+      callerCwd: scopedReq.meta?.cwd,
+      stateDir: sessionStore.resolveDaemonStateDir(),
+      deviceRuntimeGateway: params.deviceRuntimeGateway,
+      platformRequestScope: params.platformRequestScope,
+      daemonPolicy: params.daemonPolicy,
+      claimRecoveryGateway: params.claimRecoveryGateway,
+      sessionStore,
+    });
+
+    let bindingCleanup: Promise<void> | undefined;
+    const disposeBindings = (): Promise<void> => {
+      bindingCleanup ??= (async () => {
+        try {
+          await runtimeBindings[Symbol.asyncDispose]();
+        } finally {
+          await claimAdmission[Symbol.asyncDispose]();
+        }
+      })();
+      return bindingCleanup;
+    };
+    const runAdmittedAndDispose = async <T>(task: () => Promise<T>): Promise<T> => {
+      try {
+        return await scope.runAdmitted(task);
+      } finally {
+        // The router consumes the same cleanup outcome when it finalizes the response,
+        // preserving a primary command failure over a secondary disposal failure.
+        await Promise.allSettled([disposeBindings()]);
+      }
+    };
+
+    const scope: RequestExecutionScope = {
+      host: params.host,
+      req: scopedReq,
+      command,
+      sessionName,
+      requestLogPath,
+      runnerLogPath,
+      startedAtMs,
+      retainDeviceExecutionLock: async (deviceId) =>
+        await requestExecutionLocks.retainDevice(deviceId),
+      bindDevice: runtimeBindings.bindDevice,
+      inspectFacts: runtimeBindings.inspectFacts,
+      bindExactDevice: runtimeBindings.bindExactDevice,
+      platformServices: { ...params.platformServices },
+      dispatchLedger,
+      throwIfCanceled: () => throwIfRequestCanceled(scopedReq.meta?.requestId),
+      runAdmitted: async (task) => {
+        throwIfRequestCanceled(scopedReq.meta?.requestId);
+        const boundedStep =
+          command !== 'batch' && command !== 'replay' && isBoundedCompositeRequest(scopedReq);
+        let admissionCompleted = false;
+        try {
+          const existingRef = sessionStore.lookup(sessionName);
+          const session = existingRef?.session;
+          const boundedResources = boundedStep
+            ? await import('../core/composite-resource-admission.ts')
+            : undefined;
+          if (boundedResources) {
+            await boundedResources.admitBoundedCompositeResourceRequest({
+              req: scopedReq,
+              session,
+              validateSessionReopen: async (current) => {
+                const { resolveExistingOpenRequest } =
+                  await import('../sessions/session-lifecycle/internal/session-open.ts');
+                const resolution = await resolveExistingOpenRequest({
+                  req: scopedReq,
+                  session: current,
+                  platformServices: scope.platformServices,
+                });
+                if (resolution.type === 'response' && !resolution.response.ok) {
+                  const { code, message, details } = resolution.response.error;
+                  throw new AppError(code, message, details);
+                }
+              },
+              closeWouldReleaseProviderLease: async () => {
+                if (!session?.lease) return false;
+                const facts =
+                  scopedReq.flags?.shutdown === true
+                    ? await scope.inspectFacts(session.device)
+                    : undefined;
+                return inspectSessionProviderReleaseOnClose({
+                  shutdownRequested:
+                    facts?.device.providerMode === 'provider-runtime' &&
+                    facts.operations.shutdownTarget.available,
+                  session,
+                  leaseRegistry,
+                  leaseLifecycleProvider: params.leaseLifecycleProvider,
+                });
+              },
+              claimRecovery: {
+                currentSessionExists: Boolean(session),
+                resolveDevice: async () => {
+                  const selected = await resolveBoundedClaimDevice(
+                    prepareLockedRequestBinding({ req: scopedReq, existingRef }).req,
+                    session,
+                    params.host.env,
+                    scope.platformServices,
+                  );
+                  await scopedReq.internal?.retainDeviceExecutionLock?.(selected.id);
+                  return selected;
+                },
+                hasInMemorySessionOwner: (device) =>
+                  sessionStore.findByDevice(device.id) !== undefined,
+                session: sessionName,
+                workspace: requestCwd(scopedReq, params.host),
+                stateDir: sessionStore.resolveDaemonStateDir(),
+                env: params.host.env,
+                observeDeviceBoot: scope.platformServices.deviceBootObservation,
+                claimConflictError: deviceClaimConflictError,
+                coveredClaimIsOwnedByRequest: (claim) => {
+                  const root = resolveCallerScopeRoot(scopedReq.meta?.cwd);
+                  return !root || resolveCallerScopeRoot(claim.workspace) === root;
+                },
+              },
+            });
+          }
+          throwIfRequestCanceled(scopedReq.meta?.requestId);
+          await cleanupExpiredLeasedSession({
+            env: params.host.env,
+            sessionName,
+            sessionStore,
+            leaseRegistry,
+            assertTeardownAllowed: () => {
+              if (command === 'batch' || command === 'replay' || boundedStep) {
+                throw new AppError('UNAUTHORIZED', 'Lease is not active', {
+                  reason: 'LEASE_NOT_FOUND',
+                  dispatched: 'no',
+                });
+              }
+            },
+            teardownSession: async (ref) =>
+              await teardownExpiredSession({
+                ref,
+                sessionStore,
+                inspectFacts: scope.inspectFacts,
+                bindDevice: scope.bindDevice,
+                platformCleanup: requirePlatformCleanup(params.platformResourceCleanup),
+              }),
+          });
+          scopedReq = admitRequestLeaseForLockedScope({
+            env: params.host.env,
+            req: scopedReq,
+            sessionName,
+            sessionStore,
+            leaseRegistry,
+            providerAppCatalog: params.providerAppCatalog,
+            daemonPolicy: params.daemonPolicy,
+          });
+          scope.req = scopedReq;
+          admissionCompleted = true;
+          const admittedLease = scopedReq.internal?.admittedLease;
+          if (admittedLease) await assertMacOsAppLeaseProcess(admittedLease);
+          return await runAdmittedLeaseWork({ leaseRegistry, req: scopedReq, task });
+        } finally {
+          // The #2833 inactivity deadline is measured from the END of the last command that ATTACHED
+          // to this session, stamped here under the session's own execution lock. The lock is what
+          // makes this one stamp enough: an expiry has to acquire it too, so it can never catch a
+          // session mid-command, and one command slower than the window keeps the session it is
+          // working on — the same guarantee admitted work gives a remote lease (ADR 0007).
+          //
+          // Two exclusions carry that parity. Inventory commands (`devices`, `doctor`, `session list`)
+          // resolve a session address only to locate their own artifacts, so on a shared host they run
+          // against a session they never act through — stamping there would let a bystander agent's
+          // polling keep another agent's abandoned claim alive forever. And a request whose client
+          // hung up preserves nothing, exactly as a canceled request renews no lease: an agent that
+          // timed out is the behavior this feature exists to catch.
+          if (
+            (!boundedStep || admissionCompleted) &&
+            attachesToSession &&
+            !isRequestCanceled(scopedReq.meta?.requestId)
+          ) {
+            sessionStore.noteSessionActivity(sessionName);
+          }
+        }
+      },
+      runLocked: async (task) => {
+        throwIfRequestCanceled(scopedReq.meta?.requestId);
+        if (!openWait) {
+          return await requestExecutionLocks.run(async () => await runAdmittedAndDispose(task));
+        }
+        return await openWait.runWhenDeviceIsUnheld({
+          acquireLocks: requestExecutionLocks.run,
+          task: async () => await runAdmittedAndDispose(task),
+        });
+      },
+      // Claims outlive the bindings they guard: release only once no device
+      // operation from this request can still run.
+      [Symbol.asyncDispose]: disposeBindings,
+    };
+    requestScopeFinalizers.set(scope, (response) => {
+      if (shouldRecordRequestEvents) {
+        sessionStore.recordEvent(
+          sessionName,
+          buildRequestFinishedEvent({
+            req: scopedReq,
+            response,
+            durationMs: Math.max(0, Date.now() - startedAtMs),
+          }),
+        );
+      }
+      return response;
+    });
+    return scope;
+  } catch (error) {
+    if (shouldRecordRequestEvents) {
+      sessionStore.recordEvent(
+        sessionName,
+        buildRequestFinishedEvent({
+          req: scopedReq,
+          response: {
+            ok: false,
+            error: normalizeError(error, {
+              diagnosticId: getDiagnosticsMeta().diagnosticId,
+              logPath: requestLogPath,
+            }),
+          },
+          durationMs: Math.max(0, Date.now() - startedAtMs),
+        }),
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * The request's device access, gated by the executing command's #1320 claim
+ * policy: bindings hand out device operations only after the claim admission
+ * derived from that policy allows it, so `transient-exclusive` commands hold an
+ * exclusive claim for as long as they can reach a device and every other policy
+ * stays out of the claim store.
+ */
+function createRequestDeviceAccess(params: {
+  env: EnvMap;
+  req: DaemonRequest;
+  command: string;
+  sessionName: string;
+  dispatchLedger: RequestDispatchLedger;
+  workspace: string;
+  callerCwd: string | undefined;
+  stateDir: string;
+  deviceRuntimeGateway: DeviceRuntimeGateway<PlatformRuntimeOperations>;
+  platformRequestScope: PlatformRequestScope;
+  daemonPolicy: DaemonPolicy | undefined;
+  claimRecoveryGateway: ClaimRecoveryGatewayFactory;
+  sessionStore: SessionStore;
+}): {
+  claimAdmission: DeviceClaimAdmission;
+  runtimeBindings: RequestRuntimeBindings;
+} {
+  const { deviceRuntimeGateway, platformRequestScope, daemonPolicy } = params;
+  const claimPolicy = resolveCommandDeviceClaimPolicy(params.command);
+  const claimAdmission = createDeviceClaimAdmission({
+    policy: claimPolicy,
+    command: params.command,
+    session: params.sessionName,
+    workspace: params.workspace,
+    callerCwd: params.callerCwd,
+    resolveScopeRoot: resolveCallerScopeRoot,
+    stateDir: params.stateDir,
+    env: params.env,
+    reconcileOrphanedDeviceClaim: createOwnerScopedDeviceClaimReconciler({
+      scope: platformRequestScope,
+      beforeGateway: async (claim) => {
+        const { createBoundedClaimRecoveryBeforeGateway } =
+          await import('../core/composite-resource-admission.ts');
+        return createBoundedClaimRecoveryBeforeGateway(params.req)(claim);
+      },
+      composeGateway: params.claimRecoveryGateway,
+    }),
+  });
+  return {
+    claimAdmission,
+    runtimeBindings: createRequestRuntimeBindings({
+      gateway: deviceRuntimeGateway,
+      scope: platformRequestScope,
+      dispatchLedger: params.dispatchLedger,
+      admitDeviceClaim: claimAdmission.admit,
+      admitDevice:
+        daemonPolicy || claimPolicy === 'require-owner'
+          ? (device) => {
+              if (daemonPolicy) {
+                assertDaemonPolicyAdmitsDevice(daemonPolicy, device);
+              }
+              if (claimPolicy === 'require-owner' && !params.sessionStore.get(params.sessionName)) {
+                const refusal = findSessionDeviceConflict({
+                  req: params.req,
+                  device,
+                  sessionStore: params.sessionStore,
+                  sessionName: params.sessionName,
+                });
+                if (refusal) {
+                  throw new AppError(
+                    refusal.error.code,
+                    refusal.error.message,
+                    refusal.error.details,
+                  );
+                }
+              }
+            }
+          : undefined,
+    }),
+  };
+}
+
+async function teardownExpiredSession(params: {
+  ref: SessionRef;
+  sessionStore: SessionStore;
+  inspectFacts: InspectDeviceRuntimeFacts;
+  bindDevice: BindDeviceRuntime;
+  platformCleanup: PlatformResourceCleanup;
+}): Promise<void> {
+  const { ref, sessionStore, inspectFacts, bindDevice, platformCleanup } = params;
+  const session = sessionStore.resolveCurrent(ref) ?? ref.session;
+  const sessionName = ref.address;
+  const runtimeHints = runtimeHintValues(sessionStore.getRuntimeHints(ref.address));
+  let primaryError: unknown;
+  try {
+    await teardownSessionResources({
+      appLog: 'run',
+      ref,
+      sessionStore,
+      platformCleanup,
+    });
+  } catch (error) {
+    primaryError = error;
+  }
+  try {
+    await finalizeBoundSessionApplicationLifecycle({
+      inspectFacts,
+      bindDevice,
+      session,
+      stateDir: sessionStore.resolveDaemonStateDir(),
+      runtimeHints,
+    });
+  } catch (cleanupError) {
+    if (primaryError !== undefined) {
+      emitDiagnostic({
+        level: 'error',
+        phase: 'expired_session_lifecycle_cleanup_failed',
+        data: {
+          session: sessionName,
+          error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+          primaryError: primaryError instanceof Error ? primaryError.message : String(primaryError),
+        },
+      });
+    } else {
+      throw cleanupError;
+    }
+  }
+  if (primaryError !== undefined) throw primaryError;
+}
+
+function requirePlatformCleanup(
+  cleanup: PlatformResourceCleanup | undefined,
+): PlatformResourceCleanup {
+  if (!cleanup) {
+    throw new AppError(
+      'INTERNAL_ERROR',
+      'Platform resource cleanup was not supplied by root runtime composition',
+    );
+  }
+  return cleanup;
+}
+
+function applyRequestCommandDefaults(req: DaemonRequest): DaemonRequest {
+  const flags = { ...(req.flags ?? {}) };
+  const changed = applyCommandDefaults(req.command, flags);
+  if (!changed) return req;
+  return {
+    ...req,
+    flags: flags as CommandFlags,
+  };
+}
+
+export async function prepareLockedRequestScope(params: {
+  scope: RequestExecutionScope;
+  sessionStore: SessionStore;
+  trackDownloadableArtifact: TrackDownloadableArtifact;
+}): Promise<LockedRequestScopeResult> {
+  const { scope, sessionStore, trackDownloadableArtifact } = params;
+  const logPath = scope.runnerLogPath;
+  scope.throwIfCanceled();
+  const seededRef = sessionStore.lookup(scope.sessionName);
+  if (seededRef) {
+    // A composite's resource health is checked by its admitted steps; the outer read can invalidate a durable recording.
+    if (scope.command !== 'batch' && scope.command !== 'replay') {
+      await refreshRecordingHealth(sessionStore, seededRef, scope.platformServices);
+    }
+    scope.throwIfCanceled();
+    sessionStore.requireCurrent(seededRef);
+  }
+  const binding = prepareLockedRequestBinding({
+    req: scope.req,
+    existingRef: seededRef ? sessionStore.refresh(seededRef) : undefined,
+  });
+  const lockedReq = binding.req;
+  // `scope.sessionName` is the resolved store key, so `existingRef` carries the address every
+  // recovery producer below must name — `existingRef.session.name` is only the public name.
+  const existingRef = binding.existingRef;
+  const existingSession = existingRef?.session;
+  updateDiagnosticsScope({ traceLogPath: existingSession?.trace?.outPath });
+  const finalize = (response: DaemonResponse): DaemonResponse => {
+    const finalized = finalizeDaemonResponse(lockedReq, response, trackDownloadableArtifact);
+    if (shouldRecordEventForRequest(lockedReq)) {
+      sessionStore.recordEvent(
+        scope.sessionName,
+        buildRequestFinishedEvent({
+          req: lockedReq,
+          response: finalized,
+          durationMs: Math.max(0, Date.now() - scope.startedAtMs),
+        }),
+      );
+    }
+    return finalized;
+  };
+  requestScopeFinalizers.set(scope, finalize);
+
+  const recordingInvalidatedReason =
+    existingSession?.screenRecording?.handle.inspect().invalidatedReason;
+  if (recordingInvalidatedReason && shouldBlockForInvalidRecording(scope.command)) {
+    return {
+      type: 'response',
+      response: {
+        ok: false,
+        error: {
+          code: 'COMMAND_FAILED',
+          message: recordingInvalidatedReason,
+        },
+      },
+    };
+  }
+
+  if (existingRef && !lockedReq.meta?.lockPolicy && shouldValidateSessionSelector(scope.command)) {
+    assertSessionSelectorMatches(existingRef, lockedReq.flags);
+  }
+
+  const contextFromFlags = (
+    flags: CommandFlags | undefined,
+    appBundleId?: string,
+    traceLogPath?: string,
+  ): DaemonCommandContext =>
+    contextFromRequestFlags(logPath, flags, appBundleId, traceLogPath, lockedReq.meta);
+
+  return {
+    type: 'scope',
+    scope: {
+      req: lockedReq,
+      sessionName: scope.sessionName,
+      logPath,
+      existingSession,
+      retainDeviceExecutionLock: scope.retainDeviceExecutionLock,
+      bindDevice: scope.bindDevice,
+      platformServices: scope.platformServices,
+      inspectFacts: scope.inspectFacts,
+      bindExactDevice: scope.bindExactDevice,
+      dispatchLedger: scope.dispatchLedger,
+      throwIfCanceled: scope.throwIfCanceled,
+      contextFromFlags,
+      handlerContextFromFlags: (flags, appBundleId, traceLogPath) =>
+        ({
+          ...contextFromFlags(flags, appBundleId, traceLogPath),
+          // Handlers may update surface during the request, so read the current session state.
+          surface: (seededRef
+            ? sessionStore.resolveCurrent(seededRef)
+            : sessionStore.get(scope.sessionName)
+          )?.surface,
+        }) satisfies DaemonCommandContext,
+    },
+  };
+}
+
+/** Final response/event construction runs only after request bindings dispose. */
+export function finalizeRequestExecutionScope(
+  scope: RequestExecutionScope,
+  response: DaemonResponse,
+): DaemonResponse {
+  const finalize = requestScopeFinalizers.get(scope);
+  requestScopeFinalizers.delete(scope);
+  return finalize ? finalize(response) : response;
+}
+
+function contextFromRequestFlags(
+  logPath: string,
+  flags: CommandFlags | undefined,
+  appBundleId?: string,
+  traceLogPath?: string,
+  meta?: DaemonRequest['meta'],
+): DaemonCommandContext {
+  const requestId = getDiagnosticsMeta().requestId;
+  return {
+    ...contextFromFlagsWithLog(logPath, flags, appBundleId, traceLogPath, requestId, meta),
+    requestId,
+  };
+}
+
+/**
+ * The per-`LeaseRegistry` execution-lock map a request's session and device locks are taken from.
+ * Exported because the #2833 session-idle reaper expires sessions through this same map: an expiry
+ * that did not wait on the session's execution lock could tear down a session mid-command, and a
+ * second map would make that race invisible rather than impossible.
+ */
+export function getLeaseRegistryExecutionLocks(
+  leaseRegistry: LeaseRegistry,
+): Map<string, Promise<unknown>> {
+  let locks = leaseRegistryExecutionLocks.get(leaseRegistry);
+  if (!locks) {
+    locks = new Map();
+    leaseRegistryExecutionLocks.set(leaseRegistry, locks);
+  }
+  return locks;
+}
+
+export type LeaseSessionEnd = Readonly<{
+  /**
+   * Ends sessions and retained execution hosts owned by `leaseId` under their execution locks.
+   * Clears live sessions' device claims after teardown. Never rejects.
+   */
+  end: (leaseId: string, reason: LeaseEndReason) => Promise<void>;
+  /** Retries retained-host cleanup that failed after the registry removed its lease. */
+  retryPending: () => Promise<void>;
+  /**
+   * Called when the daemon begins to leave. Shutdown tears every session down without taking an
+   * execution lock, so no lease end may start a teardown after this, including one already queued
+   * on the locks.
+   */
+  cancel: () => void;
+  /** Resolves once every lease end already started has finished. */
+  drain: () => Promise<void>;
+}>;
+
+const LEASE_END_RETRY_INTERVAL_MS = 10_000;
+
+export function createLeaseSessionEnd(params: {
+  env: HostEnvironment['env'];
+  sessionStore: SessionStore;
+  executionLocks: Map<string, Promise<unknown>>;
+  teardownSession: SessionTeardown;
+  cleanupSessionlessExecutionHost: PlatformResourceCleanup['cleanupSessionlessExecutionHost'];
+  withinDiagnosticsScope?: (run: () => Promise<void>) => Promise<void>;
+}): LeaseSessionEnd {
+  const { sessionStore, executionLocks, teardownSession } = params;
+  let closing = false;
+  const inFlight = new Map<string, Set<Promise<void>>>();
+  const pending = new Map<string, { reason: LeaseEndReason; nextRetryAt: number }>();
+
+  const endLiveSessions = async (leaseId: string, reason: LeaseEndReason): Promise<void> => {
+    const refs = sessionStore.listRefs().filter((ref) => ref.session.lease?.leaseId === leaseId);
+    await Promise.all(
+      refs.map(
+        async (ref) =>
+          await withRequestExecutionLockKeys(
+            executionLocks,
+            existingSessionExecutionLockKeys(ref.address, ref.session.device.id),
+            async () => {
+              if (closing) return;
+              if (sessionStore.resolveCurrent(ref)?.lease?.leaseId !== leaseId) return;
+              await endLeasedSession(
+                sessionStore.refresh(ref),
+                sessionStore,
+                teardownSession,
+                reason,
+                params.env,
+              );
+            },
+          ),
+      ),
+    );
+  };
+
+  const endUnderLocks = async (leaseId: string, reason: LeaseEndReason): Promise<void> => {
+    await endLiveSessions(leaseId, reason);
+    // A close queued before this lease end can retire its session while we wait for its locks.
+    const retainedHosts = sessionStore.listRetainedExecutionHosts(leaseId);
+    await Promise.all(
+      retainedHosts.map(async (host) => {
+        try {
+          await withRequestExecutionLockKeys(
+            executionLocks,
+            existingSessionExecutionLockKeys(host.address, host.device.id),
+            async () => {
+              if (closing || !sessionStore.ownsRetainedExecutionHost(host)) return;
+              if (!sessionStore.findByDevice(host.device.id)) {
+                await params.cleanupSessionlessExecutionHost(host.device);
+              }
+              sessionStore.releaseRetainedExecutionHost(host);
+            },
+          );
+        } catch (error) {
+          emitDiagnostic({
+            level: 'warn',
+            phase: 'retained_execution_host_cleanup_failed',
+            data: { leaseId, reason, deviceId: host.device.id, error: errorMessage(error) },
+          });
+        }
+      }),
+    );
+    // A reopen can publish its same-lease session while retained-host cleanup waits for the device.
+    await endLiveSessions(leaseId, reason);
+  };
+
+  const run = async (leaseId: string, reason: LeaseEndReason): Promise<void> => {
+    try {
+      await endUnderLocks(leaseId, reason);
+    } catch (error) {
+      emitDiagnostic({
+        level: 'warn',
+        phase: 'leased_session_end_failed',
+        data: { leaseId, reason, error: errorMessage(error) },
+      });
+    } finally {
+      if (
+        !closing &&
+        sessionStore.listRetainedExecutionHosts(leaseId).length === 0 &&
+        !sessionStore.listRefs().some((ref) => ref.session.lease?.leaseId === leaseId)
+      ) {
+        pending.delete(leaseId);
+      } else if (!closing) {
+        pending.set(leaseId, { reason, nextRetryAt: Date.now() + LEASE_END_RETRY_INTERVAL_MS });
+      }
+    }
+  };
+
+  const end = async (leaseId: string, reason: LeaseEndReason): Promise<void> => {
+    if (closing) return;
+    pending.set(leaseId, { reason, nextRetryAt: 0 });
+    const ending = params.withinDiagnosticsScope
+      ? params.withinDiagnosticsScope(async () => await run(leaseId, reason))
+      : run(leaseId, reason);
+    const running = inFlight.get(leaseId) ?? new Set<Promise<void>>();
+    running.add(ending);
+    inFlight.set(leaseId, running);
+    try {
+      await ending;
+    } finally {
+      running.delete(ending);
+      if (running.size === 0) inFlight.delete(leaseId);
+    }
+  };
+
+  return {
+    end,
+    retryPending: async () => {
+      await Promise.all(
+        Array.from(pending, async ([leaseId, { reason, nextRetryAt }]) => {
+          if (!inFlight.has(leaseId) && Date.now() >= nextRetryAt) await end(leaseId, reason);
+        }),
+      );
+    },
+    cancel: () => {
+      closing = true;
+    },
+    drain: async () => {
+      await Promise.allSettled(Array.from(inFlight.values()).flatMap((running) => [...running]));
+    },
+  };
+}

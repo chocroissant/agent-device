@@ -1,0 +1,147 @@
+import type { EnvMap, HostEnvironment } from '@agent-device/kernel/source-value';
+import type { AppLogSessionArtifacts } from '@agent-device/contracts/app-log-runtime';
+import type { DeviceShutdownRuntimeLoaders } from '@agent-device/contracts/device-shutdown-runtime';
+import type { OwnedProcessRecordWriter } from '@agent-device/contracts/platform-runtime-host';
+import type { PlatformRuntimeHost } from '@agent-device/contracts/platform-runtime-operations';
+import { macOsHelperSurface } from '@agent-device/contracts/session';
+import type {
+  CaptureSnapshotInput,
+  SnapshotResult,
+  SnapshotRuntimeHost,
+} from '@agent-device/contracts/snapshot-runtime';
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { createAppleToolHost } from './platform-runtime-apple-tool-host.ts';
+import { createHostToolchainPreparer } from './platform-runtime-toolchain-host.ts';
+import { createHostCommandRunner } from './platform-runtime-host-command-runner.ts';
+import { openAppLogOutput, readAppLogOutputTail } from './platform-runtime-app-log-output.ts';
+import { createManagedAppLogProcesses } from './platform-runtime-app-log-process.ts';
+import { createNetworkRuntimeHost } from './platform-runtime-network-host.ts';
+import { createScreenRecordingRuntimeHost } from './platform-runtime-screen-recording-host.ts';
+import { createAudioProbeRuntimeHost } from './platform-runtime-audio-probe-host.ts';
+import { createPerfRuntimeHost } from './platform-runtime-perf-host.ts';
+import { createApplePhysicalReadinessHost } from './platform-runtime-apple-physical-readiness.ts';
+import { createAppleAutomationKeepHotHost } from './platform-runtime-apple-automation-keep-hot.ts';
+import { createAndroidEmulatorHost } from './platform-runtime-android-emulator-host.ts';
+import { createDeviceShutdownRuntimeHost } from './platform-runtime-device-shutdown-host.ts';
+import { createAppleAppDeploymentExecutor } from './platform-runtime-apple-deployment-executor.ts';
+import { createAndroidAppDeploymentExecutor } from './platform-runtime-android-deployment-executor.ts';
+import { createTemporaryTextFile } from './platform-runtime-host.ts';
+import { createAndroidToolHost } from './platform-runtime-android-tool-host.ts';
+import { createAppleApplicationTools } from './platform-runtime-apple-application-tools.ts';
+import { createAndroidApplicationTools } from './platform-runtime-android-application-tools.ts';
+import { createLocalApplicationInteractorHost } from './platform-runtime-local-application-interactors.ts';
+import { createApplicationResourceLifecycle } from './platform-runtime-application-resources.ts';
+
+export { createSnapshotRuntimeHost } from '@agent-device/capture-kit/snapshot-desktop-surface';
+
+export async function loadMacOsSurfaceSnapshot(
+  options: CaptureSnapshotInput['options'],
+  signal: AbortSignal | undefined,
+  env: Readonly<EnvMap>,
+): Promise<SnapshotResult> {
+  // The Apple owner routes and names the surface; one it did not name was never routed here.
+  const surface =
+    options?.surface === undefined ? undefined : macOsHelperSurface(options.surface, 'native');
+  if (!surface) {
+    throw new TypeError('Apple surface capture requires a helper-routed macOS surface');
+  }
+  const { captureMacOsSurfaceSnapshot } = await import('@agent-device/platform-apple/macos');
+  return await captureMacOsSurfaceSnapshot({ ...options, surface }, signal, env);
+}
+
+export function createPlatformRuntimeHost(options: {
+  host: HostEnvironment;
+  sessionsDir: string;
+  resolveSessionArtifacts(sessionId: string): AppLogSessionArtifacts;
+  shutdownLoaders: DeviceShutdownRuntimeLoaders;
+  assertShutdownAllowed?: () => void;
+  snapshot: SnapshotRuntimeHost;
+  ownedProcesses?: OwnedProcessRecordWriter;
+}): PlatformRuntimeHost {
+  const host = options.host;
+  const env = host.env;
+  const processes = createManagedAppLogProcesses(options.sessionsDir, env);
+  const localProcessTransport = Object.freeze({ mode: 'local' as const, start: processes.start });
+  const appleTools = createAppleToolHost();
+  const commands = createHostCommandRunner(host);
+  const network = createNetworkRuntimeHost({
+    resolveSessionArtifacts: options.resolveSessionArtifacts,
+    processes,
+    resolveTransport: async (device) => {
+      if (device.platform !== 'web') return Object.freeze({ mode: 'local' as const });
+      const { resolveWebNetworkTransport } =
+        await import('./platform-runtime-network-web-transport.ts');
+      return await resolveWebNetworkTransport(device);
+    },
+  });
+  const appleApplications = createAppleApplicationTools(env);
+  const androidApplications = createAndroidApplicationTools();
+  return Object.freeze({
+    hostEnvironment: host,
+    commands,
+    appleTools,
+    toolchains: createHostToolchainPreparer(env),
+    artifacts: Object.freeze({ resolveSession: options.resolveSessionArtifacts }),
+    outputs: Object.freeze({
+      openAppend: async (pathname: string) =>
+        await openAppLogOutput(options.sessionsDir, pathname, host),
+      readTail: async (pathname: string, maxBytes: number) =>
+        await readAppLogOutputTail(options.sessionsDir, pathname, maxBytes),
+    }),
+    processes,
+    processTransports: Object.freeze({
+      resolve: async (device: DeviceInfo) => {
+        if (device.platform !== 'android') return localProcessTransport;
+        const { resolveAndroidAppLogProcessTransport } =
+          await import('./platform-runtime-app-log-android-transport.ts');
+        return resolveAndroidAppLogProcessTransport(
+          options.sessionsDir,
+          device,
+          localProcessTransport,
+          env,
+        );
+      },
+    }),
+    ...network,
+    appleDeployment: createAppleAppDeploymentExecutor(env),
+    androidDeployment: createAndroidAppDeploymentExecutor(env),
+    androidTools: createAndroidToolHost(),
+    temporaryFiles: Object.freeze({
+      create: async (temporaryFileOptions: { prefix: string; suffix: string }) =>
+        await createTemporaryTextFile(temporaryFileOptions),
+    }),
+    deviceReadiness: Object.freeze({
+      applePhysical: createApplePhysicalReadinessHost(),
+      appleAutomation: createAppleAutomationKeepHotHost(),
+      androidEmulator: createAndroidEmulatorHost(),
+    }),
+    deviceShutdown: createDeviceShutdownRuntimeHost(
+      { appleTools, commands },
+      options.shutdownLoaders,
+      options.assertShutdownAllowed,
+    ),
+    screenRecording: createScreenRecordingRuntimeHost({
+      ownedProcesses: options.ownedProcesses,
+      host,
+    }),
+    audioProbe: createAudioProbeRuntimeHost({ ownedProcesses: options.ownedProcesses, host }),
+    perf: createPerfRuntimeHost(),
+    snapshot: options.snapshot,
+    localInteractors: createLocalApplicationInteractorHost(host),
+    appleApplications,
+    androidApplications,
+    applicationResources: createApplicationResourceLifecycle({
+      android: androidApplications,
+      apple: appleApplications,
+    }),
+    clock: Object.freeze({
+      now: () => Date.now(),
+      sleep: async (milliseconds: number, signal?: AbortSignal) => {
+        await sleep(milliseconds, undefined, signal ? { signal } : undefined);
+      },
+    }),
+  });
+}
+
+export { recoverLegacyAppLogMarkersAfterDaemonLock } from './platform-runtime-app-log-process.ts';

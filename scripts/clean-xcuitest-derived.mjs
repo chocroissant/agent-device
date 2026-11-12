@@ -1,0 +1,122 @@
+#!/usr/bin/env node
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { AppError } from '@agent-device/kernel/errors';
+import {
+  assertSafeDerivedCleanup,
+  shouldDeleteRunnerDerivedRootEntry,
+  resolveRunnerDerivedOverride,
+  resolveRunnerScriptDefaultDerivedPath,
+} from '@agent-device/platform-apple/runner/operations';
+
+const DERIVED_OVERRIDE = resolveRunnerDerivedOverride(process.env);
+const platforms = process.argv.slice(2);
+const PLATFORM_LABELS = new Map([
+  ['ios', 'iOS'],
+  ['macos', 'macOS'],
+  ['tvos', 'tvOS'],
+  ['visionos', 'visionOS'],
+]);
+const requested = platforms.length > 0 ? platforms : [...PLATFORM_LABELS.keys()];
+const MAX_SUMMARY_ENTRY_NAMES = 3;
+
+for (const platform of requested) {
+  const platformLabel = PLATFORM_LABELS.get(platform);
+  if (!platformLabel) {
+    console.error(`Unsupported XCTest cache platform: ${platform}`);
+    console.error(`Supported platforms: ${[...PLATFORM_LABELS.keys()].join(', ')}`);
+    process.exitCode = 1;
+    continue;
+  }
+  const targetPath =
+    DERIVED_OVERRIDE ?? resolveRunnerScriptDefaultDerivedPath(platform, os.homedir());
+  try {
+    assertSafeDerivedCleanup(targetPath, process.env);
+    const result = cleanDerivedPath(platform, targetPath);
+    console.log(formatCleanupResult(platform, platformLabel, targetPath, result));
+  } catch (error) {
+    console.error(formatCleanupError(platformLabel, targetPath, error));
+    process.exitCode = 1;
+  }
+}
+
+// fallow-ignore-next-line complexity
+function cleanDerivedPath(platform, targetPath) {
+  if (!fs.existsSync(targetPath)) {
+    return { status: 'skipped', reason: 'not-found' };
+  }
+  if (wholeDirectoryClean(platform)) {
+    fs.rmSync(targetPath, { recursive: true, force: true });
+    return { status: 'removed' };
+  }
+  const removedEntries = [];
+  const preservedEntries = [];
+  for (const entry of fs.readdirSync(targetPath, { withFileTypes: true })) {
+    if (!shouldDeleteRunnerDerivedRootEntry(entry.name)) {
+      preservedEntries.push(entry.name);
+      continue;
+    }
+    fs.rmSync(path.join(targetPath, entry.name), { recursive: true, force: true });
+    removedEntries.push(entry.name);
+  }
+  if (removedEntries.length === 0) {
+    return {
+      status: 'skipped',
+      reason: 'no-transient-entries',
+      preservedEntries,
+    };
+  }
+  return {
+    status: 'removed',
+    removedEntries,
+    preservedEntries,
+  };
+}
+
+function formatCleanupResult(platform, platformLabel, targetPath, result) {
+  if (wholeDirectoryClean(platform))
+    return formatWholeDerivedCleanupResult(platformLabel, targetPath, result);
+  return formatIosCleanupResult(platformLabel, targetPath, result);
+}
+
+// Only a platform's own default subdirectory is removed whole; the shared base and an override
+// keep entries that are not build output.
+function wholeDirectoryClean(platform) {
+  return platform !== 'ios' && !DERIVED_OVERRIDE;
+}
+
+function formatWholeDerivedCleanupResult(platformLabel, targetPath, result) {
+  return result.status === 'removed'
+    ? `Removed ${platformLabel} XCTest derived data: ${targetPath}`
+    : `Skipped ${platformLabel} XCTest cleanup: ${targetPath} not found`;
+}
+
+function formatIosCleanupResult(platformLabel, targetPath, result) {
+  if (result.status === 'skipped' && result.reason === 'not-found') {
+    return `Skipped ${platformLabel} XCTest cleanup: ${targetPath} not found`;
+  }
+  const keptSuffix = formatKeptEntriesSuffix(result.preservedEntries);
+  if (result.status === 'skipped') {
+    return `Skipped ${platformLabel} XCTest cleanup under ${targetPath}: no transient entries found${keptSuffix}`;
+  }
+  return `Removed ${platformLabel} XCTest transient entries under ${targetPath}: ${summarizeEntryNames(result.removedEntries)}${keptSuffix}`;
+}
+
+function formatKeptEntriesSuffix(preservedEntries) {
+  return preservedEntries.length > 0 ? `; kept ${summarizeEntryNames(preservedEntries)}` : '';
+}
+
+function formatCleanupError(platformLabel, targetPath, error) {
+  const detail = error instanceof Error ? error.message : String(error);
+  const hint = error instanceof AppError ? error.details?.hint : undefined;
+  return `Failed to clean ${platformLabel} XCTest derived data under ${targetPath}: ${detail}${typeof hint === 'string' ? `\n${hint}` : ''}`;
+}
+
+function summarizeEntryNames(entryNames) {
+  const names = [...entryNames].sort();
+  if (names.length <= MAX_SUMMARY_ENTRY_NAMES) {
+    return names.join(', ');
+  }
+  return `${names.slice(0, MAX_SUMMARY_ENTRY_NAMES).join(', ')} (+${names.length - MAX_SUMMARY_ENTRY_NAMES} more)`;
+}

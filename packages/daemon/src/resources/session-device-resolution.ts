@@ -1,0 +1,155 @@
+import type { DaemonResponse } from '@agent-device/kernel/contracts';
+import type { EnvMap } from '@agent-device/kernel/source-value';
+import { hostDeviceIdOf, isIosFamily, type DeviceInfo } from '@agent-device/kernel/device';
+import { AppError, sessionOrDeviceSelectorRequiredDetails } from '@agent-device/kernel/errors';
+import { resolveRequestOrSessionLeaseScope } from '../core/lease-context.ts';
+import { isActiveProviderDevice } from '../core/provider-device-admission.ts';
+import type { DaemonPlatformServices } from '../core/platform-services.ts';
+import { resolveTargetDevice } from '@agent-device/device-selection/dispatch-resolve';
+import {
+  resolveRequestTargetDevice,
+  resolveRequestTargetDeviceSelection,
+} from '../core/request-device-resolution.ts';
+import {
+  resolveExistingSessionDeviceSelection,
+  type DeviceSelectionResult,
+} from '@agent-device/device-selection/device-selection-resolver';
+import type { DaemonRequest } from '../core/daemon-request.ts';
+import type { SessionState } from '../core/session-state.ts';
+import {
+  hasDeviceSelectionInput,
+  hasExplicitDeviceSelector,
+} from '../core/device/device-selector-intent.ts';
+import { listSessionSelectorConflicts } from '../core/session-selector.ts';
+import { errorResponse } from '@agent-device/kernel/contracts';
+
+const pinnedSessionDevices = new WeakMap<
+  DaemonPlatformServices,
+  { originalId: string; selected: DeviceInfo }
+>();
+
+export function pinSessionDeviceSelection(
+  platformServices: DaemonPlatformServices,
+  original: DeviceInfo,
+  selected: DeviceInfo,
+): void {
+  pinnedSessionDevices.set(platformServices, { originalId: original.id, selected });
+}
+
+export function requireSessionOrExplicitSelector(
+  command: string,
+  session: SessionState | undefined,
+  flags: DaemonRequest['flags'] | undefined,
+): DaemonResponse | null {
+  if (session || hasDeviceSelectionInput(flags)) {
+    return null;
+  }
+  return errorResponse(
+    'INVALID_ARGS',
+    `${command} requires an active session or an explicit device selector (e.g. --platform ios).`,
+    sessionOrDeviceSelectorRequiredDetails(),
+  );
+}
+
+export async function resolveCommandDevice(params: {
+  session: SessionState | undefined;
+  /** Its flags select the device; a web selection binds the device derived from its web session identity. */
+  req: DaemonRequest;
+  env: EnvMap;
+  androidAvdSelection?: 'running-only' | 'include-stopped';
+  platformServices: DaemonPlatformServices;
+}): Promise<DeviceInfo> {
+  const scope = resolveRequestOrSessionLeaseScope(params.req, params.session);
+  const shouldUseExplicitIdentity = hasExplicitDeviceSelector(params.req.flags);
+  if (!shouldUseExplicitIdentity && params.session && (!scope.leaseProvider || scope.leaseId)) {
+    const selected = await refreshSessionDeviceIfNeeded(
+      params.session.device,
+      params.platformServices,
+      params.env,
+    );
+    pinSessionDeviceSelection(params.platformServices, params.session.device, selected);
+    return selected;
+  }
+  const device = await resolveRequestTargetDevice(
+    params.req,
+    { env: params.env, androidAvdSelection: params.androidAvdSelection },
+    { ...params.req.flags, ...scope },
+  );
+  // A selector that names the host of the session's app device (ADR 0035) stays on that device:
+  // the session holds one app, not the host.
+  const held = params.session?.device;
+  return held && held.id !== device.id && hostDeviceIdOf(held.id) === device.id ? held : device;
+}
+
+/**
+ * Boot's device with its selection evidence. Boot alone reads the `--pick` opt-in; other
+ * commands keep refusing a tie.
+ */
+export async function resolveBootCommandSelection(
+  params: Parameters<typeof resolveCommandDevice>[0],
+): Promise<DeviceSelectionResult> {
+  if (params.session && !hasExplicitDeviceSelector(params.req.flags)) {
+    return resolveExistingSessionDeviceSelection(await resolveCommandDevice(params));
+  }
+  return await resolveRequestTargetDeviceSelection(params.req, {
+    env: params.env,
+    androidAvdSelection: params.androidAvdSelection,
+    boot: { pick: params.req.flags?.pick },
+  });
+}
+
+export async function refreshSessionDeviceIfNeeded(
+  device: DeviceInfo,
+  platformServices: DaemonPlatformServices,
+  env: EnvMap,
+): Promise<DeviceInfo> {
+  const pinned = pinnedSessionDevices.get(platformServices);
+  if (pinned?.originalId === device.id) return pinned.selected;
+  if (isActiveProviderDevice(device)) {
+    return device;
+  }
+  if (!isIosFamily(device) || device.kind !== 'simulator') {
+    return device;
+  }
+  if (process.platform !== 'darwin') {
+    return device;
+  }
+  // A live XCUITest runner session is attached to this exact UDID, which
+  // proves the simulator still exists and is booted — the two facts the
+  // ~0.7s re-resolve inventory listing exists to establish.
+  if ((await platformServices.appleSessionObservation.observeRunnerSession(device.id))?.alive) {
+    return { ...device, booted: true };
+  }
+
+  const exactSelector: NonNullable<DaemonRequest['flags']> = {
+    platform: 'ios',
+    target: device.target,
+    udid: device.id,
+    ...(device.simulatorSetPath ? { iosSimulatorDeviceSet: device.simulatorSetPath } : {}),
+  };
+  try {
+    return await resolveTargetDevice(exactSelector, { env });
+  } catch (error) {
+    if (!(error instanceof AppError) || error.code !== 'DEVICE_NOT_FOUND') {
+      throw error;
+    }
+  }
+
+  return await resolveTargetDevice(
+    {
+      platform: 'ios',
+      target: device.target,
+      device: device.name,
+      ...(device.simulatorSetPath ? { iosSimulatorDeviceSet: device.simulatorSetPath } : {}),
+    },
+    { env },
+  );
+}
+
+export function selectorTargetsSessionDevice(
+  flags: DaemonRequest['flags'] | undefined,
+  session: SessionState | undefined,
+): boolean {
+  if (!session) return false;
+  return listSessionSelectorConflicts(session, flags).length === 0;
+}

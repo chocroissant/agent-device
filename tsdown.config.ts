@@ -1,0 +1,168 @@
+import { buildEntries } from './scripts/build-entries.ts';
+import fs from 'node:fs';
+import { defineConfig, type TsdownPluginOption } from 'tsdown';
+import { bundledLicenseNotices } from './scripts/lib/bundled-license-notices.ts';
+
+const typeScriptPackageJsonUrl = import.meta.resolve('typescript/package.json');
+const { default: getTypeScript7ExePath } = await import(
+  new URL('lib/getExePath.js', typeScriptPackageJsonUrl).href
+);
+
+const packageJson = JSON.parse(
+  fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'),
+) as { version: string };
+
+const publicSdkChunkGroups = [
+  [
+    'sdk-contracts',
+    /packages[\\/]kernel[\\/]src[\\/]contracts\.d\.[cm]?ts$/,
+    /packages[\\/]kernel[\\/]src[\\/]contracts\.ts$/,
+  ],
+  [
+    'sdk-errors',
+    /packages[\\/]kernel[\\/]src[\\/]errors\.d\.[cm]?ts$/,
+    /packages[\\/]kernel[\\/]src[\\/]errors\.ts$/,
+  ],
+  [
+    'sdk-device',
+    /packages[\\/]kernel[\\/]src[\\/]device\.d\.[cm]?ts$/,
+    /packages[\\/]kernel[\\/]src[\\/]device\.ts$/,
+  ],
+  [
+    'sdk-snapshot',
+    /packages[\\/]kernel[\\/]src[\\/]snapshot\.d\.[cm]?ts$/,
+    /packages[\\/]kernel[\\/]src[\\/]snapshot\.ts$/,
+  ],
+  ['sdk-io', /src[\\/]io\.d\.[cm]?ts$/, /src[\\/]io\.ts$/],
+  [
+    'sdk-batch',
+    /packages[\\/]command-registry[\\/]src[\\/]batch-policy\.d\.[cm]?ts$/,
+    /packages[\\/]command-registry[\\/]src[\\/]batch-policy\.ts$/,
+  ],
+  [
+    'sdk-batch-runner',
+    /packages[\\/]command-registry[\\/]src[\\/]batch\.d\.[cm]?ts$/,
+    /packages[\\/]command-registry[\\/]src[\\/]batch\.ts$/,
+  ],
+  ['sdk-finders', /src[\\/]finders\.d\.[cm]?ts$/, /src[\\/]finders\.ts$/],
+  [
+    'sdk-remote-config',
+    /packages[\\/]remote[\\/]src[\\/]remote-config-schema\.d\.[cm]?ts$/,
+    /packages[\\/]remote[\\/]src[\\/]remote-config-schema\.ts$/,
+  ],
+  ['sdk-selectors', /src[\\/]sdk[\\/]selectors\.d\.[cm]?ts$/, /src[\\/]sdk[\\/]selectors\.ts$/],
+] as const;
+
+/**
+ * Drops the ambient `import '...'` marker `deps.dts.neverBundle` leaves behind, which a
+ * published install cannot resolve. Safe only while the name appears nowhere else.
+ */
+function dropAmbientDeclarationImport(
+  fileName: string,
+  code: string,
+  packageName = '@limrun/api',
+): string | null {
+  const ambientImport = new RegExp(`^import ["']${packageName}["'];\\n`, 'm');
+  if (!ambientImport.test(code)) return null;
+  const declarationChunk = code.replace(ambientImport, '');
+  if (declarationChunk.includes(packageName)) {
+    throw new Error(
+      `${fileName} keeps a type reference to ${packageName}, which is dev-bundled and absent from a published install.`,
+    );
+  }
+  return declarationChunk;
+}
+
+const dropAmbientDeclarationImports: TsdownPluginOption = {
+  name: 'agent-device:drop-ambient-declaration-imports',
+  renderChunk(code, chunk) {
+    return chunk.fileName.endsWith('.d.ts')
+      ? dropAmbientDeclarationImport(chunk.fileName, code)
+      : null;
+  },
+};
+
+export default defineConfig({
+  entry: buildEntries,
+  deps: {
+    alwaysBundle: [/^@agent-device\//],
+    onlyBundle: [
+      '@limrun/api',
+      '@limrun/xdelta3-wasm',
+      '@xmldom/xmldom',
+      'agent-base',
+      'b4a',
+      'debug',
+      'events-universal',
+      'eventsource-client',
+      'eventsource-parser',
+      'fast-fifo',
+      'has-flag',
+      'https-proxy-agent',
+      'ignore',
+      'ipaddr.js',
+      'jpeg-js',
+      'ms',
+      'pend',
+      'plist',
+      'pngjs',
+      'proxy-from-env',
+      'streamx',
+      'supports-color',
+      'tar-stream',
+      'text-decoder',
+      'undici',
+      'undici-types',
+      'ws',
+      'xmlbuilder',
+      'yaml',
+      'yauzl',
+    ],
+    // The Limrun SDK is dev-bundled, so a published install has no `@limrun/api` to resolve:
+    // the limrun facade declares the session and runtime types consumers may use.
+    dts: {
+      neverBundle: ['@limrun/api'],
+    },
+  },
+  inputOptions: {
+    // A build with missing workspace links resolves nothing under `alwaysBundle` and emits the
+    // specifiers as externals instead. That is how 0.20.4 shipped an unresolvable
+    // `@agent-device/ad-script` import: rolldown warned, exited 0, and `prepack` packed the result.
+    // An unresolved import in a bundle that is supposed to inline its workspace is never a warning.
+    onLog(level, log, handler) {
+      if (log.code === 'UNRESOLVED_IMPORT') {
+        throw new Error(
+          `${log.message}\nRun \`pnpm install\` to restore workspace links: unresolved imports would ship as unresolvable externals.`,
+        );
+      }
+      handler(level, log);
+    },
+  },
+  format: 'esm',
+  platform: 'node',
+  target: 'es2022',
+  outDir: 'dist/src',
+  tsconfig: 'tsconfig.lib.json',
+  define: {
+    __AGENT_DEVICE_VERSION__: JSON.stringify(packageJson.version),
+    __OWNER_FILES__: 'false',
+  },
+  shims: true,
+  hash: false,
+  outputOptions: {
+    codeSplitting: {
+      groups: publicSdkChunkGroups.flatMap(([name, dtsTest, jsTest]) => [
+        { test: dtsTest, name: `${name}.d` },
+        { test: jsTest, name },
+      ]),
+    },
+  },
+  outExtensions: () => ({ js: '.js', dts: '.d.ts' }),
+  minify: true,
+  plugins: [dropAmbientDeclarationImports, bundledLicenseNotices(import.meta.dirname)],
+  dts: {
+    tsgo: {
+      path: getTypeScript7ExePath(),
+    },
+  },
+});

@@ -1,0 +1,262 @@
+import { DEFAULT_ALERT_TIMEOUT_MS } from '@agent-device/contracts/alert-contract';
+import type { Interactor } from '@agent-device/contracts/interactor-types';
+import { invalidRuntimeContract } from '@agent-device/contracts/runtime-contract-error';
+import { emitDiagnostic } from '@agent-device/host-kit/diagnostics';
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import { AppError } from '@agent-device/kernel/errors';
+import { alertIfPresent } from './alert.ts';
+import { resolveIosSimulatorDeepLinkBundleId } from './core/app-resolution.ts';
+import {
+  isRunnerMainThreadTimeoutError,
+  RUNNER_READY_PREFLIGHT_TIMEOUT_MS,
+} from '@agent-device/apple-runner';
+
+export const LAUNCH_CONFIRMATION_FOREIGN_APP_REASON = 'launch_confirmation_foreign_app';
+
+/** Short presentation window for the optional launch-confirmation probe. */
+const LAUNCH_CONFIRMATION_PRESENTATION_TIMEOUT_MS = 3_000;
+
+/**
+ * How one launch-confirmation answer attempt ended. `accepted` verifies dismissal; an unreadable
+ * `alert-accept` has an unknown outcome. `alert-still-present` proves the recognized prompt remains
+ * after an accept failed. Other endings precede acceptance: no prompt, an unrecognized prompt, an
+ * unresolved URL owner, or an unreadable prerequisite. A caller acts on these typed outcomes and
+ * its own proof about the process, never on error text.
+ */
+export type LaunchConfirmationAttempt =
+  | Readonly<{ outcome: 'accepted' }>
+  | Readonly<{ outcome: 'absent' }>
+  | Readonly<{
+      outcome: 'unanswered';
+      reason: 'alert-unrecognized' | 'url-owner-unresolved' | 'alert-still-present';
+    }>
+  | Readonly<{ outcome: 'unreadable'; step: LaunchConfirmationStep }>;
+
+/** A step of the answer that failed, keyed for diagnostics and tests. */
+export type LaunchConfirmationStep = 'alert-read' | 'alert-accept' | 'url-owner' | 'runner';
+
+/**
+ * One shared deadline for the URL-owner lookup (the app listing and every Info.plist read). The
+ * alert read and accept are each bounded by the runner's `DEFAULT_ALERT_TIMEOUT_MS`; the lookup gets
+ * the same bound, well inside `IOS_APP_LAUNCH_TIMEOUT_MS`, so a wedged CoreSimulator leaves the open
+ * unanswered instead of holding it.
+ */
+export const URL_OWNER_LOOKUP_TIMEOUT_MS = 10_000;
+
+/**
+ * What one more press of `Open` can cost (#3861): the press and the read that verifies it, each a
+ * runner alert command that pays a readiness preflight and then runs up to its alert watchdog.
+ */
+const NEXT_PRESS_COST_MS = 2 * (RUNNER_READY_PREFLIGHT_TIMEOUT_MS + DEFAULT_ALERT_TIMEOUT_MS);
+
+/** A custom-scheme launch URL SpringBoard may hold for the session app it was checked for. */
+export type LaunchConfirmationTarget = Readonly<{ url: string; appBundleId: string }>;
+
+/** The device reads and the answer one launch confirmation needs, bound to the session app. */
+export type LaunchConfirmationPort = Readonly<{
+  appBundleId: string;
+  /**
+   * When the enclosing request must have its result. It decides only whether `Open` is pressed
+   * again; the first press and every read keep their own runner bounds.
+   */
+  deadlineAtMs: number | undefined;
+  /** Initial presentation wait, or `undefined` when no alert appears within its window. */
+  awaitAlert(): Promise<Record<string, unknown> | undefined>;
+  /** One presence read after an attempted accept. */
+  readAlert(): Promise<Record<string, unknown> | undefined>;
+  acceptAlert(): Promise<unknown>;
+  /** The installed app that owns the launch URL's scheme, when exactly one does. */
+  resolveUrlOwner(): Promise<string | undefined>;
+}>;
+
+/**
+ * Answers a launch confirmation. The title and buttons recognize the confirmation; the app it opens is
+ * the URL scheme's owner. An owner that is the session app is accepted; any other owner is never
+ * accepted and fails the open, because accepting would hand it the launch URL. Every other ending
+ * is reported as its typed attempt so the settle can decide what the launch still needs. Each step
+ * is bounded by its own timeout, so nothing outlives the answer.
+ */
+export async function answerLaunchConfirmation(
+  port: LaunchConfirmationPort,
+): Promise<LaunchConfirmationAttempt> {
+  const read = await readAlert(() => port.awaitAlert());
+  if ('outcome' in read) return read;
+  const alert = read.alert;
+  if (!alert) return { outcome: 'absent' };
+  if (!isLaunchConfirmation(alert)) {
+    emitDiagnostic({
+      level: 'warn',
+      phase: 'ios_launch_confirmation_unanswered',
+      data: {
+        reason: 'alert-unrecognized',
+        title: alert['message'],
+        buttons: alert['items'],
+      },
+    });
+    return { outcome: 'unanswered', reason: 'alert-unrecognized' };
+  }
+  const owner = await resolveUrlOwner(port);
+  if ('outcome' in owner) return owner;
+  if (owner.owner === undefined) {
+    reportUnanswered('url-owner-unresolved', {});
+    return { outcome: 'unanswered', reason: 'url-owner-unresolved' };
+  }
+  if (owner.owner !== port.appBundleId) {
+    throw new AppError('COMMAND_FAILED', `The launch URL asks to open ${owner.owner} instead.`, {
+      reason: LAUNCH_CONFIRMATION_FOREIGN_APP_REASON,
+      foreignAppBundleId: owner.owner,
+      sessionAppBundleId: port.appBundleId,
+      hint: `iOS is asking whether to open ${owner.owner}. Answer it with alert accept or alert dismiss, and pass a launch URL whose scheme belongs to the session app.`,
+    });
+  }
+  return await acceptConfirmation(port, alert);
+}
+
+/**
+ * Presses `Open` and verifies a failed press. Only a press the runner's watchdog abandoned, with the
+ * same confirmation still up, is pressed again, and only while the request's deadline leaves time
+ * for another whole press and its verification read. Any other failure, and a confirmation that is
+ * gone, ends the answer at once. The runner refuses new work as `RUNNER_BUSY` until abandoned work
+ * drains, so a read that sees the confirmation proves the abandoned press finished without
+ * answering it, and the next press cannot answer a later alert.
+ */
+async function acceptConfirmation(
+  port: LaunchConfirmationPort,
+  original: Record<string, unknown>,
+): Promise<LaunchConfirmationAttempt> {
+  for (;;) {
+    const failure = await port.acceptAlert().then(
+      () => undefined,
+      (error: unknown) => ({ error }),
+    );
+    if (!failure) return accepted();
+    const attempt = await verifyFailedAcceptance(port, original, failure.error);
+    if (attempt.outcome !== 'unanswered') return attempt;
+    const remainingMs = timeLeft(port.deadlineAtMs);
+    if (!isRunnerMainThreadTimeoutError(failure.error) || remainingMs < NEXT_PRESS_COST_MS) {
+      reportUnanswered('alert-still-present', {});
+      return attempt;
+    }
+    emitDiagnostic({
+      level: 'debug',
+      phase: 'ios_launch_confirmation_reaccept',
+      data: { reason: 'runner-main-thread-timeout', remainingMs },
+    });
+  }
+}
+
+function timeLeft(deadlineAtMs: number | undefined): number {
+  return deadlineAtMs === undefined ? 0 : Math.max(0, deadlineAtMs - Date.now());
+}
+
+async function verifyFailedAcceptance(
+  port: LaunchConfirmationPort,
+  original: Record<string, unknown>,
+  error: unknown,
+): Promise<LaunchConfirmationAttempt> {
+  const read = await readAlert(() => port.readAlert());
+  if ('outcome' in read) return unreadable('alert-accept')(error);
+  if (
+    read.alert &&
+    isLaunchConfirmation(read.alert) &&
+    read.alert['message'] === original['message']
+  ) {
+    return { outcome: 'unanswered', reason: 'alert-still-present' };
+  }
+  return unreadable('alert-accept')(error);
+}
+
+async function readAlert(
+  read: LaunchConfirmationPort['readAlert'],
+): Promise<Readonly<{ alert: Record<string, unknown> | undefined }> | LaunchConfirmationAttempt> {
+  return await read().then((alert) => ({ alert }), unreadable('alert-read'));
+}
+
+async function resolveUrlOwner(
+  port: LaunchConfirmationPort,
+): Promise<Readonly<{ owner: string | undefined }> | LaunchConfirmationAttempt> {
+  return await port.resolveUrlOwner().then((owner) => ({ owner }), unreadable('url-owner'));
+}
+
+function accepted(): LaunchConfirmationAttempt {
+  return { outcome: 'accepted' };
+}
+
+/**
+ * The runner marks SpringBoard's `Open in “<App>”?` prompt, for a URL it holds until the user
+ * confirms the app that will open it, by the OS's own wording of its title and buttons in the
+ * device's language. A title or button match here is unsafe: a permission alert names the app too.
+ * An alert the runner did not mark is reported as unrecognized.
+ */
+function isLaunchConfirmation(alert: Record<string, unknown>): boolean {
+  return alert['launchConfirmationPrompt'] === true;
+}
+
+/** A failed step leaves the open unanswered; the failure is reported, not thrown. */
+function unreadable(step: LaunchConfirmationStep): (error: unknown) => LaunchConfirmationAttempt {
+  return (error) => {
+    reportUnanswered('step-failed', {
+      step,
+      code: error instanceof AppError ? error.code : undefined,
+    });
+    return { outcome: 'unreadable', step };
+  };
+}
+
+function reportUnanswered(reason: string, data: Record<string, unknown>): void {
+  emitDiagnostic({
+    level: 'debug',
+    phase: 'ios_launch_confirmation_unanswered',
+    data: { reason, ...data },
+  });
+}
+
+/**
+ * Answers the confirmation through the runner interactor, resolved once for the read and the
+ * accept. A runner that cannot be resolved is reported as an unreadable attempt.
+ */
+export async function answerSimulatorLaunchConfirmation(
+  device: DeviceInfo,
+  confirmation: LaunchConfirmationTarget,
+  interactor: Promise<Interactor>,
+  signal: AbortSignal,
+  deadlineAtMs: number | undefined,
+): Promise<LaunchConfirmationAttempt> {
+  const settled: Readonly<{ interactor: Interactor }> | LaunchConfirmationAttempt =
+    await interactor.then((resolved) => ({ interactor: resolved }), unreadable('runner'));
+  if ('outcome' in settled) return settled;
+  return await answerLaunchConfirmation(
+    createLaunchConfirmationPort(device, confirmation, settled.interactor, signal, deadlineAtMs),
+  );
+}
+
+export function createLaunchConfirmationPort(
+  device: DeviceInfo,
+  { url, appBundleId }: LaunchConfirmationTarget,
+  interactor: Pick<Interactor, 'awaitAlert' | 'readAlert' | 'acceptAlert'>,
+  signal: AbortSignal,
+  deadlineAtMs: number | undefined,
+): LaunchConfirmationPort {
+  const awaitAlert = interactor.awaitAlert?.bind(interactor);
+  const readAlert = interactor.readAlert?.bind(interactor);
+  const acceptAlert = interactor.acceptAlert?.bind(interactor);
+  if (!awaitAlert || !readAlert || !acceptAlert) {
+    throw invalidRuntimeContract('Apple interactor has no alert wait, read or accept leg');
+  }
+  const target = { appBundleId, surface: 'app' } as const;
+  return Object.freeze({
+    appBundleId,
+    deadlineAtMs,
+    awaitAlert: async () =>
+      await alertIfPresent(
+        awaitAlert({ ...target, timeoutMs: LAUNCH_CONFIRMATION_PRESENTATION_TIMEOUT_MS }),
+      ),
+    readAlert: async () => await alertIfPresent(readAlert(target)),
+    acceptAlert: async () => await acceptAlert(target),
+    resolveUrlOwner: async () =>
+      await resolveIosSimulatorDeepLinkBundleId(device, url, {
+        timeoutMs: URL_OWNER_LOOKUP_TIMEOUT_MS,
+        signal,
+      }),
+  });
+}

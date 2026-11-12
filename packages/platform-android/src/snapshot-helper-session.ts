@@ -1,0 +1,196 @@
+/**
+ * Commands that run over a live automation-helper session: acquisition, input, and focus reads. Session ownership itself — starting, reusing, retiring — belongs to
+ * `snapshot-helper-session-lifecycle.ts`, which this module acquires through.
+ */
+import { AppError, discloseDispatch } from '@agent-device/kernel/errors';
+import { isAdbHostRefusal } from './adb-failure.ts';
+import { emitDiagnostic } from '@agent-device/host-kit/diagnostics';
+import { readAndroidCaptureFailureReason } from '@agent-device/contracts/android-snapshot-quality';
+import type {
+  AndroidSnapshotHelperCaptureOptions,
+  AndroidSnapshotHelperOutput,
+} from './snapshot-helper-types.ts';
+import { resolveAndroidSnapshotHelperCaptureOptions } from './snapshot-helper-capture.ts';
+import {
+  isAndroidSnapshotHelperSessionRequestTimeout,
+  parseAndroidSnapshotHelperSessionTouchResponse,
+  requestAndroidSnapshotHelperSessionSnapshot,
+  sendAndroidSnapshotHelperSessionCommand,
+} from './snapshot-helper-session-protocol.ts';
+import {
+  acquireAndroidSnapshotHelperSession,
+  getLiveAndroidSnapshotHelperSession,
+  retireFailedAndroidSnapshotHelperSession,
+  stopAndroidSnapshotHelperSession,
+  type AndroidSnapshotHelperSessionAcquisition,
+  type AndroidSnapshotHelperSessionHelperIdentity,
+} from './snapshot-helper-session-lifecycle.ts';
+
+export async function captureAndroidSnapshotWithHelperSession(
+  options: AndroidSnapshotHelperCaptureOptions,
+): Promise<AndroidSnapshotHelperOutput | undefined> {
+  const acquired = await acquireAndroidSnapshotHelperSession(options);
+  return acquired ? await captureFromAndroidSnapshotHelperSession(acquired, options) : undefined;
+}
+
+/** Captures over a session that is ready; `undefined` means the session failed and was retired. */
+export async function captureFromAndroidSnapshotHelperSession(
+  acquired: AndroidSnapshotHelperSessionAcquisition,
+  options: AndroidSnapshotHelperCaptureOptions,
+): Promise<AndroidSnapshotHelperOutput | undefined> {
+  const { session, deviceKey, resolved } = acquired;
+  const requestedAtMs = Date.now();
+  const reused = session.capturedCount > 0;
+  try {
+    const output = await requestAndroidSnapshotHelperSessionSnapshot({
+      port: session.port,
+      commandTimeoutMs: resolved.commandTimeoutMs,
+      signal: options.signal,
+      idleWait: options.idleWait,
+      commands: session.commands,
+    });
+    session.capturedCount += 1;
+    return {
+      xml: output.xml,
+      metadata: {
+        ...output.metadata,
+        transport: 'persistent-session',
+        sessionReused: reused,
+      },
+    };
+  } catch (error) {
+    // Read before the retirement below, which ends the process: a process that is still running
+    // has no cause of its own to report, and the retirement never waits for one.
+    const instrumentation = session.processRecord.current();
+    await retireFailedAndroidSnapshotHelperSession({
+      deviceKey,
+      identity: session.identity,
+      failedAfterMs: Date.now() - requestedAtMs,
+      fallbackBudgetMs: resolveAndroidSnapshotHelperCaptureOptions(options).commandTimeoutMs,
+      reusedSessionTimedOut: reused && isAndroidSnapshotHelperSessionRequestTimeout(error),
+      signal: options.signal,
+      cause: error,
+    });
+    options.signal?.throwIfAborted();
+    emitDiagnostic({
+      level: 'warn',
+      phase: 'android_snapshot_helper_session_fallback',
+      data: {
+        deviceKey,
+        reason: error instanceof Error ? error.message : String(error),
+        instrumentation,
+        // The typed reason the session protocol already published, not a second
+        // comparison against the helper's error type: one owner, one taxonomy (#1983).
+        uiAutomationConnectionTimeout:
+          readAndroidCaptureFailureReason(error) === 'accessibility-timeout',
+      },
+    });
+    return undefined;
+  }
+}
+
+// Touch commands piggyback on a live snapshot session so gestures do not restart instrumentation
+// (a second instrumentation for the helper package would force-stop the session that has it). They
+// never start a session: without one, callers use the same helper APK through a one-shot
+// `am instrument` run instead.
+export type AndroidTouchHelperAction =
+  | 'gesture'
+  | 'viewport'
+  | 'input'
+  | 'screenshot'
+  | 'focus'
+  | 'app';
+
+/**
+ * Gestures and input commands mutate the app, so their failures disclose whether input reached it. A
+ * mutation failure is `unknown` unless the host adb refused the launch: an `ok=false` result carries the
+ * thrown `errorType` but no count of events injected before the throw, so a parse refusal and a
+ * mid-injection failure read alike.
+ */
+export function discloseHelperTouchDispatch(
+  action: AndroidTouchHelperAction,
+  error: unknown,
+): unknown {
+  if ((action !== 'gesture' && action !== 'input') || !(error instanceof AppError)) return error;
+  return discloseDispatch(error, isAdbHostRefusal(error) ? 'no' : 'unknown');
+}
+
+export async function runAndroidSnapshotHelperSessionTouchCommand(params: {
+  deviceKey: string;
+  action: AndroidTouchHelperAction;
+  helper: AndroidSnapshotHelperSessionHelperIdentity;
+  payloadBase64?: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}): Promise<Record<string, string> | undefined> {
+  params.signal?.throwIfAborted();
+  const session = await getLiveAndroidSnapshotHelperSession(params.deviceKey);
+  if (!session) return undefined;
+  if (!matchesSessionHelperIdentity(session.helper, params.helper)) {
+    // A different helper binary was selected for this device (e.g. a provider-supplied artifact).
+    // The live session belongs to the previous helper, so stop it and let the touch command run
+    // one-shot against the selected artifact; the next snapshot restarts the session with it.
+    emitDiagnostic({
+      level: 'warn',
+      phase: 'android_snapshot_helper_session_touch_identity_mismatch',
+      data: {
+        deviceKey: params.deviceKey,
+        sessionHelper: session.helper,
+        requestedHelper: params.helper,
+      },
+    });
+    await stopAndroidSnapshotHelperSession(params.deviceKey);
+    return undefined;
+  }
+  const requestId = `${params.action}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const command = params.payloadBase64
+    ? `${params.action} ${requestId} ${params.payloadBase64}`
+    : `${params.action} ${requestId}`;
+  let headers: Record<string, string>;
+  try {
+    const response = await sendAndroidSnapshotHelperSessionCommand(
+      session.port,
+      command,
+      params.timeoutMs,
+      params.signal,
+    );
+    headers = parseAndroidSnapshotHelperSessionTouchResponse(response, requestId);
+  } catch (error) {
+    // Transport-level failure: the session process can no longer be trusted. Stop it so the next
+    // command runs against a fresh helper instead of a wedged socket.
+    await stopAndroidSnapshotHelperSession(params.deviceKey, {
+      signal: params.signal,
+      cause: error,
+    });
+    throw discloseHelperTouchDispatch(params.action, error);
+  }
+  if (headers.ok !== 'true') {
+    // The helper ran and reported a structured failure; the session itself stays healthy.
+    const failure = new AppError(
+      'COMMAND_FAILED',
+      headers.message || headers.errorType || `Android automation helper ${params.action} failed`,
+      { errorType: headers.errorType, helper: headers },
+    );
+    throw params.action === 'input' && headers.injected === 'false'
+      ? discloseDispatch(failure, 'no')
+      : discloseHelperTouchDispatch(params.action, failure);
+  }
+  return headers;
+}
+
+function matchesSessionHelperIdentity(
+  session: AndroidSnapshotHelperSessionHelperIdentity,
+  requested: AndroidSnapshotHelperSessionHelperIdentity,
+): boolean {
+  return (
+    session.packageName === requested.packageName &&
+    session.runner === requested.runner &&
+    matchesWhenBothDefined(session.helperVersion, requested.helperVersion) &&
+    matchesWhenBothDefined(session.helperVersionCode, requested.helperVersionCode) &&
+    matchesWhenBothDefined(session.sha256, requested.sha256)
+  );
+}
+
+function matchesWhenBothDefined<Value>(a: Value | undefined, b: Value | undefined): boolean {
+  return a === undefined || b === undefined || a === b;
+}

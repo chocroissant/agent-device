@@ -1,0 +1,303 @@
+// Pure model for the changed-line coverage gate (#1418): joins a unified=0
+// diff (base...HEAD) with vitest's lcov report to score coverage of CHANGED
+// LINES ONLY. Only added (new-side) lines count — deleted lines never do — so
+// the gate is deterministic against renames and deletes. run.ts owns all I/O.
+//
+// The coverable universe is the verified stamp's include/exclude, not a second
+// copy of the coverage config: `isInstrumentedPath` against the stamp is what
+// decides whether a changed file owes coverage, the same selection the CRAP
+// gate reads from the same stamp. A changed instrumented file ABSENT from
+// lcov was dropped by the run — reported (non-gating) so the gap cannot
+// silently absorb new logic. A changed file the stamp excludes is out of scope
+// by declaration and owes no gating line — but when an include root covers it,
+// its code-like added lines still show in the non-gating excluded tally, so
+// new logic under an exclude entry cannot hide from the job summary either.
+
+import type { ChangedFileDiff } from '../lib/repo-git.ts';
+import { normalizePath } from '../lib/repo-path.ts';
+import { isIncludedPath, isInstrumentedPath, type CoverageConfig } from '../coverage-crap/stamp.ts';
+
+// Single source of truth for the gate. Changed-line coverage below this
+// percentage fails the Coverage CI job (unless waived).
+export const CHANGED_LINE_COVERAGE_THRESHOLD = 70;
+
+export type LcovBranch = { readonly line: number; readonly taken: number };
+
+export type LcovFile = {
+  readonly path: string;
+  // line -> DA hit count; lines absent here are non-executable or ignored.
+  readonly lineHits: ReadonlyMap<number, number>;
+  readonly branches: readonly LcovBranch[];
+};
+
+export type CoverageIndex = ReadonlyMap<string, LcovFile>;
+
+function parseDaRecord(body: string): readonly [number, number] | null {
+  const [lineNo, hits] = body.split(',');
+  const n = Number(lineNo);
+  const h = Number(hits);
+  return Number.isFinite(n) && Number.isFinite(h) ? [n, h] : null;
+}
+
+function parseBrdaRecord(body: string): LcovBranch | null {
+  // BRDA:<line>,<block>,<branch>,<taken>; taken is '-' when never reached.
+  const parts = body.split(',');
+  const line = Number(parts[0]);
+  if (!Number.isFinite(line)) return null;
+  const takenRaw = parts[3];
+  const taken = takenRaw === '-' || takenRaw === undefined ? 0 : Number(takenRaw);
+  return { line, taken: Number.isFinite(taken) ? taken : 0 };
+}
+
+function parseLcovRecord(block: string, rootDir?: string): LcovFile | null {
+  let path: string | null = null;
+  const lineHits = new Map<number, number>();
+  const branches: LcovBranch[] = [];
+  for (const raw of block.split('\n')) {
+    const line = raw.trim();
+    if (line.startsWith('SF:')) {
+      path = normalizePath(line.slice(3), rootDir);
+    } else if (line.startsWith('DA:')) {
+      const da = parseDaRecord(line.slice(3));
+      if (da) lineHits.set(da[0], da[1]);
+    } else if (line.startsWith('BRDA:')) {
+      const branch = parseBrdaRecord(line.slice(5));
+      if (branch) branches.push(branch);
+    }
+  }
+  return path === null ? null : { path, lineHits, branches };
+}
+
+export function parseLcov(text: string, rootDir?: string): CoverageIndex {
+  const index = new Map<string, LcovFile>();
+  for (const block of text.split('end_of_record')) {
+    const file = parseLcovRecord(block, rootDir);
+    if (file) index.set(file.path, file);
+  }
+  return index;
+}
+
+// A changed line looks like product code (not blank, not a comment-only line).
+// Used only for the non-gating excluded tally, where no lcov signal exists.
+function isCodeLike(text: string | undefined): boolean {
+  if (text === undefined) return false;
+  const trimmed = text.trim();
+  if (trimmed === '') return false;
+  return !/^(\/\/|\/\*|\*)/.test(trimmed);
+}
+
+type IgnoreDirective = { readonly kind: 'next' | 'start' | 'stop'; readonly count: number };
+
+function parseIgnoreDirective(line: string): IgnoreDirective | null {
+  const match = /(?:v8|c8|istanbul)\s+ignore\s+(next|start|stop)(?:\s+(\d+))?/.exec(line);
+  if (!match) return null;
+  return { kind: match[1] as IgnoreDirective['kind'], count: match[2] ? Number(match[2]) : 1 };
+}
+
+// Lines suppressed by an explicit coverage-ignore directive (v8 / c8 / istanbul).
+// `next [N]` ignores the following N lines (default 1); `start`/`stop` bracket a
+// range. Matches how vitest's v8 provider drops these from the DA records.
+export function ignoredLineSet(lines: readonly string[]): Set<number> {
+  const ignored = new Set<number>();
+  let rangeActive = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const directive = parseIgnoreDirective(lines[i] ?? '');
+    if (directive === null) {
+      if (rangeActive) ignored.add(i + 1);
+    } else if (directive.kind === 'stop') {
+      rangeActive = false;
+    } else if (directive.kind === 'start') {
+      rangeActive = true;
+      ignored.add(i + 1);
+    } else {
+      for (let k = 1; k <= directive.count; k += 1) ignored.add(i + 1 + k);
+    }
+  }
+  return ignored;
+}
+
+export type FileCoverageReport = {
+  readonly path: string;
+  readonly coveredLines: number;
+  readonly totalLines: number;
+  readonly uncoveredLines: readonly number[];
+  readonly coveredBranches: number;
+  readonly totalBranches: number;
+};
+
+export type ExcludedFileReport = {
+  readonly path: string;
+  readonly reason: 'excluded-path' | 'ignored-lines';
+  readonly lines: readonly number[];
+};
+
+export type ChangedCoverageResult = {
+  readonly threshold: number;
+  readonly coveredLines: number;
+  readonly totalLines: number;
+  // null when no changed line is coverable (e.g. a docs-only PR): the gate is a
+  // trivial pass rather than a divide-by-zero.
+  readonly pct: number | null;
+  readonly waived: boolean;
+  readonly passed: boolean;
+  readonly offenders: readonly FileCoverageReport[];
+  readonly branch: {
+    readonly covered: number;
+    readonly total: number;
+    readonly pct: number | null;
+  };
+  readonly excluded: { readonly files: readonly ExcludedFileReport[]; readonly totalLines: number };
+};
+
+function ratioPct(covered: number, total: number): number | null {
+  if (total === 0) return null;
+  return Math.round((covered / total) * 10000) / 100;
+}
+
+function scoreGateFile(path: string, added: readonly number[], cov: LcovFile): FileCoverageReport {
+  let coveredLines = 0;
+  let totalLines = 0;
+  const uncoveredLines: number[] = [];
+  for (const n of added) {
+    const hits = cov.lineHits.get(n);
+    if (hits === undefined) continue;
+    totalLines += 1;
+    if (hits > 0) coveredLines += 1;
+    else uncoveredLines.push(n);
+  }
+  const addedSet = new Set(added);
+  const changedBranches = cov.branches.filter((b) => addedSet.has(b.line));
+  return {
+    path,
+    coveredLines,
+    totalLines,
+    uncoveredLines,
+    coveredBranches: changedBranches.filter((b) => b.taken > 0).length,
+    totalBranches: changedBranches.length,
+  };
+}
+
+// Changed lines suppressed by an ignore directive: executable-looking, absent
+// from the DA records, inside an ignore range. Reported, never gated.
+function ignoredChangedLines(
+  added: readonly number[],
+  cov: LcovFile,
+  contentLines: readonly string[],
+): number[] {
+  const ignored = ignoredLineSet(contentLines);
+  return added.filter(
+    (n) => ignored.has(n) && !cov.lineHits.has(n) && isCodeLike(contentLines[n - 1]),
+  );
+}
+
+export type ComputeInput = {
+  readonly diffs: readonly ChangedFileDiff[];
+  readonly coverage: CoverageIndex;
+  // The verified stamp's include/exclude: what the coverage run was told to
+  // instrument. run.ts verifies the stamp before calling; a model test passes
+  // the config the case is about.
+  readonly stamp: CoverageConfig;
+  // New-side content of a changed file (working tree at HEAD), or null when the
+  // path cannot be read. Only consulted for the non-gating excluded tally.
+  readonly fileLines: (path: string) => readonly string[] | null;
+  readonly waived?: boolean;
+};
+
+function sum<T>(items: readonly T[], pick: (item: T) => number): number {
+  return items.reduce((acc, item) => acc + pick(item), 0);
+}
+
+// Test code never counts toward the gate or the excluded tally, which exists
+// to surface hidden product logic, not test code. Test-kit helpers and
+// fixtures files are test material too — the coverage config excludes them
+// alongside test files — so their added lines stay out of the tally as well.
+function isTestFile(path: string): boolean {
+  return (
+    /\.test\.ts$/.test(path) ||
+    /(^|\/)__tests__\//.test(path) ||
+    /\.fixtures\.ts$/.test(path) ||
+    path.startsWith('packages/test-kit/')
+  );
+}
+
+// Code-like added lines of a file the run did not measure, as the non-gating
+// excluded tally entry: a gap the summary must show, never a denominator line.
+function excludedPathReport(
+  diff: ChangedFileDiff,
+  lines: readonly string[] | null,
+): ExcludedFileReport | null {
+  const excluded = diff.added.filter((n) => isCodeLike(lines?.[n - 1]));
+  return excluded.length > 0 ? { path: diff.path, reason: 'excluded-path', lines: excluded } : null;
+}
+
+type ChangedFileOutcome = {
+  readonly file?: FileCoverageReport;
+  readonly excluded?: ExcludedFileReport | null;
+};
+
+// One changed file's contribution: a gated report, a non-gating excluded entry, both, or neither.
+function scoreChangedFile(diff: ChangedFileDiff, input: ComputeInput): ChangedFileOutcome {
+  // A non-blob side (symlink, gitlink) is not source: its working-tree entry can
+  // resolve to a directory, which no content read may attempt.
+  if (diff.deleted || !diff.regularFile || diff.added.length === 0) return {};
+
+  if (!isInstrumentedPath(diff.path, input.stamp)) {
+    // Out of scope by declaration — but a file an include root covers still
+    // shows its added lines in the non-gating excluded tally, the way the
+    // gate did before the stamp owned selection. A test file or a path
+    // outside every include root owes not even that.
+    const owesTally = isIncludedPath(diff.path, input.stamp) && !isTestFile(diff.path);
+    return owesTally ? { excluded: excludedPathReport(diff, input.fileLines(diff.path)) } : {};
+  }
+
+  const cov = input.coverage.get(diff.path);
+  // Instrumented source absent from the lcov report: the run recorded no
+  // counters for it. Count its code-like added lines so the gap is visible.
+  if (!cov) return { excluded: excludedPathReport(diff, input.fileLines(diff.path)) };
+
+  const contentLines = input.fileLines(diff.path);
+  const ignored = contentLines ? ignoredChangedLines(diff.added, cov, contentLines) : [];
+  return {
+    file: scoreGateFile(diff.path, diff.added, cov),
+    excluded:
+      ignored.length > 0 ? { path: diff.path, reason: 'ignored-lines', lines: ignored } : null,
+  };
+}
+
+export function computeChangedCoverage(input: ComputeInput): ChangedCoverageResult {
+  const files: FileCoverageReport[] = [];
+  const excludedFiles: ExcludedFileReport[] = [];
+
+  for (const diff of input.diffs) {
+    const outcome = scoreChangedFile(diff, input);
+    if (outcome.file) files.push(outcome.file);
+    if (outcome.excluded) excludedFiles.push(outcome.excluded);
+  }
+
+  const coveredLines = sum(files, (f) => f.coveredLines);
+  const totalLines = sum(files, (f) => f.totalLines);
+  const coveredBranches = sum(files, (f) => f.coveredBranches);
+  const totalBranches = sum(files, (f) => f.totalBranches);
+  const pct = ratioPct(coveredLines, totalLines);
+  const waived = Boolean(input.waived);
+
+  const byPath = (a: { path: string }, b: { path: string }): number => a.path.localeCompare(b.path);
+  return {
+    threshold: CHANGED_LINE_COVERAGE_THRESHOLD,
+    coveredLines,
+    totalLines,
+    pct,
+    waived,
+    passed: waived || pct === null || pct >= CHANGED_LINE_COVERAGE_THRESHOLD,
+    offenders: files.filter((f) => f.uncoveredLines.length > 0).sort(byPath),
+    branch: {
+      covered: coveredBranches,
+      total: totalBranches,
+      pct: ratioPct(coveredBranches, totalBranches),
+    },
+    excluded: {
+      files: [...excludedFiles].sort(byPath),
+      totalLines: sum(excludedFiles, (f) => f.lines.length),
+    },
+  };
+}

@@ -1,0 +1,485 @@
+import {
+  parsePermissionAction,
+  parseSettingState,
+  resolveSettingsApp,
+  type ReadSettingResult,
+  type SettingOptions,
+} from '@agent-device/contracts/settings';
+import {
+  MACOS_PERMISSION_TARGETS,
+  type ReadableSetting,
+  type SettingName,
+} from '@agent-device/contracts/settings-catalog';
+import { isIosFamily, isMacOs, type DeviceInfo } from '@agent-device/kernel/device';
+import type { EnvMap } from '@agent-device/kernel/source-value';
+import {
+  AppError,
+  sessionAppRequiredDetails,
+  summarizeCommandAttemptFailures,
+  type CommandAttemptFailure,
+} from '@agent-device/kernel/errors';
+import { setMacOsAppearance } from '../os/macos/apps.ts';
+import { runMacOsPermissionAction, type MacOsPermissionTarget } from '../os/macos/helper.ts';
+import { closeIosApp } from './app-launch.ts';
+import { applySimctlSetting } from './simctl-settings.ts';
+import { readIosTextSize, setIosTextSize } from './settings-text-size.ts';
+import { resolveIosApp } from './app-resolution.ts';
+import { buildSimctlArgsForDevice } from './simctl.ts';
+import { runSimctlForDevice } from './simctl-execution.ts';
+import {
+  invalidateSimulatorStatusBarOverrideCache,
+  rememberClearedStatusBarOverrides,
+  STATUS_BAR_COMMAND_TIMEOUT_MS,
+  withSimulatorStatusBarHeld,
+} from './screenshot-status-bar.ts';
+import { ensureBootedSimulator, requireSimulatorDevice } from './simulator.ts';
+import { resolveAppleToolProvider, runXcrun } from './tool-provider.ts';
+
+const MACOS_HOST_SETTINGS = ['appearance', 'permission'] as const satisfies readonly SettingName[];
+
+export type MacOsHostSetting = (typeof MACOS_HOST_SETTINGS)[number];
+
+const APPLE_SIMULATOR_SETTINGS = [
+  'wifi',
+  'airplane',
+  'location',
+  'appearance',
+  'clear-app-state',
+  'reset-keychain',
+  'permission',
+  'text-size',
+  'faceid',
+  'touchid',
+] as const satisfies readonly SettingName[];
+
+export type AppleSimulatorSetting = (typeof APPLE_SIMULATOR_SETTINGS)[number];
+
+// fallow-ignore-next-line complexity
+export async function setIosSetting(
+  device: DeviceInfo,
+  setting: string,
+  state: string,
+  appBundleId: string | undefined,
+  options: SettingOptions | undefined,
+  env: Readonly<EnvMap>,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown> | void> {
+  if (isMacOs(device)) return await setMacOsHostSetting(setting, state, options, env);
+  requireSimulatorDevice(device, 'settings');
+  const normalized = APPLE_SIMULATOR_SETTINGS.find((name) => name === setting.toLowerCase());
+  if (normalized === undefined)
+    throw new AppError('INVALID_ARGS', `Unsupported setting: ${setting}`);
+  await ensureBootedSimulator(device);
+
+  switch (normalized) {
+    case 'clear-app-state': {
+      if (state.toLowerCase() !== 'clear') {
+        throw new AppError('INVALID_ARGS', 'settings clear-app-state only supports clear.');
+      }
+      if (!appBundleId) {
+        throw new AppError(
+          'INVALID_ARGS',
+          'settings clear-app-state requires an app id or an active app session.',
+          sessionAppRequiredDetails(),
+        );
+      }
+      const result = await clearIosSimulatorAppState(device, appBundleId, env);
+      return { bundleId: result.bundleId, containerPath: result.containerPath, cleared: true };
+    }
+    case 'reset-keychain': {
+      if (state.toLowerCase() !== 'clear') {
+        throw new AppError('INVALID_ARGS', 'settings reset-keychain only supports clear.');
+      }
+      await runSimctlForDevice(device, ['keychain', device.id, 'reset']);
+      return {
+        scope: 'simulator',
+        cleared: true,
+        message:
+          'Reset the whole iOS simulator keychain. This clears keychain-backed credentials for every installed app, not just the app under test.',
+      };
+    }
+    case 'wifi': {
+      const enabled = parseSettingState(state);
+      const mode = enabled ? 'active' : 'failed';
+      // The write waits for the simulator's status bar window: a capture restores the bar it
+      // snapshotted, so a write that landed inside that window would be reverted by that restore.
+      await withSimulatorStatusBarHeld(
+        device,
+        async () => {
+          // Dropped before the command, not after it: a write that hits its deadline may still have
+          // reached `simctl`, so no answer about the bar survives the attempt either way.
+          invalidateSimulatorStatusBarOverrideCache(device);
+          await runSimctlForDevice(
+            device,
+            ['status_bar', device.id, 'override', '--wifiMode', mode],
+            { timeoutMs: STATUS_BAR_COMMAND_TIMEOUT_MS },
+          );
+        },
+        signal,
+      );
+      return;
+    }
+    case 'airplane': {
+      const enabled = parseSettingState(state);
+      // Same reason as `wifi`: the write waits for the capture window so a restore cannot undo it,
+      // and the command is bounded so a wedged `simctl` cannot hold the simulator's captures.
+      await withSimulatorStatusBarHeld(
+        device,
+        async () => {
+          // Dropped before the command, as for `wifi`: a write that hits its deadline may still have
+          // reached `simctl`, so no answer about the bar survives the attempt.
+          invalidateSimulatorStatusBarOverrideCache(device);
+          if (enabled) {
+            await runSimctlForDevice(
+              device,
+              [
+                'status_bar',
+                device.id,
+                'override',
+                '--dataNetwork',
+                'hide',
+                '--wifiMode',
+                'failed',
+                '--wifiBars',
+                '0',
+                '--cellularMode',
+                'failed',
+                '--cellularBars',
+                '0',
+                '--operatorName',
+                '',
+              ],
+              { timeoutMs: STATUS_BAR_COMMAND_TIMEOUT_MS },
+            );
+          } else {
+            await runSimctlForDevice(device, ['status_bar', device.id, 'clear'], {
+              timeoutMs: STATUS_BAR_COMMAND_TIMEOUT_MS,
+            });
+            rememberClearedStatusBarOverrides(device);
+          }
+        },
+        signal,
+      );
+      return;
+    }
+    case 'faceid':
+    case 'touchid': {
+      const biometricSetting = normalized as IosBiometricSetting;
+      const biometric = IOS_BIOMETRIC_SETTINGS[biometricSetting];
+      const action = parseBiometricAction(state, biometricSetting);
+      await runIosBiometricSimctlCommand(device, action, {
+        settingName: biometricSetting,
+        notificationModality: biometric.notificationModality,
+      });
+      return;
+    }
+    case 'text-size': {
+      return await setIosTextSize(device, state);
+    }
+    case 'appearance':
+    case 'permission':
+    case 'location':
+      return await applySimctlSetting({
+        runSimctl: (args) => runSimctlForDevice(device, args),
+        udid: device.id,
+        deviceId: device.id,
+        setting: normalized,
+        state,
+        appBundleId,
+        resolveApp: (app) => resolveIosSettingsApp(device, app),
+        options,
+      });
+    default:
+      return normalized satisfies never;
+  }
+}
+
+async function setMacOsHostSetting(
+  setting: string,
+  state: string,
+  options: SettingOptions | undefined,
+  env: Readonly<EnvMap>,
+): Promise<Record<string, unknown> | void> {
+  const normalized = MACOS_HOST_SETTINGS.find((name) => name === setting.toLowerCase());
+  switch (normalized) {
+    case 'appearance':
+      await setMacOsAppearance(state);
+      return;
+    case 'permission': {
+      const action = parsePermissionAction(state);
+      if (action === 'deny') {
+        throw new AppError(
+          'INVALID_ARGS',
+          'The macOS host supports settings permission grant|reset, not deny.',
+        );
+      }
+      const permissionTarget = parseMacOsPermissionTarget(options?.permissionTarget);
+      return await runMacOsPermissionAction(action, permissionTarget, env);
+    }
+    case undefined:
+      throw new AppError('UNSUPPORTED_OPERATION', `Unsupported macOS setting: ${setting}`);
+    default:
+      return normalized satisfies never;
+  }
+}
+
+/**
+ * The Apple read leg, exhaustive over the readable list: a setting joins `READABLE_SETTINGS` only
+ * with an answer here, so a new readable name is a compile error on this map rather than a runtime
+ * refusal hidden in a default case. The leaf that holds the value still refuses on its own fact.
+ */
+const IOS_READABLE_SETTINGS = {
+  'text-size': readIosTextSize,
+} as const satisfies Record<ReadableSetting, (device: DeviceInfo) => Promise<ReadSettingResult>>;
+
+/** Answers `settings <setting>` with the value the Apple leaf holds. */
+export async function readIosSetting(
+  device: DeviceInfo,
+  setting: ReadableSetting,
+): Promise<ReadSettingResult> {
+  return await IOS_READABLE_SETTINGS[setting](device);
+}
+
+/**
+ * Binds a data container to its bundle in the simulator's container manager. It is container
+ * identity, not app state: removing it orphans the container until the app is reinstalled.
+ */
+const CONTAINER_MANAGER_METADATA_FILE = '.com.apple.mobile_container_manager.metadata.plist';
+
+/**
+ * The directories a fresh install creates in the data container. iOS does not recreate them on
+ * relaunch; without `tmp`, every URLSession download task fails until the app is reinstalled.
+ * The list matches the iOS 26.5 fresh-install layout; older runtimes and tvOS or visionOS
+ * simulators may differ, but an extra empty directory there is harmless.
+ */
+const FRESH_INSTALL_DATA_DIRECTORIES = [
+  'Documents',
+  'Library/Caches',
+  'Library/Preferences',
+  'SystemData',
+  'tmp',
+];
+
+/**
+ * `details.reason` of a `clear-app-state` refused because the installed app owns no data container.
+ * A driver branches on this rather than the prose: there is nothing to delete, so retrying cannot
+ * help. The motivating case ships inside the simulator runtime and cannot be uninstalled, so the
+ * hint may only point at recoveries a caller actually has: reset the simulator, or uninstall an
+ * app they installed themselves.
+ */
+export const IOS_NO_DATA_CONTAINER_REASON = 'app-no-data-container';
+
+const IOS_NO_DATA_CONTAINER_HINT =
+  'Clear the app under test instead. A runtime-shipped app keeps no data container, so this command has no app state to remove; to reset it, erase or recreate the simulator device, or uninstall and reinstall the app if you installed it yourself.';
+
+/** The agent-facing explanation for an app `simctl get_app_container` answers with no container for. */
+function iosNoDataContainerMessage(bundleId: string): string {
+  return `${bundleId} has no data container to clear. Apps shipped in the simulator runtime, such as system apps, own no data container, so there is no app state here to remove.`;
+}
+
+/** The installed app an app-scoped setting lands on, by bundle id or display name. */
+async function resolveIosSettingsApp(device: DeviceInfo, app: string): Promise<string> {
+  return await resolveSettingsApp(app, (target) =>
+    resolveIosApp(device, target, { installedOnly: true }),
+  );
+}
+
+async function clearIosSimulatorAppState(
+  device: DeviceInfo,
+  app: string,
+  env: Readonly<EnvMap>,
+): Promise<{ bundleId: string; containerPath?: string }> {
+  if (!isIosFamily(device) || device.kind !== 'simulator') {
+    throw new AppError(
+      'UNSUPPORTED_OPERATION',
+      'Clearing app state is currently supported only on iOS simulators.',
+    );
+  }
+
+  const bundleId = await resolveIosSettingsApp(device, app);
+  await ensureBootedSimulator(device);
+  await closeIosApp(device, bundleId, undefined, env);
+
+  const container = await resolveAppleToolProvider().simulatorFiles.openContainer({
+    device,
+    bundleId,
+    containerType: 'data',
+    timeoutMs: 15_000,
+  });
+  if (!container) {
+    throw new AppError('UNSUPPORTED_OPERATION', iosNoDataContainerMessage(bundleId), {
+      reason: IOS_NO_DATA_CONTAINER_REASON,
+      appBundleId: bundleId,
+      deviceId: device.id,
+      hint: IOS_NO_DATA_CONTAINER_HINT,
+    });
+  }
+  const entries = await container.list();
+  await Promise.all(
+    entries
+      .filter((entry) => entry !== CONTAINER_MANAGER_METADATA_FILE)
+      .map((entry) => container.remove(entry)),
+  );
+  await Promise.all(
+    FRESH_INSTALL_DATA_DIRECTORIES.map((directory) => container.ensureDirectory(directory)),
+  );
+  return { bundleId, ...(container.path ? { containerPath: container.path } : {}) };
+}
+
+function parseMacOsPermissionTarget(value: string | undefined): MacOsPermissionTarget {
+  const normalized = value?.trim().toLowerCase();
+  const target = MACOS_PERMISSION_TARGETS.find((name) => name === normalized);
+  if (target !== undefined) return target;
+  throw new AppError(
+    'INVALID_ARGS',
+    `Unsupported macOS permission target. Use ${MACOS_PERMISSION_TARGETS.join('|')}.`,
+  );
+}
+
+type IosBiometricAction = 'match' | 'nonmatch' | 'enroll' | 'unenroll';
+type IosBiometricSetting = 'faceid' | 'touchid';
+
+/** The BiometricKit_Sim notification family a setting posts to: `pearl` is Face ID, `fingerTouch` is Touch ID. */
+type IosBiometricNotificationModality = 'pearl' | 'fingerTouch';
+
+const IOS_BIOMETRIC_SETTINGS: Record<
+  IosBiometricSetting,
+  { notificationModality: IosBiometricNotificationModality }
+> = {
+  faceid: { notificationModality: 'pearl' },
+  touchid: { notificationModality: 'fingerTouch' },
+};
+
+function parseBiometricAction(state: string, settingName: IosBiometricSetting): IosBiometricAction {
+  const normalized = state.trim().toLowerCase();
+  if (normalized === 'match') return 'match';
+  if (normalized === 'nonmatch') return 'nonmatch';
+  if (normalized === 'enroll') return 'enroll';
+  if (normalized === 'unenroll') return 'unenroll';
+  throw new AppError(
+    'INVALID_ARGS',
+    `Invalid ${settingName} state: ${state}. Use match|nonmatch|enroll|unenroll.`,
+  );
+}
+
+/**
+ * Simulator biometrics are driven the way the Simulator.app menu drives them: `notifyutil` inside
+ * the simulator posts to `com.apple.BiometricKit_Sim` for a match or non-match and flips the
+ * `enrollmentChanged` state for enrollment. No shipped Xcode has a `simctl biometric` subcommand.
+ */
+async function runIosBiometricSimctlCommand(
+  device: DeviceInfo,
+  action: IosBiometricAction,
+  options: {
+    settingName: IosBiometricSetting;
+    notificationModality: IosBiometricNotificationModality;
+  },
+): Promise<void> {
+  const args = buildSimctlArgsForDevice(
+    device,
+    biometricNotifyutilArgs(device.id, action, options.notificationModality),
+  );
+  const result = await runXcrun(args, { allowFailure: true });
+  const failures: CommandAttemptFailure[] = [];
+  if (result.exitCode !== 0) {
+    failures.push({
+      args,
+      stderr: result.stderr,
+      stdout: result.stdout,
+      exitCode: result.exitCode,
+    });
+  } else {
+    const expected = enrollmentStateFor(action);
+    if (expected !== undefined) {
+      const readBack = await readBiometricEnrollmentState(device);
+      if (readBack.state === expected) return;
+      failures.push({
+        args: readBack.args,
+        stderr: readBack.stderr,
+        stdout: readBack.stdout,
+        exitCode: readBack.exitCode,
+      });
+    } else {
+      return;
+    }
+  }
+  throw new AppError('COMMAND_FAILED', `Failed to simulate ${options.settingName}.`, {
+    deviceId: device.id,
+    action,
+    setting: options.settingName,
+    attempts: summarizeCommandAttemptFailures(failures),
+  });
+}
+
+const BIOMETRIC_ENROLLMENT_NOTIFICATION = 'com.apple.BiometricKit.enrollmentChanged';
+
+function enrollmentStateFor(action: IosBiometricAction): '1' | '0' | undefined {
+  if (action === 'enroll') return '1';
+  if (action === 'unenroll') return '0';
+  return undefined;
+}
+
+/**
+ * Reads the enrollment state BiometricKit holds after an enroll or unenroll post, so a post that
+ * exited 0 without landing is a failure rather than an "Updated setting". `notifyutil -g` answers
+ * `<name> <state>` on one line.
+ */
+async function readBiometricEnrollmentState(
+  device: DeviceInfo,
+): Promise<CommandAttemptFailure & { state: string | undefined }> {
+  const args = buildSimctlArgsForDevice(device, [
+    'spawn',
+    device.id,
+    'notifyutil',
+    '-g',
+    BIOMETRIC_ENROLLMENT_NOTIFICATION,
+  ]);
+  const result = await runXcrun(args, { allowFailure: true });
+  const state = result.stdout
+    .split('\n')
+    .map((line) => line.trim().split(/\s+/))
+    .find((parts) => parts[0] === BIOMETRIC_ENROLLMENT_NOTIFICATION)?.[1];
+  return {
+    args,
+    stderr: result.stderr,
+    stdout: result.stdout,
+    exitCode: result.exitCode,
+    state: result.exitCode === 0 ? state : undefined,
+  };
+}
+
+/**
+ * The `simctl spawn <udid> notifyutil` argv for one biometric action; enrollment sets the state
+ * before posting so BiometricKit reads the new value when the notification lands.
+ */
+function biometricNotifyutilArgs(
+  deviceId: string,
+  action: IosBiometricAction,
+  modality: IosBiometricNotificationModality,
+): string[] {
+  const spawn = ['spawn', deviceId, 'notifyutil'];
+  switch (action) {
+    case 'match':
+      return [...spawn, '-p', `com.apple.BiometricKit_Sim.${modality}.match`];
+    case 'nonmatch':
+      return [...spawn, '-p', `com.apple.BiometricKit_Sim.${modality}.nomatch`];
+    case 'enroll':
+      return [
+        ...spawn,
+        '-s',
+        BIOMETRIC_ENROLLMENT_NOTIFICATION,
+        '1',
+        '-p',
+        BIOMETRIC_ENROLLMENT_NOTIFICATION,
+      ];
+    case 'unenroll':
+      return [
+        ...spawn,
+        '-s',
+        BIOMETRIC_ENROLLMENT_NOTIFICATION,
+        '0',
+        '-p',
+        BIOMETRIC_ENROLLMENT_NOTIFICATION,
+      ];
+  }
+}

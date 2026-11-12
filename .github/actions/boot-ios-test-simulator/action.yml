@@ -1,0 +1,78 @@
+name: 'Boot iOS Test Simulator'
+description: 'Resolve and boot the preferred iOS simulator for replay tests'
+
+inputs:
+  runtime-version:
+    description: 'Preferred iOS runtime version'
+    required: true
+  preferred-device-name:
+    description: 'Preferred simulator device name'
+    required: false
+    default: 'iPhone 17 Pro'
+  boot-timeout-seconds:
+    description: 'Maximum time to wait for simulator bootstatus'
+    required: false
+    default: '300'
+
+  wait-for-boot:
+    description: 'Wait for boot completion before returning'
+    required: false
+    default: 'true'
+
+outputs:
+  boot-timeout-seconds:
+    description: 'Boot wait budget for a deferred readiness check'
+    value: ${{ inputs.boot-timeout-seconds }}
+  simulator-udid:
+    description: 'UDID of the booted iOS simulator'
+    value: ${{ steps.boot.outputs.simulator-udid }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve and boot iOS test simulator
+      id: boot
+      env:
+        WAIT_FOR_BOOT: ${{ inputs.wait-for-boot }}
+      run: |
+        set -euo pipefail
+        if [[ "$WAIT_FOR_BOOT" != 'true' && "$WAIT_FOR_BOOT" != 'false' ]]; then
+          echo 'wait-for-boot must be true or false' >&2
+          exit 1
+        fi
+        RUNTIME_VERSION="${{ inputs.runtime-version }}"
+        RUNTIME_TOKEN="SimRuntime.iOS-${RUNTIME_VERSION//./-}"
+        export RUNTIME_TOKEN
+        export PREFERRED_DEVICE_NAME="${{ inputs.preferred-device-name }}"
+        UDID="$(
+          xcrun simctl list devices -j | node -e '
+            const fs = require("node:fs");
+            const runtimeToken = process.env.RUNTIME_TOKEN;
+            const preferredDeviceName = process.env.PREFERRED_DEVICE_NAME;
+            const payload = JSON.parse(fs.readFileSync(0, "utf8"));
+            const entries = Object.entries(payload.devices ?? {});
+            const iosRuntimes = entries.filter(([runtime]) => runtime.includes("SimRuntime.iOS-"));
+            const runtimeMatches = iosRuntimes.filter(([runtime]) => runtime.includes(runtimeToken));
+            const pool = runtimeMatches.length > 0 ? runtimeMatches : iosRuntimes;
+            const available = pool.flatMap(([runtime, devices]) =>
+              (devices ?? [])
+                .filter((device) => device.isAvailable)
+                .map((device) => ({ ...device, runtime })),
+            );
+            const preferred =
+              available.find((device) => device.state === "Booted" && device.name === preferredDeviceName) ??
+              available.find((device) => device.name === preferredDeviceName) ??
+              available.find((device) => device.state === "Booted") ??
+              available[0];
+            if (!preferred?.udid) process.exit(1);
+            console.error(`Selected ${preferred.name} (${preferred.udid}) from ${preferred.runtime}`);
+            process.stdout.write(preferred.udid);
+          '
+        )"
+        echo "simulator-udid=$UDID" >> "$GITHUB_OUTPUT"
+        xcrun simctl shutdown all || true
+        xcrun simctl boot "$UDID" || true
+        if [ "$WAIT_FOR_BOOT" = 'true' ]; then
+          bash scripts/wait-for-ios-simulator.sh "$UDID" "${{ inputs.boot-timeout-seconds }}"
+        fi
+      shell: bash

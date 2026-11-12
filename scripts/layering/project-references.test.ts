@@ -1,0 +1,178 @@
+// The TypeScript project graph is three hand-written views of one fact: the workspace package
+// set, the root manifest's `workspace:*` declarations, and the `references` lists in the root
+// build node (tsconfig.typecheck.json), examples/sdk, and per-package tsconfigs. `tsc -b` fails
+// loudly on a MISSING reference it needs but silently tolerates EXTRA ones (#3289 review), so a
+// package added to the workspace while a references list goes un-updated keeps building a stale
+// graph that still exits 0.
+// These tests read the committed declarations against each other so the four views cannot
+// drift: an added, renamed, or removed workspace package must edit every list or fail here.
+
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { test } from 'node:test';
+import { readWorkspacePackages } from './package-boundaries.ts';
+
+const repoRoot = path.resolve(import.meta.dirname, '../..');
+
+/** tsconfig JSONC minus line comments; both comment-bearing files use `//` only. */
+function readTsconfig(relativePath: string): {
+  references?: { path: string }[];
+  extends?: string;
+  include?: string[];
+  exclude?: string[];
+  compilerOptions?: Record<string, unknown>;
+} {
+  const source = fs.readFileSync(path.join(repoRoot, relativePath), 'utf8');
+  return JSON.parse(source.replaceAll(/^\s*\/\/.*$/gm, ''));
+}
+
+/**
+ * The published root package name. It names no composite project: the root tsconfig is a
+ * noEmit entry point TS6310 forbids referencing, so a workspace dependency on it is
+ * type-resolved through tsconfig `paths`, never through a reference edge.
+ */
+const rootPackageName = (
+  JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as { name: string }
+).name;
+
+/** Repo-relative package dir for one `references[].path` entry, resolved from its project. */
+function referencedPackageDirs(tsconfigFile: string, projectDir: string): string[] {
+  const config = readTsconfig(tsconfigFile);
+  return (config.references ?? [])
+    .map((reference) => path.posix.normalize(path.posix.join(projectDir, reference.path)))
+    .sort();
+}
+
+function workspacePackageDirs(): string[] {
+  return readWorkspacePackages(repoRoot)
+    .map((pkg) => pkg.dir)
+    .sort();
+}
+
+test('root and examples/sdk reference exactly the workspace package set', () => {
+  const expected = workspacePackageDirs();
+  assert.ok(expected.length >= 25, 'expected the 25+ workspace packages to be enumerable');
+
+  assert.deepEqual(referencedPackageDirs('tsconfig.typecheck.json', '.'), expected);
+  assert.deepEqual(referencedPackageDirs('examples/sdk/tsconfig.json', 'examples/sdk'), expected);
+});
+
+test('the root build node is tsconfig.json plus references, and tsconfig.json has none', () => {
+  // `fr` loads every referenced project as its own ts.Program, which exhausts Node's default
+  // heap (#3289 CI). `extends` does not inherit references, so the typecheck node carries them
+  // without fr, editors, or tsdown seeing them.
+  const rootConfig = readTsconfig('tsconfig.json');
+  assert.equal(rootConfig.references, undefined, 'references on tsconfig.json OOM freerange');
+  const typecheckConfig = readTsconfig('tsconfig.typecheck.json');
+  assert.equal(typecheckConfig.extends, './tsconfig.json');
+  assert.equal(
+    typecheckConfig.include,
+    undefined,
+    'the build node must not narrow the root program',
+  );
+  assert.equal(
+    typecheckConfig.exclude,
+    undefined,
+    'the build node must not narrow the root program',
+  );
+  assert.deepEqual(Object.keys(typecheckConfig.compilerOptions ?? {}), ['tsBuildInfoFile']);
+});
+
+test('the compiled-set predicate is licensed by the tsconfig include/exclude shape it mirrors', () => {
+  // Scripts retain full R11 checks even when the compiler also checks them.
+  const rootConfig = readTsconfig('tsconfig.json');
+  assert.equal(
+    rootConfig.exclude,
+    undefined,
+    'root tsconfig must not exclude compiler-owned paths',
+  );
+  assert.deepEqual(
+    (rootConfig.include ?? []).filter(
+      (entry) => !path.posix.normalize(entry).startsWith('scripts/'),
+    ),
+    ['src', 'test', 'packages/command-registry/src/global.d.ts'],
+  );
+  // `src` everywhere, plus the one shared ambient-declaration entry replay-port and
+  // session-journal include. Exact include ARRAYS, not a `global.d.ts` suffix class: a
+  // new include of any name must extend this allow-list deliberately, or the drift fails
+  // the test (#3289 cubic review P2 — a suffix filter would silently accept unrelated
+  // `*.global.d.ts` additions, which is the drift this pin exists to catch).
+  const knownIncludeShapes = [
+    JSON.stringify(['src']),
+    JSON.stringify(['src', '../command-registry/src/global.d.ts']),
+  ];
+  for (const pkg of readWorkspacePackages(repoRoot)) {
+    const config = readTsconfig(`${pkg.dir}/tsconfig.json`);
+    assert.equal(config.exclude, undefined, `${pkg.dir}/tsconfig.json must not declare exclude`);
+    const include = JSON.stringify(config.include ?? ['**/*']);
+    assert.ok(
+      knownIncludeShapes.includes(include),
+      `${pkg.dir}/tsconfig.json includes ${include}; the compiled-set predicate assumes ` +
+        `the known shapes ${knownIncludeShapes.join(' / ')} — extend the allow-list here ` +
+        'only after widening insideCompiledSources to match',
+    );
+  }
+});
+
+test('the root manifest declares every workspace package as a workspace dependency', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  };
+  const declared = Object.entries({
+    ...manifest.dependencies,
+    ...manifest.devDependencies,
+  })
+    .filter(([, range]) => String(range).startsWith('workspace:'))
+    .map(([name]) => name)
+    .sort();
+  const expected = readWorkspacePackages(repoRoot)
+    .map((pkg) => pkg.name)
+    .sort();
+  assert.deepEqual(
+    declared,
+    expected,
+    'a workspace package the root program consumes must be declared workspace:* in the root ' +
+      'manifest (its tsconfig references already name it; the root project resolves package ' +
+      'specifiers through these declarations)',
+  );
+});
+
+test('every package tsconfig references exactly its manifest workspace dependencies', () => {
+  // The per-package half of the same single-source-of-truth claim (#3279 requirement 1):
+  // references are DERIVED from the manifest DAG, so an import a manifest gains must add the
+  // matching reference (edge freshness, which tsc -b never asks for) and a removed one must
+  // drop it (an extra reference hides a stale edge that tsc -b tolerates silently).
+  // The one expressible-edge exception: a workspace dependency on the ROOT package
+  // (`agent-device`) has no composite project to point at (TS6310). Those imports are
+  // type-resolved through tsconfig `paths`, so the dependency is asserted present in
+  // paths instead of references.
+  const packages = readWorkspacePackages(repoRoot);
+  const nameByDir = new Map(packages.map((pkg) => [pkg.dir, pkg.name]));
+  for (const pkg of packages) {
+    const referencedDirs = referencedPackageDirs(`${pkg.dir}/tsconfig.json`, pkg.dir);
+    for (const dir of referencedDirs) {
+      assert.ok(
+        nameByDir.has(dir),
+        `${pkg.dir}/tsconfig.json references ${dir}, which is not a workspace package`,
+      );
+    }
+    const declared = new Set([...pkg.workspaceDependencies, ...pkg.workspaceDevDependencies]);
+    assert.deepEqual(
+      referencedDirs.map((dir) => nameByDir.get(dir)),
+      [...declared].filter((name) => name !== rootPackageName).sort(),
+      `${pkg.dir}/tsconfig.json references must equal its manifest workspace:* dependencies and ` +
+        `devDependencies`,
+    );
+    if (declared.has(rootPackageName)) {
+      const config = readTsconfig(`${pkg.dir}/tsconfig.json`);
+      const paths = (config.compilerOptions?.paths ?? {}) as Record<string, unknown>;
+      assert.ok(
+        Object.keys(paths).some((key) => key.startsWith(`${rootPackageName}/`)),
+        `${pkg.dir} depends on the root package without a paths mapping; tsc cannot ` +
+          'resolve it (the root project cannot be referenced)',
+      );
+    }
+  }
+});

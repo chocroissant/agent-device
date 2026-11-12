@@ -1,0 +1,85 @@
+import { PUBLIC_COMMANDS } from '@agent-device/command-registry/catalog';
+import { SNAPSHOT_BACKEND_CAPABILITIES } from '@agent-device/capture-kit/snapshot-quality-backend-capabilities';
+import {
+  SNAPSHOT_COMMAND_OPTION_KEYS,
+  snapshotOptionsFromFlags,
+} from '@agent-device/kernel/snapshot';
+import { SNAPSHOT_FLAGS } from '@agent-device/command-registry/flag-groups';
+import { booleanField, integerField, optionField, stringField } from '../command-input.ts';
+import {
+  commonInputFromFlags,
+  direct,
+  observationRecordInputFromFlags,
+} from '../cli-grammar/common.ts';
+import type { CliReader, DaemonWriter } from '../cli-grammar/types.ts';
+import { defineCommandFacet } from '../family/types.ts';
+import { defineFieldCommandMetadata } from '../field-command-contract.ts';
+
+const SNAPSHOT_COMMAND_NAME = 'snapshot';
+
+const snapshotCommandDescription =
+  'Capture the accessibility tree or compare it with the previous session baseline. Use the returned refs for subsequent semantic interactions and the diff option to verify UI changes.';
+
+const snapshotBackendCapabilityHelp = Object.entries(SNAPSHOT_BACKEND_CAPABILITIES)
+  .map(([backend, capability]) => {
+    const gaps = capability.knownGaps.map((gap) => `known gap ${gap}`);
+    return `${backend}: hittable=${capability.hittable}, regular-depth=${capability.regularDepth}, deep-extension=${capability.deepExtension}, depth-ladder=${capability.depthLadder}${gaps.length > 0 ? `, ${gaps.join(', ')}` : ''}`;
+  })
+  .join('; ');
+
+const snapshotCommandMetadata = defineFieldCommandMetadata(
+  SNAPSHOT_COMMAND_NAME,
+  snapshotCommandDescription,
+  {
+    interactiveOnly: booleanField(),
+    depth: integerField(),
+    scope: stringField(),
+    raw: booleanField(),
+    customActions: optionField('snapshotCustomActions'),
+    observeOnly: optionField('snapshotObserveOnly'),
+    forceFull: booleanField(),
+    timeoutMs: integerField('Maximum wall-clock time for the snapshot command.'),
+    // #1271 stage 2: `snapshot` is observation-only, so a repair-armed heal
+    // excludes an out-of-band one by default (ADR 0012 amendment). Exposed
+    // here so the Node SDK's typed options and the MCP tool schema can set
+    // both flags, mirroring `--no-record`/`--record` on the CLI.
+    noRecord: booleanField('Do not record this action.'),
+    record: booleanField(
+      'Force-record this out-of-band observation into a repair-armed heal (mutually exclusive with noRecord). Authored replay steps are recorded automatically and never need this.',
+    ),
+  },
+);
+
+const snapshotCliSchema = {
+  allowedFlags: [
+    'snapshotDiff',
+    ...SNAPSHOT_FLAGS,
+    'snapshotCustomActions',
+    'snapshotObserveOnly',
+    'snapshotForceFull',
+    'timeoutMs',
+    'record',
+  ],
+} as const;
+
+export const snapshotCliReader: CliReader = (_positionals, flags) => ({
+  ...commonInputFromFlags(flags),
+  ...observationRecordInputFromFlags(flags),
+  ...snapshotOptionsFromFlags(flags, SNAPSHOT_COMMAND_OPTION_KEYS),
+  timeoutMs: flags.timeoutMs,
+});
+
+const snapshotDaemonWriter: DaemonWriter = direct(PUBLIC_COMMANDS.snapshot);
+
+export const snapshotCommandFacet = defineCommandFacet({
+  name: SNAPSHOT_COMMAND_NAME,
+  text: {
+    summary: 'Capture or diff the accessibility tree',
+    cliDetail: `Scoped output (--scope) renders every returned ref with its ref generation pin (@eN~s<refsGeneration>) and one Refs generation line, so a pasted ref targets the ref frame that issued it; --json keeps plain refs plus the response-level refsGeneration, and --raw keeps byte-for-byte output. Regular iOS snapshots clip overflowing elements to their visible area and omit fully outside elements. --json reports clipping counts in snapshotQualityNotes with code regular-geometry-clipped; --raw retains reported frames. --observe-only is local iOS snapshot-only: an already-ready compatible runner reads the session app without activation or foreground repair, refuses unavailable observation or a readable system alert over the app, and reports XCUIApplication state rather than verified foreground ownership (#2696). Regular targetActivation disclosure stays unchanged (#2682, #2694). Repeated equivalent unfiltered Android snapshots return a compact unchanged acknowledgement. Use --force-full to re-emit the tree; --json and --raw retain full output. Android Appium JSON snapshots publish a display viewport only when measurements before and after the tree agree, independent of tree extent or keyboard content resizing. On Android, JSON value carries field content rather than static labels; saved selectors and replay scripts using value= for static labels must use label= instead; a reported showing hint means value is empty, and text equal to the placeholder is preserved when hint state is unknown. HarmonyOS reads the on-screen keyboard's own system window and publishes the keyboard field of --json output: the field is visibility-only — visible or hidden per the keyboard window's z-order column; a failed probe, an unreadable or conflicting z-order, or a table without the panel publishes unmeasurable, never a guessed band. When an iOS snapshot reports a screen viewport, inspect rects with snapshot -i --json and press the intended control's center, then verify with diff snapshot -i or snapshot --diff. When a fallback cannot establish the screen origin, viewport is omitted and coordinate-derived element actions refuse with window-origin-unknown before input; the snapshot may warn about the unavailable origin. Use a plain screenshot to choose screen coordinates. iOS backend capability contract: ${snapshotBackendCapabilityHelp}.`,
+  },
+  metadata: snapshotCommandMetadata,
+  run: (client, input) => client.capture.snapshot(input),
+  cliSchema: snapshotCliSchema,
+  cliReader: snapshotCliReader,
+  daemonWriter: snapshotDaemonWriter,
+});

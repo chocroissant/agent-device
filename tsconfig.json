@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./.tmp/tsconfig.tsbuildinfo",
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "rewriteRelativeImportExtensions": true,
+    "verbatimModuleSyntax": true,
+    "types": ["node"],
+    "noEmit": true,
+    "paths": {
+      "agent-device/plugins": ["./src/sdk/plugins.ts"],
+      "agent-device/plugins/webdriver": ["./src/sdk/plugin-webdriver.ts"]
+    }
+  },
+  "include": ["src", "test", "scripts/**/*.ts", "packages/command-registry/src/global.d.ts"]
+}

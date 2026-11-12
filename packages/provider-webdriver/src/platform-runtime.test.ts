@@ -1,0 +1,787 @@
+import { expect, test, vi } from 'vitest';
+import type { PlatformRuntimeHost } from '@agent-device/contracts/platform-runtime-operations';
+import { providerRuntimeOwner } from '@agent-device/contracts/platform-runtime';
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import type { Interactor } from '@agent-device/contracts/interactor-types';
+import { HARDWARE_BUTTON_NAME_LABELS, type HardwareButton } from '@agent-device/contracts/device';
+import { createWebDriverPlatformRuntimeOwner } from './platform-runtime.ts';
+import {
+  createCloudWebDriverCapabilities,
+  type CloudWebDriverCapabilityOverrides,
+} from './capabilities.ts';
+import type { CloudWebDriverPlatform } from './runtime.ts';
+import { CLOUD_WEBDRIVER_PROVIDERS } from './providers.ts';
+
+/** The declared map fact generation now reads. Defaults to a provider with no overrides. */
+function capabilities(
+  platform: CloudWebDriverPlatform = 'android',
+  overrides?: CloudWebDriverCapabilityOverrides,
+  provider: string = CLOUD_WEBDRIVER_PROVIDERS.browserStack,
+) {
+  return createCloudWebDriverCapabilities({
+    provider,
+    platform,
+    ...(overrides ? { overrides } : {}),
+  });
+}
+
+const device: DeviceInfo = {
+  platform: 'android',
+  id: 'browserstack:lease-one',
+  name: 'Remote Android',
+  kind: 'device',
+  target: 'mobile',
+  booted: true,
+};
+
+test('direct WebDriver refuses a live network dump instead of answering from another source', async () => {
+  const run = vi.fn(async () => ({ stdout: 'must not execute', stderr: '', exitCode: 0 }));
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(run),
+    owner: providerRuntimeOwner('browserstack', 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities(),
+  });
+  const binding = await owner.bind({
+    device,
+    intent: { kind: 'ordinary' },
+    scope: {
+      signal: new AbortController().signal,
+      diagnostics: { emit: () => {} },
+      progress: { report: () => {} },
+    },
+  });
+
+  expect(binding.operations.networkDump).toBeUndefined();
+  expect(binding.facts.operations.networkDump).toMatchObject({
+    available: false,
+    reason: 'network-capture-post-session',
+    hint: 'The provider publishes any network capture only after its session ends, on the provider dashboard.',
+  });
+  expect(binding.facts.operations.appLogInspect).toMatchObject({ available: false });
+  for (const operation of [
+    'deployApp',
+    'materializeAppSource',
+    'deployMaterializedApp',
+    'sendPushNotification',
+  ] as const) {
+    expect(binding.facts.operations[operation]).toMatchObject({
+      available: false,
+      reason: 'unsupported-provider-mode',
+    });
+  }
+  expect(binding.operations.deployApp).toBeUndefined();
+  expect(run).not.toHaveBeenCalled();
+});
+
+test('a provider with no capture of its own states the same refusal for a live dump', async () => {
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner(CLOUD_WEBDRIVER_PROVIDERS.awsDeviceFarm, 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities('android', undefined, CLOUD_WEBDRIVER_PROVIDERS.awsDeviceFarm),
+  });
+
+  expect(await owner.inspectFacts({ ...device, id: 'aws-device-farm:lease-one' })).toMatchObject({
+    operations: {
+      networkDump: {
+        available: false,
+        reason: 'network-capture-post-session',
+        hint: 'The provider publishes any network capture only after its session ends, on the provider dashboard.',
+      },
+    },
+  });
+});
+
+/**
+ * The `network` cell is also the fallback the shared hub gives every optional cell this owner leaves
+ * unclassified, `snapshot` among them, and `findText`/`querySelector` start from the snapshot cell.
+ * So the post-session reason must be stated on `networkDump` alone, or an unrelated read reports it.
+ */
+test('the post-session refusal stays on networkDump and does not leak into the text reads', async () => {
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities(),
+  });
+
+  const facts = await owner.inspectFacts(device);
+
+  expect(facts.operations.networkDump).toMatchObject({
+    available: false,
+    reason: 'network-capture-post-session',
+  });
+  for (const operation of ['findText', 'querySelector'] as const) {
+    expect(facts.operations[operation].available).toBe(false);
+    if (facts.operations[operation].available) throw new Error(`${operation} admitted a live read`);
+    expect(facts.operations[operation].reason).toBe('unsupported-provider-mode');
+  }
+});
+
+test.each([
+  ['Android', device],
+  [
+    'iOS',
+    {
+      ...device,
+      platform: 'apple' as const,
+      appleOs: 'ios' as const,
+      id: 'browserstack:ios:lease-one',
+      name: 'Remote iPhone',
+    },
+  ],
+])('classifies the direct WebDriver %s device binding', async (_name, runtimeDevice) => {
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', String(_name).toLowerCase()),
+    ownsDevice: () => true,
+    capabilities: capabilities(),
+  });
+  const binding = await owner.bind({
+    device: runtimeDevice,
+    intent: { kind: 'ordinary' },
+    scope: {
+      signal: new AbortController().signal,
+      diagnostics: { emit: () => {} },
+      progress: { report: () => {} },
+    },
+  });
+  expect(binding.facts.device.providerMode).toBe('provider-runtime');
+  expect(binding.facts.operations.appState).toMatchObject({
+    available: false,
+    reason: 'unsupported-provider-mode',
+  });
+  expect(binding.facts.operations.networkDump).toMatchObject({
+    available: false,
+    reason: 'network-capture-post-session',
+  });
+  expect(binding.facts.operations.ensureReady).toEqual({ available: true });
+  expect(binding.facts.operations.bootTarget).toEqual({ available: true });
+  expect(binding.facts.operations.bootTargetHeadless).toMatchObject({ available: false });
+  expect(binding.facts.operations.listApps).toMatchObject({
+    available: false,
+    reason: 'owner-capability-missing',
+  });
+  await expect(binding.operations.ensureReady?.({})).resolves.toMatchObject({
+    id: runtimeDevice.id,
+    booted: true,
+  });
+  await expect(binding.operations.bootTarget?.({})).resolves.toMatchObject({
+    id: runtimeDevice.id,
+    booted: true,
+  });
+});
+
+test.each([
+  ['Android', device],
+  [
+    'iOS',
+    {
+      ...device,
+      platform: 'apple' as const,
+      appleOs: 'ios' as const,
+      id: 'browserstack:ios:lease-one',
+      name: 'Remote iPhone',
+    },
+  ],
+] as const)(
+  'uses an admitted direct WebDriver deployment runtime for %s without a local fallback',
+  async (_name, runtimeDevice) => {
+    const deployApp = vi.fn(async () => ({ launchTarget: 'provider-installed' }));
+    const deployMaterializedApp = vi.fn(async () => ({ launchTarget: 'provider-materialized' }));
+    const materializeApple = vi.fn(async () => ({
+      installablePath: '/tmp/App.app',
+      cleanup: async () => {},
+    }));
+    const materializeAndroid = vi.fn(async () => ({
+      installablePath: '/tmp/app.apk',
+      cleanup: async () => {},
+    }));
+    const base = host(async () => ({ stdout: '', stderr: '', exitCode: 0 }));
+    const owner = createWebDriverPlatformRuntimeOwner({
+      host: {
+        ...base,
+        appleDeployment: {
+          prepareArtifact: materializeApple,
+        } as unknown as PlatformRuntimeHost['appleDeployment'],
+        androidDeployment: {
+          prepareArtifact: materializeAndroid,
+        } as unknown as PlatformRuntimeHost['androidDeployment'],
+      },
+      owner: providerRuntimeOwner(
+        'browserstack',
+        runtimeDevice.platform === 'apple' ? 'ios' : 'android',
+      ),
+      ownsDevice: () => true,
+      capabilities: capabilities(),
+      deployment: {
+        fact: () => ({ available: true }),
+        deployApp,
+        deployMaterializedApp,
+      },
+    });
+    const controller = new AbortController();
+    const binding = await owner.bind({
+      device: runtimeDevice,
+      intent: { kind: 'ordinary' },
+      scope: {
+        signal: controller.signal,
+        diagnostics: { emit: () => {} },
+        progress: { report: () => {} },
+      },
+    });
+
+    for (const operation of [
+      'deployApp',
+      'materializeAppSource',
+      'deployMaterializedApp',
+    ] as const) {
+      expect(binding.facts.operations[operation]).toEqual({ available: true });
+    }
+    expect(binding.facts.operations.sendPushNotification).toMatchObject({
+      available: false,
+      reason: 'unsupported-provider-mode',
+    });
+    const deployInput = {
+      app: 'com.example.app',
+      appPath: '/tmp/app',
+      replaceExisting: false,
+    };
+    await binding.operations.deployApp?.(deployInput);
+    const artifact = await binding.operations.materializeAppSource?.({
+      source: { kind: 'path', path: '/tmp/app' },
+    });
+    const materializedInput = { artifact: artifact! };
+    await binding.operations.deployMaterializedApp?.(materializedInput);
+    expect(deployApp).toHaveBeenCalledWith(runtimeDevice, deployInput, controller.signal);
+    expect(deployMaterializedApp).toHaveBeenCalledWith(
+      runtimeDevice,
+      materializedInput,
+      controller.signal,
+    );
+    expect(materializeApple).toHaveBeenCalledTimes(runtimeDevice.platform === 'apple' ? 1 : 0);
+    expect(materializeAndroid).toHaveBeenCalledTimes(runtimeDevice.platform === 'android' ? 1 : 0);
+  },
+);
+
+test('captures through only the active exact WebDriver interactor', async () => {
+  const snapshot = vi.fn(async () => ({ backend: 'android' as const, nodes: [] }));
+  const getInteractor = vi.fn(() => ({ snapshot }) as unknown as Interactor);
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities(),
+    snapshotAvailable: true,
+    getInteractor,
+  });
+  const binding = await owner.bind({
+    device,
+    intent: { kind: 'ordinary' },
+    scope: {
+      signal: new AbortController().signal,
+      diagnostics: { emit: () => {} },
+      progress: { report: () => {} },
+    },
+  });
+
+  expect(binding.facts.operations.captureSnapshot).toEqual({ available: true });
+  expect(binding.facts.operations.captureSnapshotWithCustomActions.available).toBe(false);
+  expect(binding.facts.operations.captureSnapshotWithoutActiveApp).toEqual({ available: true });
+  expect(binding.facts.operations.setViewport).toMatchObject({ available: false });
+  expect(binding.operations.setViewport).toBeUndefined();
+  expect(binding.facts.operations.captureScreenshot).toEqual({ available: true });
+  expect(binding.operations.captureScreenshot).toBeTypeOf('function');
+  await expect(
+    binding.operations.captureScreenshot!({
+      outPath: '/tmp/runner.png',
+      options: { captureBackend: 'runner' },
+    }),
+  ).rejects.toMatchObject({
+    code: 'UNSUPPORTED_OPERATION',
+    details: { reason: 'screenshot-capture-backend-unsupported' },
+  });
+  // R40/R41: interaction cells share the captures' reachability gate and interactor.
+  expect(binding.facts.operations.focusPoint).toEqual({ available: true });
+  expect(binding.facts.operations.typeText).toEqual({ available: true });
+  expect(binding.operations.focusPoint).toBeTypeOf('function');
+  expect(binding.operations.typeText).toBeTypeOf('function');
+  // Provider ownership is authoritative and fails closed: a WebDriver owner's transport carries
+  // no local point-read tool, so it advertises none and never borrows the local family read.
+  expect(binding.facts.operations.readTextAtPoint).toMatchObject({
+    available: false,
+    reason: 'unsupported-provider-mode',
+  });
+  expect(binding.operations.readTextAtPoint).toBeUndefined();
+  // back/home/orientation and both clipboard halves ride the same reachable interactor
+  // focus/type do; the declared-capability gate stays inside the interactor.
+  for (const operation of [
+    'back',
+    'home',
+    'setOrientation',
+    'readClipboard',
+    'writeClipboard',
+    'appSwitcher',
+    'triggerAppEvent',
+    'keyboardEnter',
+    'keyboardDismiss',
+    'keyboardStatus',
+  ] as const) {
+    expect(binding.facts.operations[operation]).toEqual({ available: true });
+    expect(binding.operations[operation]).toBeTypeOf('function');
+  }
+  // tv-remote, settings, and the alert legs always throw unsupported in this interactor
+  // regardless of reachability: no capability ever declared them.
+  for (const operation of [
+    'tvRemote',
+    'setSetting',
+    'readAlert',
+    'awaitAlert',
+    'acceptAlert',
+    'dismissAlert',
+  ] as const) {
+    expect(binding.facts.operations[operation]).toMatchObject({
+      available: false,
+      reason: 'unsupported-provider-mode',
+    });
+    expect(binding.operations[operation]).toBeUndefined();
+  }
+  await expect(
+    binding.operations.captureSnapshot?.({ options: { interactiveOnly: true } }),
+  ).resolves.toEqual({ backend: 'android', nodes: [] });
+  expect(getInteractor).toHaveBeenCalledWith(device, expect.any(Object));
+  expect(snapshot).toHaveBeenCalledWith({
+    interactiveOnly: true,
+    signal: expect.any(AbortSignal),
+  });
+});
+
+test.each([
+  [
+    'inactive session',
+    { isSessionActive: () => false, snapshotAvailable: true, screenshotAvailable: true },
+  ],
+  [
+    'unsupported capability',
+    { isSessionActive: () => true, snapshotAvailable: false, screenshotAvailable: false },
+  ],
+] as const)('fails closed for an %s capture owner cell', async (_name, state) => {
+  const getInteractor = vi.fn(() => ({}) as unknown as Interactor);
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities(),
+    ...state,
+    getInteractor,
+  });
+  const facts = await owner.inspectFacts(device);
+  expect(facts.operations.captureSnapshot.available).toBe(false);
+  expect(facts.operations.captureSnapshotWithCustomActions.available).toBe(false);
+  expect(facts.operations.captureSnapshotWithoutActiveApp.available).toBe(false);
+  expect(facts.operations.setViewport.available).toBe(false);
+  expect(facts.operations.captureScreenshot.available).toBe(false);
+  // R40/R41: interaction cells gate on interactor reachability, not on the capture
+  // capability declarations — a provider that can drive its interactor can touch and type
+  // even when it declares no snapshot/screenshot. Only a dead session closes them.
+  expect(facts.operations.focusPoint.available).toBe(state.isSessionActive());
+  expect(facts.operations.typeText.available).toBe(state.isSessionActive());
+  expect(facts.operations.readTextAtPoint.available).toBe(false);
+  // back/home/orientation and the keyboard legs share focus/type's reachability gate; tv-remote
+  // stays unavailable even for an active session with no reachable interactor.
+  expect(facts.operations.back.available).toBe(state.isSessionActive());
+  for (const operation of ['keyboardStatus', 'keyboardDismiss', 'keyboardEnter'] as const) {
+    expect(facts.operations[operation].available).toBe(state.isSessionActive());
+  }
+  expect(facts.operations.home.available).toBe(state.isSessionActive());
+  expect(facts.operations.setOrientation.available).toBe(state.isSessionActive());
+  // `orientation auto` is ADB-only: even a fully reachable WebDriver session keeps the default
+  // unlock refusal the orientation facts state for an owner that declares no unlock cell.
+  expect(facts.operations.unlockOrientation.available).toBe(false);
+  expect(facts.operations.readClipboard.available).toBe(state.isSessionActive());
+  expect(facts.operations.writeClipboard.available).toBe(state.isSessionActive());
+  expect(facts.operations.appSwitcher.available).toBe(state.isSessionActive());
+  expect(facts.operations.triggerAppEvent.available).toBe(state.isSessionActive());
+  for (const operation of [
+    'tvRemote',
+    'setSetting',
+    'readAlert',
+    'awaitAlert',
+    'acceptAlert',
+    'dismissAlert',
+  ] as const) {
+    expect(facts.operations[operation].available).toBe(false);
+  }
+  // A dead session closes the keyboard family with the session gap, not the provider's own refusal.
+  if (!state.isSessionActive()) {
+    for (const operation of ['keyboardStatus', 'keyboardDismiss', 'keyboardEnter'] as const) {
+      expect(facts.operations[operation]).toMatchObject({ reason: 'owner-capability-missing' });
+    }
+  }
+  if (state.isSessionActive()) {
+    const binding = await owner.bind({
+      device,
+      intent: { kind: 'ordinary' },
+      scope: {
+        signal: new AbortController().signal,
+        diagnostics: { emit: () => {} },
+        progress: { report: () => {} },
+      },
+    });
+    expect(binding.operations.captureSnapshot).toBeUndefined();
+  } else {
+    await expect(
+      owner.bind({
+        device,
+        intent: { kind: 'ordinary' },
+        scope: {
+          signal: new AbortController().signal,
+          diagnostics: { emit: () => {} },
+          progress: { report: () => {} },
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED_OPERATION' });
+  }
+  expect(getInteractor).not.toHaveBeenCalled();
+});
+
+function host(run: PlatformRuntimeHost['commands']['run']): PlatformRuntimeHost {
+  // This suite reaches direct network and the explicitly replaced materializer only.
+  return {
+    deviceReadiness: {
+      applePhysical: { ensureConnected: async () => {} },
+      appleAutomation: {
+        keepHot: () => {},
+        markBooted: () => {},
+        wasRecentlyObservedBooted: async () => false,
+      },
+      androidEmulator: {
+        discover: async () => [],
+        launch: async () => 1,
+        terminate: async () => {},
+      },
+    },
+    deviceShutdown: {
+      apple: {
+        shutdownTarget: async () => ({ success: true, exitCode: 0, stdout: '', stderr: '' }),
+      },
+      android: {
+        shutdownTarget: async () => ({ success: true, exitCode: 0, stdout: '', stderr: '' }),
+      },
+    },
+    appleTools: {
+      isXcrunAvailable: async () => false,
+      run: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+    },
+    toolchains: { prepare: async () => {} },
+    commands: { which: async () => undefined, run },
+    artifacts: {
+      resolveSession: () => ({
+        outputPath: '/sessions/one/app.log',
+        pidPath: '/sessions/one/app-log.pid',
+      }),
+    },
+    outputs: {
+      openAppend: async () => {
+        throw new Error('unused');
+      },
+      readTail: async () => '',
+    },
+    processes: {
+      start: async () => {
+        throw new Error('unused');
+      },
+      readMarker: async () => ({ status: 'missing' }),
+      clearMarker: async () => {},
+      inspect: async () => 'missing',
+      terminate: async () => 'already-missing',
+    },
+    processTransports: { resolve: async () => ({ mode: 'local' }) },
+    clock: { now: () => 1, sleep: async () => {} },
+    appLogs: {
+      readRecent: async () => ({
+        path: '/sessions/one/app.log',
+        exists: false,
+        text: '',
+        skippedLines: 0,
+      }),
+      readProcessMarker: async () => ({ status: 'missing' }),
+    },
+    snapshot: {
+      captureSurface: async () => ({
+        backend: 'xctest' as const,
+        producer: 'appium-source' as const,
+        nodes: [],
+      }),
+      presentIosAcquisition: async () => ({
+        backend: 'xctest' as const,
+        producer: 'appium-source' as const,
+        nodes: [],
+      }),
+    },
+    networkTransports: { resolve: async () => ({ mode: 'local' }) },
+    screenRecording: {
+      outputs: { prepare: async () => {} },
+      apple: {
+        availability: async () => ({ available: true }),
+        runRunner: async () => ({}),
+        startSimulator: async () => {
+          throw new Error('unused');
+        },
+        inspectProcess: async () => 'missing',
+        terminateProcess: async () => 'already-missing',
+        inspectRunner: async () => 'missing',
+        retrieveRunnerRecording: async () => {},
+        captureClockAnchor: async () => undefined,
+        isRunnerBundleId: async () => false,
+      },
+      android: {
+        resolve: async () => {
+          throw new Error('unused');
+        },
+      },
+      harmony: {
+        start: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        stop: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        findMedia: async () => undefined,
+        stageMedia: async () => false,
+        stagedFileSize: async () => undefined,
+        pull: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        remove: async () => true,
+        removeMedia: async () => true,
+      },
+      web: { resolve: async () => undefined },
+      finalize: { complete: async () => ({}) },
+    },
+  } as unknown as PlatformRuntimeHost;
+}
+
+// R52/R53: gestures and scrolling ride the same reachability gate the captures do. The one extra
+// gate is multi-touch: this provider reaches iOS through its own WebDriver interactor, which has no
+// two-finger synthesis.
+test.each([
+  ['Android physical', device, true],
+  ['iOS physical', { ...device, platform: 'apple' as const, appleOs: 'ios' as const }, false],
+])('declares the WebDriver %s gesture and scroll cells', async (_name, owned, multiTouch) => {
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities(),
+    getInteractor: () => ({}) as unknown as Interactor,
+  });
+  const facts = await owner.inspectFacts(owned);
+  expect(facts.operations.performGesturePlan).toEqual({ available: true });
+  expect(facts.operations.performDirectionalFlingPlan).toEqual({ available: true });
+  expect(facts.operations.performTargetAuthoredDrag).toEqual({ available: true });
+  expect(facts.operations.gestureViewport).toEqual({ available: true });
+  expect(facts.operations.scrollDirection).toEqual({ available: true });
+  expect(facts.operations.performMultiTouchGesturePlan.available).toBe(multiTouch);
+  if (!multiTouch) {
+    expect(facts.operations.performMultiTouchGesturePlan).toEqual({
+      available: false,
+      reason: 'unsupported-provider-mode',
+      hint: 'Two-finger gesture synthesis is not available on iOS devices reached through a WebDriver provider.',
+    });
+  }
+});
+
+test('closes every WebDriver gesture and scroll cell when the interactor is unreachable', async () => {
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities(),
+    getInteractor: undefined,
+  });
+  const facts = await owner.inspectFacts(device);
+  for (const operation of [
+    'performGesturePlan',
+    'performDirectionalFlingPlan',
+    'performMultiTouchGesturePlan',
+    'performTargetAuthoredDrag',
+    'gestureViewport',
+    'scrollDirection',
+  ] as const) {
+    expect(facts.operations[operation]).toMatchObject({
+      available: false,
+      reason: 'unsupported-provider-mode',
+    });
+  }
+});
+
+// The defect this pins: a provider configured with `capabilityOverrides` used to be admitted from
+// interactor reachability alone, so `capabilities` advertised the operation and the interactor's
+// own `requireSupport` threw `UNSUPPORTED_OPERATION` after binding. Admission and execution now
+// read the same declared map (ADR 0019 §2).
+test.each([
+  ['clipboard.read', 'readClipboard'],
+  ['clipboard.write', 'writeClipboard'],
+  ['appSwitcher', 'appSwitcher'],
+  ['back', 'back'],
+  ['home', 'home'],
+  ['orientation', 'setOrientation'],
+] as const)(
+  'an unsupported %s override is refused at admission, not after binding',
+  async (operation, factKey) => {
+    const owner = createWebDriverPlatformRuntimeOwner({
+      host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+      owner: providerRuntimeOwner('browserstack', 'android'),
+      ownsDevice: () => true,
+      capabilities: capabilities('android', { [operation]: 'unsupported' }),
+      getInteractor: () => ({}) as unknown as Interactor,
+    });
+
+    const facts = await owner.inspectFacts(device);
+
+    expect(facts.operations[factKey]).toMatchObject({
+      available: false,
+      reason: 'owner-capability-missing',
+    });
+    // The refusal carries the capability map author's own wording.
+    const fact = facts.operations[factKey];
+    expect(fact.available === false && String(fact.hint)).toContain(operation);
+  },
+);
+
+test('a reachable provider with no overrides still admits its declared operations', async () => {
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities(),
+    getInteractor: () => ({}) as unknown as Interactor,
+  });
+
+  const facts = await owner.inspectFacts(device);
+
+  // `partial` counts as supported, matching `capabilitySupported` in the interactor.
+  for (const key of ['readClipboard', 'writeClipboard', 'appSwitcher', 'back', 'home'] as const) {
+    expect(facts.operations[key].available).toBe(true);
+  }
+});
+
+test('hardware-button facts follow the platform capability map', async () => {
+  const owner = (platform: CloudWebDriverPlatform) =>
+    createWebDriverPlatformRuntimeOwner({
+      host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+      owner: providerRuntimeOwner('browserstack', platform),
+      ownsDevice: () => true,
+      capabilities: capabilities(platform),
+      getInteractor: () => ({}) as unknown as Interactor,
+    });
+
+  const android = await owner('android').inspectFacts(device);
+  for (const key of [
+    'volumeUp',
+    'volumeDown',
+    'power',
+    'mute',
+    'sleep',
+    'wake',
+    'mediaPlayPause',
+    'mediaNext',
+    'mediaPrevious',
+    'mediaRewind',
+    'mediaFastForward',
+  ] as const) {
+    expect(android.operations[key].available, key).toBe(true);
+  }
+
+  const iosDevice: DeviceInfo = { ...device, platform: 'apple', appleOs: 'ios' };
+  const ios = await owner('ios').inspectFacts(iosDevice);
+  expect(ios.operations.volumeUp.available).toBe(true);
+  expect(ios.operations.volumeDown.available).toBe(true);
+  for (const key of [
+    'power',
+    'mute',
+    'sleep',
+    'wake',
+    'mediaPlayPause',
+    'mediaNext',
+    'mediaPrevious',
+    'mediaRewind',
+    'mediaFastForward',
+  ] as const) {
+    expect(ios.operations[key], key).toMatchObject({
+      available: false,
+      reason: 'owner-capability-missing',
+    });
+  }
+});
+
+test('Android TV hardware buttons are refused before a WebDriver interactor is acquired', async () => {
+  const getInteractor = vi.fn(() => {
+    throw new Error('a TV hardware button must not acquire an interactor');
+  });
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities('android'),
+    getInteractor,
+  });
+  const tv: DeviceInfo = { ...device, target: 'tv' };
+  const facts = await owner.inspectFacts(tv);
+  const binding = await owner.bind({
+    device: tv,
+    intent: { kind: 'ordinary' },
+    scope: {
+      signal: new AbortController().signal,
+      diagnostics: { emit: () => {} },
+      progress: { report: () => {} },
+    },
+  });
+
+  for (const button of Object.keys(HARDWARE_BUTTON_NAME_LABELS) as HardwareButton[]) {
+    expect(facts.operations[button], button).toMatchObject({
+      available: false,
+      reason: 'unsupported-provider-mode',
+    });
+    expect(binding.operations[button], button).toBeUndefined();
+  }
+  expect(getInteractor).not.toHaveBeenCalled();
+});
+
+test('an iOS WebDriver device serves keyboard dismiss, and neither the unproven enter nor the Android IME probe', async () => {
+  const iosDevice: DeviceInfo = {
+    ...device,
+    platform: 'apple',
+    appleOs: 'ios',
+    id: 'browserstack:lease-ios',
+    name: 'Remote iPhone',
+  };
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', 'ios'),
+    ownsDevice: () => true,
+    capabilities: capabilities('ios'),
+    getInteractor: vi.fn(() => ({}) as unknown as Interactor),
+  });
+  const facts = await owner.inspectFacts(iosDevice);
+  expect(facts.operations.keyboardDismiss).toEqual({ available: true });
+  for (const operation of ['keyboardEnter', 'keyboardStatus'] as const) {
+    expect(facts.operations[operation]).toMatchObject({
+      available: false,
+      reason: 'unsupported-provider-mode',
+    });
+  }
+});
+
+test('a provider that declares no keyboard capability closes the keyboard family', async () => {
+  const owner = createWebDriverPlatformRuntimeOwner({
+    host: host(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    owner: providerRuntimeOwner('browserstack', 'android'),
+    ownsDevice: () => true,
+    capabilities: capabilities('android', { keyboard: 'unsupported' }),
+    getInteractor: vi.fn(() => ({}) as unknown as Interactor),
+  });
+  const facts = await owner.inspectFacts(device);
+  for (const operation of ['keyboardStatus', 'keyboardDismiss', 'keyboardEnter'] as const) {
+    expect(facts.operations[operation]).toMatchObject({
+      available: false,
+      reason: 'owner-capability-missing',
+    });
+  }
+});

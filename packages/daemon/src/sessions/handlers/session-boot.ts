@@ -1,0 +1,137 @@
+import { resolveCommandAndroidAvdSelection } from '../../core/daemon-command-registry.ts';
+import type { DaemonResponse } from '@agent-device/kernel/contracts';
+import { resolveDeviceReadinessRuntimePlan } from '@agent-device/contracts/platform-runtime-operations';
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import { asAppError } from '@agent-device/kernel/errors';
+import { errorResponse } from '@agent-device/kernel/contracts';
+import { resolveDeviceReadinessInput } from '../../core/device-readiness-input.ts';
+import {
+  markSelectionBootOccurred,
+  type DeviceSelectionResult,
+} from '@agent-device/device-selection/device-selection-resolver';
+import {
+  requireSessionOrExplicitSelector,
+  resolveBootCommandSelection,
+} from '../../resources/session-device-resolution.ts';
+import {
+  admitRuntimeOperations,
+  type UnavailableRuntimeResponse,
+} from '../../core/runtime-admission.ts';
+import { startupDeadlineAtMs } from '../startup-deadline.ts';
+import type { RuntimeCommandHandlerParams } from '../../core/session-runtime-admission.ts';
+import { deviceStatusReportResponse } from './session-device-status-response.ts';
+
+/** `boot --headless` reports an unsupported cell as a request error, not a device capability gap. */
+function bootUnavailableResponse(headless: boolean): UnavailableRuntimeResponse {
+  return (unavailable) =>
+    errorResponse(
+      headless ? 'INVALID_ARGS' : 'UNSUPPORTED_OPERATION',
+      headless
+        ? 'boot --headless is supported only for Android emulators.'
+        : 'boot is not supported on this device',
+      undefined,
+      unavailable.hint ? { hint: unavailable.hint } : undefined,
+    );
+}
+
+function hasAndroidAvdIdentity(
+  selectedName: string | undefined,
+  sessionDevice: DeviceInfo | undefined,
+): boolean {
+  return Boolean(
+    selectedName?.trim() ||
+    (sessionDevice?.platform === 'android' && sessionDevice.kind === 'emulator'),
+  );
+}
+
+/**
+ * Which device this boot targets. A headless plan whose selector carries no Android AVD identity
+ * turns the resolver's `DEVICE_NOT_FOUND` into the argument error that names the missing
+ * `--device <avd-name>`; every other resolution failure propagates unchanged.
+ */
+async function resolveBootTargetSelection(
+  params: RuntimeCommandHandlerParams,
+  headless: boolean,
+): Promise<DeviceSelectionResult | { refusal: DaemonResponse }> {
+  const { sessionName, sessionStore, req, platformServices } = params;
+  const session = sessionStore.get(sessionName);
+  const flags = req.flags ?? {};
+  try {
+    const selection = await resolveBootCommandSelection({
+      session,
+      req,
+      env: sessionStore.host.env,
+      androidAvdSelection: resolveCommandAndroidAvdSelection(req.command),
+      platformServices,
+    });
+    const { device } = selection;
+    if (flags.target && (device.target ?? 'mobile') !== flags.target) {
+      return {
+        refusal: errorResponse(
+          'DEVICE_NOT_FOUND',
+          `No ${device.platform} device found matching --target ${flags.target}.`,
+        ),
+      };
+    }
+    return selection;
+  } catch (error) {
+    const appError = asAppError(error);
+    if (
+      headless &&
+      !hasAndroidAvdIdentity(flags.device, session?.device) &&
+      appError.code === 'DEVICE_NOT_FOUND' &&
+      appError.details?.reason !== 'provider_instance_unallocated'
+    ) {
+      return {
+        refusal: errorResponse(
+          'INVALID_ARGS',
+          'boot --headless requires --device <avd-name> (or an Android emulator session target).',
+        ),
+      };
+    }
+    throw error;
+  }
+}
+
+/** Brings the selected device up, headless for an Android AVD plan, through one admitted runtime. */
+export async function handleBootCommand(
+  params: RuntimeCommandHandlerParams,
+): Promise<DaemonResponse> {
+  const flags = params.req.flags ?? {};
+  const guard = requireSessionOrExplicitSelector(
+    params.req.command,
+    params.sessionStore.get(params.sessionName),
+    flags,
+  );
+  if (guard) return guard;
+
+  const plan = resolveDeviceReadinessRuntimePlan({ headless: flags.headless === true });
+
+  const selection = await resolveBootTargetSelection(params, plan.kind === 'boot-target-headless');
+  if ('refusal' in selection) return selection.refusal;
+  const target = selection.device;
+
+  const admitted = await admitRuntimeOperations({
+    command: 'boot',
+    device: target,
+    required: plan.use.required,
+    inspectFacts: params.inspectFacts,
+    platformServices: params.platformServices,
+    bindDevice: params.bindDevice,
+    unavailableResponse: bootUnavailableResponse(plan.kind === 'boot-target-headless'),
+  });
+  if (admitted.type === 'response') return admitted.response;
+
+  const input = resolveDeviceReadinessInput({
+    flags,
+    env: params.host.env,
+    deadlineAtMs: startupDeadlineAtMs(flags.timeoutMs),
+  });
+  const device =
+    plan.kind === 'boot-target-headless'
+      ? await (await admitted.bind(target, plan.use)).operations.bootTargetHeadless(input)
+      : await (await admitted.bind(target, plan.use)).operations.bootTarget(input);
+
+  const { device: _selected, ...metadata } = markSelectionBootOccurred(selection);
+  return deviceStatusReportResponse(device, { booted: true, selection: metadata });
+}

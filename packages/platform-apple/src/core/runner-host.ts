@@ -1,0 +1,124 @@
+import type { AppleRunnerHost } from '@agent-device/apple-runner';
+import { publishFileSync, acquireProcessLock, withProcessLock } from '@agent-device/host-kit/file';
+
+import {
+  commandDeveloperDir,
+  isCommandTimeoutError,
+  requireExecSuccess,
+  runCmdBackground,
+  runCmdStreaming,
+} from '@agent-device/host-kit/command';
+import { shellQuote } from '@agent-device/kernel/device-shell';
+import { AppError } from '@agent-device/kernel/errors';
+import { emitDiagnostic, withDiagnosticTimer } from '@agent-device/host-kit/diagnostics';
+import {
+  isProcessAlive,
+  isProcessGroupAlive,
+  readProcessCommand,
+  readProcessStartTime,
+  signalPidsBestEffort,
+  signalProcessGroupBestEffort,
+  classifyOwnerLiveness,
+  readHostCpuArchSync,
+} from '@agent-device/host-kit/process';
+import { Deadline, isEnvTruthy, retryWithPolicy } from '@agent-device/host-kit/retry';
+import { runtimeSlot } from '@agent-device/host-kit/runtime-slots';
+
+import { withKeyedLock } from '@agent-device/kernel/keyed-lock';
+
+import { findProjectRoot, readVersion } from '@agent-device/host-kit/version';
+import { isRecord } from '@agent-device/kernel/record';
+import { parseBooleanLiteral } from '@agent-device/kernel/source-value';
+import type { HostEnvironment } from '@agent-device/kernel/source-value';
+
+import {
+  getRequestSignal,
+  isRequestCanceled,
+  emitRequestProgress,
+} from '@agent-device/host-kit/request';
+
+import { bootFailureHint, classifyBootFailure } from '@agent-device/provision-kit/boot-diagnostics';
+import { resolveIosPhysicalDeviceControl } from './physical-device-control.ts';
+import {
+  getAppleRunnerHostEnvironment,
+  getRunnerDeviceClaimAuthorityProbe,
+  getRunnerLeaseOwnerStateDir,
+} from './runner-owner-state.ts';
+import { buildSimctlArgsForDevice, simulatorAddressFor } from './simctl.ts';
+import {
+  hasScopedAppleToolProvider,
+  readApplePlistJson,
+  runAppleToolCommand,
+  runXcrun,
+} from './tool-provider.ts';
+
+/**
+ * The real host capabilities for `@agent-device/platform-apple/runner`: the one place
+ * the runner package's port meets the root-owned utilities. Consumed by the
+ * production composition module (`runner-client.ts`) and by the vitest
+ * `apple-runner` project setup, which installs the same capabilities as
+ * overridable test defaults.
+ *
+ * Names only -- `AppleRunnerHost` derives every signature from the owning module, and naming each
+ * import keeps the bundler shaking the rest of those modules away. Spreading the modules whole
+ * instead would drop this list, at the cost of putting all of their exports on the host object at
+ * runtime (measured: 41 members to 128, +1.8 kB shipped, including a vitest-only memo reset) and
+ * making a name shared by two of them silently rebind a capability.
+ */
+export const appleRunnerHost: AppleRunnerHost = {
+  runCmdStreaming,
+  runCmdBackground,
+  requireExecSuccess,
+  isCommandTimeoutError,
+  commandDeveloperDir,
+  hostEnvironment: (): HostEnvironment => {
+    const host = getAppleRunnerHostEnvironment();
+    if (!host) {
+      throw new AppError('COMMAND_FAILED', 'Apple runner configuration has no bound host.', {
+        reason: 'apple_runner_host_unbound',
+      });
+    }
+    return host;
+  },
+  shellQuote,
+  emitDiagnostic,
+  withDiagnosticTimer,
+  retryWithPolicy,
+  isEnvTruthy,
+  deadlineFromTimeoutMs: (timeoutMs, nowMs) => Deadline.fromTimeoutMs(timeoutMs, nowMs),
+  isProcessAlive,
+  isProcessGroupAlive,
+  readProcessStartTime,
+  readProcessCommand,
+  signalPidsBestEffort,
+  signalProcessGroupBestEffort,
+  findProjectRoot,
+  readVersion,
+  acquireProcessLock,
+  withProcessLock,
+  withKeyedLock,
+  publishFileSync,
+  classifyOwnerLiveness,
+  readHostCpuArchSync,
+  parseBooleanLiteral,
+  isRecord,
+  emitRequestProgress,
+  getRequestSignal,
+  isRequestCanceled,
+  classifyBootFailure,
+  bootFailureHint,
+  runAppleToolCommand,
+  runXcrun,
+  enableIosSimulatorAppAccessibility: async (device) => {
+    const { enableIosSimulatorAppAccessibility } = await import('./ios-simulator-accessibility.ts');
+    await enableIosSimulatorAppAccessibility(device);
+  },
+  readApplePlistJson,
+  hasScopedAppleToolProvider,
+  buildSimctlArgsForDevice,
+  simulatorAddressFor,
+  resolveIosPhysicalDeviceControl,
+  leaseOwnerStateDir: getRunnerLeaseOwnerStateDir,
+  runnerRuntimeSlot: runtimeSlot,
+  hasDeviceClaimAuthority: (device) => getRunnerDeviceClaimAuthorityProbe()?.(device) ?? false,
+};

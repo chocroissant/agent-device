@@ -1,0 +1,562 @@
+import { daemonPlatformServicesFixture } from '../../../__tests__/support/platform-services-fixture.ts';
+import { test, expect, vi } from 'vitest';
+import * as path from 'node:path';
+import {
+  mockDispatch,
+  mockResolveTargetDevice,
+  makeSessionStore,
+  makeSession,
+  noopInvoke,
+} from '../../../__tests__/support/handlers/session-test-harness.ts';
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import type { SessionState } from '../../../core/session-state.ts';
+import type { DaemonRequest } from '../../../core/daemon-request.ts';
+import {
+  handleSessionCommands,
+  mockInspectDeviceRuntimeFacts,
+} from '../../../__tests__/support/handlers/session-command-harness.ts';
+import { mkdtempForTestSync, createTestHostEnvironment } from '@agent-device/test-kit';
+import { AppError, PRE_DISPATCH_REFUSAL_REASONS } from '@agent-device/kernel/errors';
+import type {
+  AppStateRuntimeInput,
+  AppStateRuntimeResult,
+} from '@agent-device/contracts/app-state-runtime';
+import {
+  appStateUse,
+  type PlatformRuntimeOperations,
+} from '@agent-device/contracts/platform-runtime-operations';
+import {
+  localRuntimeOwner,
+  narrowDeviceBinding,
+  type DeviceBinding,
+  type RuntimeFacts,
+  type RuntimeOperationUnavailability,
+} from '@agent-device/contracts/platform-runtime';
+import type { BindDeviceRuntime } from '../../../core/request-runtime-binding.ts';
+import { fakeCreateCommandSurface } from '../../../__tests__/support/command-surface-fake.ts';
+
+test('appstate on iOS requires active session on selected device', async () => {
+  const sessionStore = makeSessionStore();
+  const sessionName = 'default';
+  sessionStore.publish(sessionName, {
+    ...makeSession(sessionName, {
+      platform: 'apple',
+      id: 'sim-1',
+      name: 'iPhone 15',
+      kind: 'simulator',
+      booted: true,
+    }),
+    appBundleId: 'com.apple.Preferences',
+    appName: 'Settings',
+  });
+  const selectedDevice: SessionState['device'] = {
+    platform: 'apple',
+    id: 'sim-2',
+    name: 'iPhone 17 Pro',
+    kind: 'simulator',
+    booted: true,
+  };
+  mockResolveTargetDevice.mockResolvedValue(selectedDevice);
+  mockDispatch.mockRejectedValue(new Error('snapshot dispatch should not run'));
+
+  const response = await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      token: 't',
+      session: sessionName,
+      command: 'appstate',
+      positionals: [],
+      flags: { platform: 'ios', device: 'iPhone 17 Pro' },
+    },
+    sessionName,
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+  });
+
+  expect(response).toBeTruthy();
+  expect(response?.ok).toBe(false);
+  if (response && !response.ok) {
+    expect(response.error.code).toBe('SESSION_NOT_FOUND');
+    expect(response.error.message).toMatch(/requires an active session/i);
+  }
+});
+
+test('appstate returns session appName when bundle id is unavailable', async () => {
+  const sessionStore = makeSessionStore();
+  const sessionName = 'sim';
+  sessionStore.publish(sessionName, {
+    ...makeSession(sessionName, {
+      platform: 'apple',
+      id: 'sim-1',
+      name: 'iPhone 17 Pro',
+      kind: 'simulator',
+      booted: true,
+    }),
+    appName: 'Maps',
+  });
+
+  const selectedDevice: SessionState['device'] = {
+    platform: 'apple',
+    id: 'sim-1',
+    name: 'iPhone 17 Pro',
+    kind: 'simulator',
+    booted: true,
+  };
+  mockResolveTargetDevice.mockResolvedValue(selectedDevice);
+  mockDispatch.mockRejectedValue(new Error('snapshot dispatch should not run'));
+
+  const response = await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      token: 't',
+      session: sessionName,
+      command: 'appstate',
+      positionals: [],
+      flags: { platform: 'ios', device: 'iPhone 17 Pro' },
+    },
+    sessionName,
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+    ...appleAppStateRuntime(async () => ({})),
+  });
+
+  expect(response).toBeTruthy();
+  expect(response?.ok).toBe(true);
+  if (response && response.ok) {
+    expect(response.data?.platform).toBe('ios');
+    expect(response.data?.appName).toBe('Maps');
+    expect(response.data?.appBundleId).toBe(undefined);
+    expect(response.data?.source).toBe('session');
+    expect(response.data?.device_udid).toBe('sim-1');
+    expect(response.data?.ios_simulator_device_set).toBe(null);
+  }
+});
+
+test('appstate fails when iOS session has no tracked app', async () => {
+  const sessionStore = makeSessionStore();
+  const sessionName = 'sim';
+  sessionStore.publish(
+    sessionName,
+    makeSession(sessionName, {
+      platform: 'apple',
+      id: 'sim-1',
+      name: 'iPhone 17 Pro',
+      kind: 'simulator',
+      booted: true,
+    }),
+  );
+
+  const selectedDevice: SessionState['device'] = {
+    platform: 'apple',
+    id: 'sim-1',
+    name: 'iPhone 17 Pro',
+    kind: 'simulator',
+    booted: true,
+  };
+  mockResolveTargetDevice.mockResolvedValue(selectedDevice);
+
+  const response = await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      token: 't',
+      session: sessionName,
+      command: 'appstate',
+      positionals: [],
+      flags: { platform: 'ios', device: 'iPhone 17 Pro' },
+    },
+    sessionName,
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+  });
+
+  expect(response).toBeTruthy();
+  expect(response?.ok).toBe(false);
+  if (response && !response.ok) {
+    expect(response.error.code).toBe('COMMAND_FAILED');
+    expect(response.error.message).toMatch(/no foreground app is tracked/i);
+  }
+});
+
+test('appstate without session on iOS selector returns SESSION_NOT_FOUND', async () => {
+  const sessionStore = makeSessionStore();
+  const selectedDevice: SessionState['device'] = {
+    platform: 'apple',
+    id: 'sim-2',
+    name: 'iPhone 17 Pro',
+    kind: 'simulator',
+    booted: true,
+  };
+  mockResolveTargetDevice.mockResolvedValue(selectedDevice);
+
+  const response = await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      token: 't',
+      session: 'default',
+      command: 'appstate',
+      positionals: [],
+      flags: { platform: 'ios', device: 'iPhone 17 Pro' },
+    },
+    sessionName: 'default',
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+  });
+
+  expect(response).toBeTruthy();
+  expect(response?.ok).toBe(false);
+  if (response && !response.ok) {
+    expect(response.error.code).toBe('SESSION_NOT_FOUND');
+  }
+});
+
+test('appstate with explicit missing session returns SESSION_NOT_FOUND', async () => {
+  const sessionStore = makeSessionStore();
+  const response = await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      token: 't',
+      session: 'sim',
+      command: 'appstate',
+      positionals: [],
+      flags: { session: 'sim', platform: 'ios', device: 'iPhone 17 Pro' },
+    },
+    sessionName: 'sim',
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+  });
+
+  expect(response).toBeTruthy();
+  expect(response?.ok).toBe(false);
+  if (response && !response.ok) {
+    expect(response.error.code).toBe('SESSION_NOT_FOUND');
+    expect(response.error.message).toMatch(/no active session "sim"/i);
+    expect(response.error.message).not.toMatch(/omit --session/i);
+    expect(response.error.details?.reason).toBe(PRE_DISPATCH_REFUSAL_REASONS.namedSessionNotFound);
+    expect(response.error.details?.session).toBe('sim');
+    expect(response.error.details?.dispatched).toBe('no');
+    expect(mockResolveTargetDevice).not.toHaveBeenCalled();
+  }
+});
+
+test('clipboard requires an active session or explicit device selector', async () => {
+  const sessionStore = makeSessionStore();
+  const response = await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      token: 't',
+      session: 'default',
+      command: 'clipboard',
+      positionals: ['read'],
+      flags: {},
+    },
+    sessionName: 'default',
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+  });
+
+  expect(response).toBeTruthy();
+  expect(response?.ok).toBe(false);
+  if (response && !response.ok) {
+    expect(response.error.code).toBe('INVALID_ARGS');
+    expect(response.error.message).toMatch(
+      /clipboard requires an active session or an explicit device selector/i,
+    );
+  }
+});
+
+test('clipboard rejects unsupported iOS physical devices', async () => {
+  const sessionStore = makeSessionStore();
+  const sessionName = 'ios-device-session';
+  sessionStore.publish(
+    sessionName,
+    makeSession(sessionName, {
+      platform: 'apple',
+      id: 'ios-device-1',
+      name: 'iPhone Device',
+      kind: 'device',
+      booted: true,
+    }),
+  );
+
+  mockDispatch.mockRejectedValue(new Error('dispatch should not run for unsupported targets'));
+
+  const response = await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      token: 't',
+      session: sessionName,
+      command: 'clipboard',
+      positionals: ['read'],
+      flags: {},
+    },
+    sessionName,
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+  });
+
+  expect(response).toBeTruthy();
+  expect(response?.ok).toBe(false);
+  if (response && !response.ok) {
+    expect(response.error.code).toBe('UNSUPPORTED_OPERATION');
+    expect(response.error.message).toMatch(/clipboard is not supported on this device/i);
+  }
+});
+
+const IOS_SESSION_DEVICE: SessionState['device'] = {
+  platform: 'apple',
+  appleOs: 'ios',
+  id: 'sim-1',
+  name: 'iPhone 17 Pro',
+  kind: 'simulator',
+  booted: true,
+};
+
+/** An Apple owner that admits the appstate read and answers it with `read`. */
+function appleAppStateRuntime(
+  read: (input: AppStateRuntimeInput | undefined) => Promise<AppStateRuntimeResult>,
+): {
+  inspectFacts: (device: DeviceInfo) => Promise<RuntimeFacts<PlatformRuntimeOperations>>;
+  bindDevice: BindDeviceRuntime;
+} {
+  const factsFor = async (device: DeviceInfo): Promise<RuntimeFacts<PlatformRuntimeOperations>> => {
+    const base = await mockInspectDeviceRuntimeFacts(device);
+    return { ...base, operations: { ...base.operations, appState: { available: true } } };
+  };
+  return {
+    inspectFacts: factsFor,
+    bindDevice: async (selected, use) => {
+      const binding: DeviceBinding<PlatformRuntimeOperations> = {
+        device: selected,
+        owner: localRuntimeOwner('apple'),
+        facts: await factsFor(selected),
+        operations: {
+          ensureReady: async () => selected,
+          appState: read,
+        },
+        [Symbol.asyncDispose]: async () => undefined,
+      };
+      return narrowDeviceBinding(binding, use);
+    },
+  };
+}
+
+function iosSessionRequest(sessionName: string): DaemonRequest {
+  return {
+    token: 't',
+    session: sessionName,
+    command: 'appstate',
+    positionals: [],
+    flags: { platform: 'ios', device: 'iPhone 17 Pro' },
+  };
+}
+
+test('appstate on iOS reads the session app state from the runner when its owner admits it', async () => {
+  const sessionStore = makeSessionStore();
+  const sessionName = 'sim';
+  sessionStore.publish(sessionName, {
+    ...makeSession(sessionName, IOS_SESSION_DEVICE),
+    appBundleId: 'dev.e2e.benchmark',
+    appName: 'Benchmark',
+  });
+  mockResolveTargetDevice.mockResolvedValue(IOS_SESSION_DEVICE);
+  const asked: Array<AppStateRuntimeInput | undefined> = [];
+  const runtime = appleAppStateRuntime(async (input) => {
+    asked.push(input);
+    return { applicationState: 'runningBackground' };
+  });
+
+  const response = await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: iosSessionRequest(sessionName),
+    sessionName,
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+    ...runtime,
+  });
+
+  expect(response?.ok).toBe(true);
+  if (response && response.ok) {
+    expect(response.data?.appBundleId).toBe('dev.e2e.benchmark');
+    expect(response.data?.state).toBe('runningBackground');
+    expect(response.data?.source).toBe('runner');
+  }
+  // The read is about the session app, and the use it went through is the appstate use.
+  expect(asked).toEqual([{ appBundleId: 'dev.e2e.benchmark' }]);
+  expect(appStateUse.required).toEqual(['ensureReady', 'appState']);
+});
+
+test('appstate on iOS keeps the session answer, with no state, when no runner is live to ask', async () => {
+  const sessionStore = makeSessionStore();
+  const sessionName = 'sim';
+  sessionStore.publish(sessionName, {
+    ...makeSession(sessionName, IOS_SESSION_DEVICE),
+    appBundleId: 'dev.e2e.benchmark',
+    appName: 'Benchmark',
+  });
+  mockResolveTargetDevice.mockResolvedValue(IOS_SESSION_DEVICE);
+  const runtime = appleAppStateRuntime(async () => ({}));
+
+  const response = await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: iosSessionRequest(sessionName),
+    sessionName,
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+    ...runtime,
+  });
+
+  expect(response?.ok).toBe(true);
+  if (response && response.ok) {
+    expect(response.data?.source).toBe('session');
+    expect(response.data).not.toHaveProperty('state');
+  }
+});
+
+const BUNDLED_APP = { appBundleId: 'dev.e2e.benchmark', appName: 'Benchmark' };
+const DEEP_LINK_APP = { appName: 'myapp://path' };
+
+function publishIosSession(
+  sessionStore: ReturnType<typeof makeSessionStore>,
+  sessionName: string,
+  app: Readonly<{ appBundleId?: string; appName: string }> = BUNDLED_APP,
+) {
+  sessionStore.publish(sessionName, { ...makeSession(sessionName, IOS_SESSION_DEVICE), ...app });
+  mockResolveTargetDevice.mockResolvedValue(IOS_SESSION_DEVICE);
+}
+
+async function appStateWith(
+  runtime: ReturnType<typeof appleAppStateRuntime>,
+  app?: Parameters<typeof publishIosSession>[2],
+) {
+  const sessionStore = makeSessionStore();
+  const sessionName = 'sim';
+  publishIosSession(sessionStore, sessionName, app);
+  return await handleSessionCommands({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: iosSessionRequest(sessionName),
+    sessionName,
+    logPath: path.join(mkdtempForTestSync('daemon'), 'daemon.log'),
+    sessionStore,
+    invoke: noopInvoke,
+    ...runtime,
+  });
+}
+
+function runtimeWithAppStateFact(
+  fact: RuntimeOperationUnavailability,
+): ReturnType<typeof appleAppStateRuntime> {
+  return {
+    ...appleAppStateRuntime(async () => ({})),
+    inspectFacts: async (device) => {
+      const base = await mockInspectDeviceRuntimeFacts(device);
+      return { ...base, operations: { ...base.operations, appState: fact } };
+    },
+  };
+}
+
+test('appstate on iOS fails with the read error when the runtime read fails', async () => {
+  const failure = new AppError('COMMAND_FAILED', 'runner is busy', { reason: 'runner_busy' });
+
+  await expect(
+    appStateWith(
+      appleAppStateRuntime(async () => {
+        throw failure;
+      }),
+    ),
+  ).rejects.toBe(failure);
+});
+
+test('appstate on iOS is refused when the owner holds no live session for the device', async () => {
+  const response = await appStateWith(
+    runtimeWithAppStateFact({
+      available: false,
+      reason: 'owner-capability-missing',
+      hint: 'Limrun requires a matching live provider session for this device.',
+    }),
+  );
+
+  expect(response).toMatchObject({
+    ok: false,
+    error: {
+      code: 'UNSUPPORTED_OPERATION',
+      details: { reason: 'owner-capability-missing' },
+    },
+  });
+});
+
+test('appstate on iOS asks the owner about a session opened with no bundle id', async () => {
+  const read = vi.fn(async () => ({}));
+
+  const response = await appStateWith(appleAppStateRuntime(read), DEEP_LINK_APP);
+
+  expect(response).toMatchObject({
+    ok: true,
+    data: { source: 'session', appName: 'myapp://path' },
+  });
+  expect(read).toHaveBeenCalledTimes(1);
+});
+
+test('appstate on iOS fails when the read fails for a session with no bundle id', async () => {
+  const failure = new AppError('COMMAND_FAILED', 'instance gone', {
+    reason: 'limrun_instance_unreachable',
+  });
+
+  await expect(
+    appStateWith(
+      appleAppStateRuntime(async () => {
+        throw failure;
+      }),
+      DEEP_LINK_APP,
+    ),
+  ).rejects.toBe(failure);
+});
+
+test('appstate on iOS is refused for a session with no bundle id and no live owner session', async () => {
+  const response = await appStateWith(
+    runtimeWithAppStateFact({ available: false, reason: 'owner-capability-missing' }),
+    DEEP_LINK_APP,
+  );
+
+  expect(response).toMatchObject({
+    ok: false,
+    error: { code: 'UNSUPPORTED_OPERATION', details: { reason: 'owner-capability-missing' } },
+  });
+});
+
+test.each(['unsupported-provider-mode', 'unsupported-platform-leaf'] as const)(
+  'appstate on iOS keeps the session answer when the owner reports %s',
+  async (reason) => {
+    const response = await appStateWith(runtimeWithAppStateFact({ available: false, reason }));
+
+    expect(response).toMatchObject({ ok: true, data: { source: 'session', appName: 'Benchmark' } });
+  },
+);

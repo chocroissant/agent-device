@@ -1,0 +1,225 @@
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import {
+  coerceExecResult,
+  runCmd,
+  whichCmd,
+  type ExecOptions,
+  type ExecResult,
+  commandHostEnvironment,
+} from '@agent-device/host-kit/command';
+import type {
+  ScopedSimctlArgs,
+  ScopedSimctlCommand,
+} from '@agent-device/contracts/platform-runtime-host';
+import { createScopedProvider } from '@agent-device/kernel/scoped-provider';
+import { createLocalAppleMacOsHostProvider } from '../os/macos/host-provider.ts';
+import type {
+  AppleMacOsHelperProvider,
+  AppleMacOsHostProvider,
+  ApplePlistProvider,
+  AppleSimctlToolProvider,
+  AppleSimulatorFileCopy,
+  AppleSimulatorContainerRequest,
+  AppleSimulatorContainer,
+  AppleSimulatorAppInfoRequest,
+  SimulatorAppListOptions,
+  SimulatorAppListRead,
+  AppleToolAvailabilityChecker,
+  AppleToolCommandExecutor,
+  AppleToolExecOptions,
+  AppleXcrunToolProvider,
+} from './tool-provider-types.ts';
+
+export type {
+  AppleMacOsHelperProvider,
+  AppleMacOsHostProvider,
+  ApplePlistProvider,
+  AppleToolAvailabilityChecker,
+  AppleToolCommandExecutor,
+  AppleToolExecOptions,
+  AppleToolSubcommandExecutor,
+  AppleXcrunToolProvider,
+} from './tool-provider-types.ts';
+
+export type { ScopedSimctlCommand };
+
+export function simctlCommand(args: ScopedSimctlArgs): ScopedSimctlCommand {
+  return Object.freeze(['simctl', ...args] as const) as ScopedSimctlCommand;
+}
+
+async function runSimctlCommand(
+  runCommand: AppleToolCommandExecutor,
+  args: ScopedSimctlArgs,
+  options?: AppleToolExecOptions,
+): Promise<ExecResult> {
+  return await runCommand('xcrun', [...simctlCommand(args)], options);
+}
+
+function simctlCommandArgs(command: ScopedSimctlCommand): ScopedSimctlArgs {
+  return Object.freeze(command.slice(1)) as ScopedSimctlArgs;
+}
+
+export type AppleToolProvider = {
+  runCommand: AppleToolCommandExecutor;
+  simctl: AppleSimctlToolProvider;
+  devicectl: AppleXcrunToolProvider;
+  macosHelper?: AppleMacOsHelperProvider;
+  macosHost?: AppleMacOsHostProvider;
+  plist?: ApplePlistProvider;
+  /** Hosts without a simctl screenshot transport use the runner's file capture. */
+  simulatorScreenshotBackend?: 'runner';
+  simulatorFiles: {
+    copyToHost(request: AppleSimulatorFileCopy): Promise<void>;
+    openContainer(request: AppleSimulatorContainerRequest): Promise<AppleSimulatorContainer | null>;
+    stageFile(path: string, signal?: AbortSignal): Promise<AsyncDisposable & { path: string }>;
+  };
+  simulatorApps: {
+    list(device: DeviceInfo, options?: SimulatorAppListOptions): Promise<SimulatorAppListRead>;
+    readInfoPlist(request: AppleSimulatorAppInfoRequest): Promise<Record<string, unknown> | null>;
+  };
+  whichCommand: AppleToolAvailabilityChecker;
+};
+
+export const APPLE_PLIST_TIMEOUT_MS = 15_000;
+
+const localAppleToolProvider = createLocalAppleToolProvider();
+
+const appleToolProviderScope = createScopedProvider<AppleToolProvider>(
+  localAppleToolProvider,
+  createLocalAppleToolProvider,
+);
+
+export function createLocalAppleToolProvider(
+  provider: Partial<AppleToolProvider> = {},
+): AppleToolProvider {
+  const runCommand = coerceRunCommand(provider.runCommand ?? runCmd);
+  const simctl: AppleSimctlToolProvider = {
+    run: provider.simctl
+      ? coerceRun(provider.simctl.run)
+      : async (args, options) => await runSimctlCommand(runCommand, args, options),
+  };
+  const plist = provider.plist ?? {
+    readJson: async (plistPath: string, signal?: AbortSignal) =>
+      await readPlistJsonWithCommand(runCommand, plistPath, signal),
+  };
+  const tools = { simctl, runCommand };
+  return {
+    ...provider,
+    simctl,
+    runCommand,
+    ...(provider.macosHelper ? { macosHelper: { run: coerceRun(provider.macosHelper.run) } } : {}),
+    simulatorFiles: provider.simulatorFiles ?? {
+      copyToHost: async (request) =>
+        await (await import('./local-simulator-files.ts')).copySimulatorFileToHost(simctl, request),
+      openContainer: async (request) =>
+        await (await import('./local-simulator-files.ts')).openSimulatorContainer(simctl, request),
+      stageFile: async (path, signal) => {
+        signal?.throwIfAborted();
+        return { path, [Symbol.asyncDispose]: async () => {} };
+      },
+    },
+    simulatorApps: provider.simulatorApps ?? {
+      list: async (device, options) =>
+        await (
+          await import('./local-simulator-apps.ts')
+        ).readSimulatorAppMetadata(tools, device, options),
+      readInfoPlist: async (request) =>
+        await (await import('./local-simulator-apps.ts')).readSimulatorAppInfoPlist(tools, request),
+    },
+    devicectl: {
+      run: provider.devicectl
+        ? coerceRun(provider.devicectl.run)
+        : async (args, options) => await runCommand('xcrun', ['devicectl', ...args], options),
+    },
+    plist,
+    macosHost:
+      provider.macosHost ??
+      createLocalAppleMacOsHostProvider(
+        runCommand,
+        async (plistPath) => await plist.readJson(plistPath),
+      ),
+    whichCommand:
+      provider.whichCommand ?? (async (cmd) => await whichCmd(cmd, commandHostEnvironment().env)),
+  };
+}
+
+export function resolveAppleToolProvider(provider?: AppleToolProvider): AppleToolProvider {
+  return appleToolProviderScope.resolve(provider);
+}
+
+export async function withAppleToolProvider<T>(
+  provider: AppleToolProvider | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return await appleToolProviderScope.run(provider, fn);
+}
+
+export function hasScopedAppleToolProvider(): boolean {
+  return appleToolProviderScope.hasScope();
+}
+
+export async function runAppleToolCommand(
+  cmd: string,
+  args: string[],
+  options?: ExecOptions,
+): Promise<ExecResult> {
+  return await resolveAppleToolProvider().runCommand(cmd, args, options);
+}
+
+/** An xcrun argv for a tool other than simctl; a simctl argv is a ScopedSimctlCommand. */
+type XcrunToolArgs = readonly ['devicectl' | 'xcdevice' | 'xctrace', ...string[]];
+
+export async function runXcrun(
+  args: ScopedSimctlCommand | XcrunToolArgs,
+  options?: AppleToolExecOptions,
+): Promise<ExecResult> {
+  const provider = resolveAppleToolProvider();
+  if (args[0] === 'simctl') {
+    return await provider.simctl.run(simctlCommandArgs(args), options);
+  }
+  const [tool, ...toolArgs] = args;
+  if (tool === 'devicectl') {
+    return await provider.devicectl.run(toolArgs, options);
+  }
+  return await runAppleToolCommand('xcrun', [...args], options);
+}
+
+export async function readApplePlistJson(
+  plistPath: string,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown> | null> {
+  return (await resolveAppleToolProvider().plist?.readJson(plistPath, signal)) ?? null;
+}
+
+// Scoped providers are SDK-supplied callbacks; coerce their results once at
+// the boundary (see coerceExecResult) so platform code can trust the types.
+function coerceRunCommand(run: AppleToolCommandExecutor): AppleToolCommandExecutor {
+  return async (cmd, args, options) => coerceExecResult(await run(cmd, args, options));
+}
+
+function coerceRun<Args>(
+  run: (args: Args, options?: ExecOptions) => Promise<ExecResult>,
+): (args: Args, options?: ExecOptions) => Promise<ExecResult> {
+  return async (args, options) => coerceExecResult(await run(args, options));
+}
+
+async function readPlistJsonWithCommand(
+  runCommand: AppleToolCommandExecutor,
+  plistPath: string,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const result = await runCommand('plutil', ['-convert', 'json', '-o', '-', plistPath], {
+      allowFailure: true,
+      timeoutMs: APPLE_PLIST_TIMEOUT_MS,
+      signal,
+    });
+    if (result.exitCode !== 0 || !result.stdout.trim()) {
+      return null;
+    }
+    return JSON.parse(result.stdout) as Record<string, unknown>;
+  } catch {
+    signal?.throwIfAborted();
+    return null;
+  }
+}

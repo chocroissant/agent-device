@@ -1,0 +1,124 @@
+import {
+  publicPlatformString,
+  type DeviceInfo,
+  type PublicPlatform,
+} from '@agent-device/kernel/device';
+import { AppError } from '@agent-device/kernel/errors';
+import type { JsonObject } from '@agent-device/contracts/client';
+
+type AppEventDevice = Pick<DeviceInfo, 'platform' | 'appleOs'>;
+
+const GLOBAL_APP_EVENT_URL_TEMPLATE_VARIABLE = 'AGENT_DEVICE_APP_EVENT_URL_TEMPLATE';
+const PLATFORM_APP_EVENT_URL_TEMPLATE_VARIABLES: Partial<Record<PublicPlatform, string>> = {
+  ios: 'AGENT_DEVICE_IOS_APP_EVENT_URL_TEMPLATE',
+  macos: 'AGENT_DEVICE_MACOS_APP_EVENT_URL_TEMPLATE',
+  android: 'AGENT_DEVICE_ANDROID_APP_EVENT_URL_TEMPLATE',
+};
+
+const APP_EVENT_NAME_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
+const MAX_APP_EVENT_PAYLOAD_BYTES = 8 * 1024;
+const MAX_APP_EVENT_URL_LENGTH = 4 * 1024;
+
+type AppEventPayload = JsonObject | undefined;
+
+export function parseTriggerAppEventArgs(positionals: string[]): {
+  eventName: string;
+  payload: AppEventPayload;
+} {
+  const eventName = positionals[0]?.trim();
+  const payloadArg = positionals[1]?.trim();
+  if (!eventName) {
+    throw new AppError('INVALID_ARGS', 'trigger-app-event requires <event> [payloadJson]');
+  }
+  if (!APP_EVENT_NAME_PATTERN.test(eventName)) {
+    throw new AppError('INVALID_ARGS', `Invalid trigger-app-event event name: ${eventName}`, {
+      hint: 'Use 1-64 chars: letters, numbers, underscore, dot, colon, or dash.',
+    });
+  }
+  if (positionals.length > 2) {
+    throw new AppError(
+      'INVALID_ARGS',
+      'trigger-app-event accepts at most two arguments: <event> [payloadJson]',
+    );
+  }
+  const payload = parseTriggerEventPayload(payloadArg, eventName);
+  return { eventName, payload };
+}
+
+export function resolveAppEventUrl(
+  device: AppEventDevice,
+  eventName: string,
+  payload: AppEventPayload | undefined,
+  env: NodeJS.ProcessEnv,
+): string {
+  const platform = publicPlatformString(device);
+  const variables = appEventUrlTemplateVariables(platform);
+  const template = readAppEventUrlTemplate(variables, env);
+  if (!template) {
+    throw new AppError(
+      'UNSUPPORTED_OPERATION',
+      `No app event URL template configured for ${platform}.`,
+      {
+        hint: `Set ${variables.join(' or ')}, for example "myapp://agent-device/event?name={event}&payload={payload}".`,
+      },
+    );
+  }
+
+  const payloadText = payload ? JSON.stringify(payload) : '';
+  const eventUrl = template
+    .replaceAll('{event}', encodeURIComponent(eventName))
+    .replaceAll('{payload}', encodeURIComponent(payloadText))
+    .replaceAll('{platform}', encodeURIComponent(platform));
+  if (eventUrl.length > MAX_APP_EVENT_URL_LENGTH) {
+    throw new AppError('INVALID_ARGS', 'trigger-app-event URL exceeds maximum supported length', {
+      hint: 'Reduce payload size or shorten AGENT_DEVICE_*_APP_EVENT_URL_TEMPLATE.',
+      length: eventUrl.length,
+      maxLength: MAX_APP_EVENT_URL_LENGTH,
+    });
+  }
+  return eventUrl;
+}
+
+function parseTriggerEventPayload(
+  payloadArg: string | undefined,
+  eventName: string,
+): AppEventPayload {
+  if (!payloadArg) return undefined;
+  try {
+    const parsed = JSON.parse(payloadArg) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new AppError(
+        'INVALID_ARGS',
+        `trigger-app-event payload for "${eventName}" must be a JSON object`,
+      );
+    }
+    const payloadText = JSON.stringify(parsed);
+    if (Buffer.byteLength(payloadText, 'utf8') > MAX_APP_EVENT_PAYLOAD_BYTES) {
+      throw new AppError(
+        'INVALID_ARGS',
+        `trigger-app-event payload for "${eventName}" exceeds ${MAX_APP_EVENT_PAYLOAD_BYTES} bytes`,
+      );
+    }
+    return parsed as JsonObject;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError('INVALID_ARGS', `Invalid trigger-app-event payload JSON: ${payloadArg}`);
+  }
+}
+
+/** The read order of template variables for one platform: its own variable first, if any. */
+function appEventUrlTemplateVariables(platform: PublicPlatform): readonly string[] {
+  const platformSpecific = PLATFORM_APP_EVENT_URL_TEMPLATE_VARIABLES[platform];
+  return platformSpecific
+    ? [platformSpecific, GLOBAL_APP_EVENT_URL_TEMPLATE_VARIABLE]
+    : [GLOBAL_APP_EVENT_URL_TEMPLATE_VARIABLE];
+}
+
+function readAppEventUrlTemplate(
+  variables: readonly string[],
+  env: NodeJS.ProcessEnv,
+): string | undefined {
+  const candidate = variables.map((name) => env[name]).find((value) => value !== undefined);
+  const trimmed = candidate?.trim();
+  return trimmed ? trimmed : undefined;
+}

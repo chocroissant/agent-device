@@ -1,0 +1,246 @@
+import { AppError, type AppErrorCode, type AppErrorDetails } from '@agent-device/kernel/errors';
+import { resolveProxyForUrl } from '@agent-device/provision-kit/install-source-network-transport';
+import net from 'node:net';
+import { Agent, Dispatcher, ProxyAgent, fetch as undiciFetch } from 'undici';
+import { approveDownloadSourceUrl } from '@agent-device/provision-kit/install-source-network';
+
+export const MAX_RUN_SCRIPT_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const RUN_SCRIPT_HTTP_TIMEOUT_MS = 30_000;
+
+export type RunScriptHttpRequest = {
+  method: 'GET' | 'POST';
+  url: string;
+  headers: Record<string, string>;
+  body?: string;
+  publicNetworkOnly: boolean;
+};
+
+export type RunScriptHttpResponse = {
+  status: number;
+  body: string;
+  headers: Record<string, string>;
+};
+
+/** The typed error a runScript child process reports on stdout. */
+export type RunScriptChildError = {
+  code: AppErrorCode;
+  message: string;
+  details?: AppErrorDetails;
+};
+
+/** What the HTTP child writes to stdout: the response, or the typed error that ended the request. */
+export type RunScriptHttpChildOutput =
+  | { response: RunScriptHttpResponse }
+  | { error: RunScriptChildError };
+
+/**
+ * The HTTP child's whole job: run the request read from `input` and report the response or the
+ * typed error that ended it. Any other failure rejects, and the child reports it on stderr.
+ */
+export async function runScriptHttpChildOutput(
+  input: string,
+  environment: NodeJS.ProcessEnv,
+): Promise<RunScriptHttpChildOutput> {
+  try {
+    const request = JSON.parse(input) as RunScriptHttpRequest;
+    return { response: await executeRunScriptHttpRequest(request, environment) };
+  } catch (error) {
+    if (!(error instanceof AppError)) throw error;
+    return { error: { code: error.code, message: error.message, details: error.details } };
+  }
+}
+
+export async function executeRunScriptHttpRequest(
+  input: RunScriptHttpRequest,
+  environment: NodeJS.ProcessEnv,
+): Promise<RunScriptHttpResponse> {
+  if (!input.publicNetworkOnly) return await executeLocalRequest(input);
+  return await executePublicRequest(input, environment);
+}
+
+async function executeLocalRequest(input: RunScriptHttpRequest): Promise<RunScriptHttpResponse> {
+  if (typeof fetch !== 'function') {
+    throw new Error('global fetch is required for Maestro runScript http helpers');
+  }
+  const response = await fetch(input.url, {
+    ...fetchInit(input),
+    signal: AbortSignal.timeout(RUN_SCRIPT_HTTP_TIMEOUT_MS),
+  });
+  return await serializeResponse(response, MAX_RUN_SCRIPT_HTTP_RESPONSE_BYTES);
+}
+
+async function executePublicRequest(
+  input: RunScriptHttpRequest,
+  environment: NodeJS.ProcessEnv,
+): Promise<RunScriptHttpResponse> {
+  const initialUrl = parsePublicUrl(input.url);
+  const signal = AbortSignal.timeout(RUN_SCRIPT_HTTP_TIMEOUT_MS);
+  const dispatcher = new PublicFetchDispatcher(
+    initialUrl.protocol === 'https:',
+    signal,
+    environment,
+  );
+  try {
+    const response = await undiciFetch(initialUrl, {
+      ...fetchInit(input),
+      dispatcher,
+      signal,
+    });
+    return await serializeResponse(
+      response as unknown as Response,
+      MAX_RUN_SCRIPT_HTTP_RESPONSE_BYTES,
+    );
+  } catch (error) {
+    if (error instanceof TypeError && error.cause instanceof AppError) throw error.cause;
+    throw error;
+  } finally {
+    await dispatcher.dispose();
+  }
+}
+
+function fetchInit(input: RunScriptHttpRequest) {
+  return {
+    method: input.method,
+    headers: input.headers,
+    ...(input.body !== undefined ? { body: input.body } : {}),
+  };
+}
+
+export class PublicFetchDispatcher extends Dispatcher {
+  readonly #dispatchers = new Set<Dispatcher>();
+  #httpsRequired: boolean;
+  readonly #signal: AbortSignal;
+  readonly #environment: NodeJS.ProcessEnv;
+
+  constructor(httpsRequired: boolean, signal: AbortSignal, environment: NodeJS.ProcessEnv) {
+    super();
+    this.#httpsRequired = httpsRequired;
+    this.#signal = signal;
+    this.#environment = environment;
+  }
+
+  override dispatch(
+    options: Dispatcher.DispatchOptions,
+    handler: Dispatcher.DispatchHandler,
+  ): boolean {
+    void this.dispatchApproved(options, handler).catch((error: unknown) => {
+      handler.onError?.(error instanceof Error ? error : new Error(String(error)));
+    });
+    return true;
+  }
+
+  async dispose(): Promise<void> {
+    await Promise.all([...this.#dispatchers].map(async (dispatcher) => await dispatcher.close()));
+  }
+
+  private async dispatchApproved(
+    options: Dispatcher.DispatchOptions,
+    handler: Dispatcher.DispatchHandler,
+  ): Promise<void> {
+    const url = dispatchUrl(options);
+    if (this.#httpsRequired && url.protocol !== 'https:') {
+      throw new AppError('COMMAND_FAILED', 'Maestro runScript HTTP redirect downgraded HTTPS');
+    }
+    if (url.protocol === 'https:') this.#httpsRequired = true;
+    const approved = await approveDownloadSourceUrl(url, this.#signal);
+    const proxyUrl = resolveProxyForUrl(url, this.#environment);
+    const dispatcher = proxyUrl
+      ? proxyDispatcher(proxyUrl, url)
+      : directDispatcher(approved.address, approved.family);
+    this.#dispatchers.add(dispatcher);
+    dispatcher.dispatch(
+      proxyUrl ? proxyDispatchOptions(options, url, approved.address, approved.family) : options,
+      handler,
+    );
+  }
+}
+
+function directDispatcher(address: string, family: 4 | 6): Agent {
+  return new Agent({
+    connect: {
+      lookup: (_hostname, options, callback) => {
+        if (options.all) {
+          callback(null, [{ address, family }]);
+          return;
+        }
+        callback(null, address, family);
+      },
+    },
+  });
+}
+
+function proxyDispatcher(proxyUrl: string, destination: URL): ProxyAgent {
+  const hostname = stripAddressBrackets(destination.hostname);
+  return new ProxyAgent({
+    uri: proxyUrl,
+    proxyTunnel: true,
+    requestTls:
+      destination.protocol === 'https:' && net.isIP(hostname) === 0
+        ? { servername: hostname }
+        : undefined,
+  });
+}
+
+function proxyDispatchOptions(
+  options: Dispatcher.DispatchOptions,
+  originalUrl: URL,
+  address: string,
+  family: 4 | 6,
+): Dispatcher.DispatchOptions {
+  const approved = new URL(originalUrl);
+  approved.hostname = family === 6 ? `[${stripAddressBrackets(address)}]` : address;
+  const headers = Array.isArray(options.headers)
+    ? [...options.headers, 'host', originalUrl.host]
+    : { ...options.headers, host: originalUrl.host };
+  return { ...options, origin: approved.origin, headers };
+}
+
+function stripAddressBrackets(value: string): string {
+  return value.startsWith('[') && value.endsWith(']') ? value.slice(1, -1) : value;
+}
+
+function dispatchUrl(options: Dispatcher.DispatchOptions): URL {
+  if (!options.origin) throw new AppError('INVALID_ARGS', 'Invalid Maestro runScript HTTP URL');
+  return new URL(options.path, options.origin);
+}
+
+function parsePublicUrl(value: string): URL {
+  try {
+    return new URL(value);
+  } catch {
+    throw new AppError('INVALID_ARGS', 'Invalid Maestro runScript HTTP URL');
+  }
+}
+
+async function serializeResponse(
+  response: Response,
+  maxBodyBytes: number,
+): Promise<RunScriptHttpResponse> {
+  return {
+    status: response.status,
+    body: await readResponseBody(response, maxBodyBytes),
+    headers: Object.fromEntries(response.headers.entries()),
+  };
+}
+
+async function readResponseBody(response: Response, maxBodyBytes: number): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  let bytesSeen = 0;
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytesSeen += value.byteLength;
+    if (bytesSeen > maxBodyBytes) {
+      await reader.cancel();
+      throw new AppError(
+        'COMMAND_FAILED',
+        `Maestro runScript HTTP response exceeded ${maxBodyBytes} bytes`,
+        { limitBytes: maxBodyBytes, status: response.status },
+      );
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks, bytesSeen).toString('utf8');
+}

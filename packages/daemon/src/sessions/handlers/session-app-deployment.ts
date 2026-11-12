@@ -1,0 +1,323 @@
+import { resolveCommandAndroidAvdSelection } from '../../core/daemon-command-registry.ts';
+import { bootStoppedLocalAndroidDevice } from '../../core/stopped-local-android-device.ts';
+import type { HostEnvironment } from '@agent-device/kernel/source-value';
+import type { DaemonResponse } from '@agent-device/kernel/contracts';
+import type { DaemonPlatformServices } from '../../core/platform-services.ts';
+import { expandSessionPath } from '@agent-device/host-kit/session-paths';
+import fs from 'node:fs';
+import type { AppDeploymentResult } from '@agent-device/contracts/app-deployment-runtime';
+import {
+  deployAppUse,
+  readySendPushNotificationUse,
+  uninstallAppUse,
+} from '@agent-device/contracts/app-deployment-runtime-plan';
+import { isIosFamily, publicPlatformString } from '@agent-device/kernel/device';
+import { parseInlineNotificationPayload, readNotificationPayload } from '../dispatch-payload.ts';
+import {
+  cleanupUploadedArtifact,
+  prepareUploadedArtifact,
+} from '../../resources/artifact-tracking.ts';
+import { expireRefFrame } from '../../core/ref-frame.ts';
+import type {
+  BindDeviceRuntime,
+  InspectDeviceRuntimeFacts,
+} from '../../core/request-runtime-binding.ts';
+import type { SessionStore } from '../../core/session-store.ts';
+import type { DaemonRequest } from '../../core/daemon-request.ts';
+import { requestCwd } from '../../core/context.ts';
+import type { SessionRef, SessionState } from '../../core/session-state.ts';
+import { resolveDeployResultTarget } from '@agent-device/contracts/deploy-result-target';
+import { withSuccessText } from '@agent-device/kernel/success-text';
+import { recordSessionAction } from '../../core/session-action-recorder.ts';
+import {
+  requireSessionOrExplicitSelector,
+  resolveCommandDevice,
+} from '../../resources/session-device-resolution.ts';
+import {
+  requireRuntimeBinding,
+  requireRuntimeFacts,
+  type RuntimeCommandHandlerParams,
+  unavailableRuntimeOperationResponse,
+} from '../../core/session-runtime-admission.ts';
+import { errorResponse } from '@agent-device/kernel/contracts';
+
+type DeployCommand = 'install' | 'reinstall';
+
+type DeployResult = Readonly<{
+  app: string;
+  appPath: string;
+  appName?: string;
+  appId?: string;
+  bundleId?: string;
+  package?: string;
+  packageName?: string;
+  launchTarget?: string;
+  platform: 'ios' | 'android' | 'harmonyos';
+}>;
+
+export async function handleAppDeploymentCommand(params: {
+  host: HostEnvironment;
+  req: DaemonRequest;
+  command: DeployCommand;
+  sessionName: string;
+  sessionStore: SessionStore;
+  inspectFacts?: InspectDeviceRuntimeFacts;
+  platformServices: DaemonPlatformServices;
+  bindDevice?: BindDeviceRuntime;
+}): Promise<DaemonResponse> {
+  const { req, command, sessionName, sessionStore } = params;
+  const ref = sessionStore.lookup(sessionName);
+  const session = ref?.session;
+  const flags = req.flags ?? {};
+  const guard = requireSessionOrExplicitSelector(command, session, flags);
+  if (guard) return guard;
+  const target = resolveDeployTarget(command, req.positionals ?? []);
+  if (!target.ok) return target.response;
+
+  const uploadedArtifactId = req.meta?.uploadedArtifactId;
+  // Acquire before the cleanup scope: a rejected foreign upload ID must not delete that upload.
+  const appPath = uploadedArtifactId
+    ? prepareUploadedArtifact(uploadedArtifactId, req.meta?.tenantId)
+    : expandSessionPath(target.appPathInput, requestCwd(req, params.host));
+  try {
+    if (!fs.existsSync(appPath)) {
+      return errorResponse('INVALID_ARGS', `App binary not found: ${appPath}`);
+    }
+
+    let device = await resolveCommandDevice({
+      session,
+      req,
+      env: sessionStore.host.env,
+      androidAvdSelection: resolveCommandAndroidAvdSelection(command),
+      platformServices: params.platformServices,
+    });
+    const facts = await requireRuntimeFacts(params.inspectFacts)(device);
+    const unsupported = unavailableRuntimeOperationResponse(command, facts.operations.deployApp);
+    if (unsupported) return unsupported;
+
+    const bindDevice = requireRuntimeBinding(params.bindDevice);
+    let runtime = await bindDevice(device, deployAppUse);
+    const booted = await bootStoppedLocalAndroidDevice({
+      device,
+      owner: runtime.owner,
+      bindDevice,
+      flags,
+      env: sessionStore.host.env,
+      deadlineAtMs: undefined,
+    });
+    if (booted) {
+      device = booted;
+      runtime = await bindDevice(device, deployAppUse);
+    }
+    // ADR 0014: deployment can replace the visible surface. Do this immediately before the
+    // bound operation so an admission failure never discards a still-valid reference frame.
+    if (ref) expireRefFrame(sessionStore.requireCurrent(ref));
+    const deployment = await runtime.operations.deployApp({
+      app: target.app,
+      appPath,
+      replaceExisting: command === 'reinstall',
+    });
+    const result = buildDeployResult(device, target.app, appPath, deployment);
+    const data = withSuccessText(
+      result,
+      `Installed: ${result.appName ?? resolveDeployResultTarget(result)}`,
+    );
+    updateHarmonyDeploymentSession(sessionStore, ref, result);
+    recordSessionAction(sessionStore, ref, req, command, data);
+    return { ok: true, data };
+  } finally {
+    if (uploadedArtifactId) cleanupUploadedArtifact(uploadedArtifactId);
+  }
+}
+
+export async function handlePushNotificationCommand(
+  params: RuntimeCommandHandlerParams,
+): Promise<DaemonResponse> {
+  const { req, sessionName, sessionStore } = params;
+  const ref = sessionStore.lookup(sessionName);
+  const session = ref?.session;
+  const flags = req.flags ?? {};
+  const guard = requireSessionOrExplicitSelector('push', session, flags);
+  if (guard) return guard;
+
+  const appId = req.positionals?.[0]?.trim();
+  const payloadArg = req.positionals?.[1]?.trim();
+  if (!appId || !payloadArg) {
+    return errorResponse(
+      'INVALID_ARGS',
+      'push requires <bundle|package> <payload.json|inline-json>',
+    );
+  }
+  const payload = req.internal?.publicNetworkOnly
+    ? parseInlineNotificationPayload(payloadArg)
+    : await readNotificationPayload(payloadArg, {
+        resolvePath: (value) => expandSessionPath(value, requestCwd(req, params.host)),
+      });
+  const device = await resolveCommandDevice({
+    session,
+    req,
+    env: sessionStore.host.env,
+    platformServices: params.platformServices,
+  });
+  const facts = await requireRuntimeFacts(params.inspectFacts)(device);
+  const unsupported =
+    unavailableRuntimeOperationResponse('push', facts.operations.ensureReady) ??
+    unavailableRuntimeOperationResponse('push', facts.operations.sendPushNotification);
+  if (unsupported) return unsupported;
+
+  const runtime = await requireRuntimeBinding(params.bindDevice)(
+    device,
+    readySendPushNotificationUse,
+  );
+  await runtime.operations.ensureReady({});
+  // ADR 0014: a notification dispatch may change the visible surface. Keep an admission failure
+  // non-destructive, but expire immediately before dispatch so an attempted provider operation
+  // that fails after crossing the side-effect seam cannot leave stale refs authorized.
+  if (ref) expireRefFrame(sessionStore.requireCurrent(ref));
+  const result = await runtime.operations.sendPushNotification({ appId, payload });
+  const data = isIosFamily(device)
+    ? withSuccessText({ platform: 'ios', bundleId: appId }, `Pushed notification to ${appId}`)
+    : withSuccessText(
+        {
+          platform: publicPlatformString(device),
+          package: appId,
+          action: result.action,
+          extrasCount: result.extrasCount,
+        },
+        `Pushed notification to ${appId}`,
+      );
+  recordSessionAction(sessionStore, ref, req, 'push', data, {
+    positionals: [appId, payloadArg],
+  });
+  return { ok: true, data };
+}
+
+export async function handleUninstallCommand(
+  params: RuntimeCommandHandlerParams,
+): Promise<DaemonResponse> {
+  const { req, sessionName, sessionStore } = params;
+  const ref = sessionStore.lookup(sessionName);
+  const session = ref?.session;
+  const flags = req.flags ?? {};
+  const guard = requireSessionOrExplicitSelector('uninstall', session, flags);
+  if (guard) return guard;
+
+  const app = req.positionals?.[0]?.trim();
+  if (!app) return errorResponse('INVALID_ARGS', 'uninstall requires <app>');
+  const device = await resolveCommandDevice({
+    session,
+    req,
+    env: sessionStore.host.env,
+    platformServices: params.platformServices,
+  });
+  const facts = await requireRuntimeFacts(params.inspectFacts)(device);
+  const unsupported = unavailableRuntimeOperationResponse(
+    'uninstall',
+    facts.operations.uninstallApp,
+  );
+  if (unsupported) return unsupported;
+
+  const runtime = await requireRuntimeBinding(params.bindDevice)(device, uninstallAppUse);
+  if (ref) expireRefFrame(sessionStore.requireCurrent(ref));
+  const result = await runtime.operations.uninstallApp({ app });
+  const platform = isIosFamily(device) ? 'ios' : 'android';
+  const appId = !result.wasInstalled
+    ? undefined
+    : 'bundleId' in result
+      ? result.bundleId
+      : result.packageName;
+  const data = appId
+    ? withSuccessText({ platform, app, wasInstalled: true, appId }, `Uninstalled: ${appId}`)
+    : withSuccessText({ platform, app, wasInstalled: false }, `Not installed: ${app}`);
+  recordSessionAction(sessionStore, ref, req, 'uninstall', data);
+  return { ok: true, data };
+}
+
+function buildDeployResult(
+  device: SessionState['device'],
+  app: string,
+  appPath: string,
+  deployment: AppDeploymentResult,
+): DeployResult {
+  // This response normalization remains daemon-owned; platform runtimes own the mechanics.
+  if (isIosFamily(device)) {
+    return buildIosDeployResult(app, appPath, deployment);
+  }
+  return buildNonIosDeployResult(device, app, appPath, deployment);
+}
+
+function buildIosDeployResult(
+  app: string,
+  appPath: string,
+  deployment: AppDeploymentResult,
+): DeployResult {
+  const bundleId = deployment.bundleId;
+  return {
+    app: app || bundleId || deployment.launchTarget || appPath,
+    appPath,
+    platform: 'ios',
+    ...(bundleId ? { appId: bundleId, bundleId } : {}),
+    appName: deployment.appName,
+    launchTarget: deployment.launchTarget,
+  };
+}
+
+function buildNonIosDeployResult(
+  device: SessionState['device'],
+  app: string,
+  appPath: string,
+  deployment: AppDeploymentResult,
+): DeployResult {
+  const packageName = deployment.packageName;
+  const platform = device.platform === 'harmonyos' ? 'harmonyos' : 'android';
+  return {
+    app: app || packageName || deployment.launchTarget || appPath,
+    appPath,
+    platform,
+    ...(packageName ? { appId: packageName, package: packageName, packageName } : {}),
+    appName: deployment.appName,
+    launchTarget: deployment.launchTarget,
+  };
+}
+
+function updateHarmonyDeploymentSession(
+  sessionStore: SessionStore,
+  ref: SessionRef | undefined,
+  result: DeployResult,
+): void {
+  if (!ref || result.platform !== 'harmonyos' || !result.appId) return;
+  sessionStore.update(ref, {
+    appBundleId: result.appId,
+    appName: result.appName ?? result.app,
+  });
+}
+
+function resolveDeployTarget(
+  command: DeployCommand,
+  positionals: string[],
+):
+  | Readonly<{ ok: true; app: string; appPathInput: string }>
+  | Readonly<{ ok: false; response: DaemonResponse }> {
+  const first = positionals[0]?.trim();
+  const second = positionals[1]?.trim();
+  if (command === 'install') {
+    const appPathInput = second ?? first;
+    if (!appPathInput) {
+      return {
+        ok: false,
+        response: errorResponse('INVALID_ARGS', 'install requires: install <path-to-app-binary>'),
+      };
+    }
+    return { ok: true, app: second ? (first ?? '') : '', appPathInput };
+  }
+  if (!first || !second) {
+    return {
+      ok: false,
+      response: errorResponse(
+        'INVALID_ARGS',
+        'reinstall requires: reinstall <app> <path-to-app-binary>',
+      ),
+    };
+  }
+  return { ok: true, app: first, appPathInput: second };
+}

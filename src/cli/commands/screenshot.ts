@@ -1,0 +1,162 @@
+import { localCommandPolicy } from '@agent-device/contracts/command-policy';
+import { formatScreenshotDiffText, formatSnapshotDiffText } from '@agent-device/command-output';
+import type { ScreenshotDiffResult } from '@agent-device/capture-kit/screenshot-diff';
+import { AppError } from '@agent-device/kernel/errors';
+import { isNonDefaultResponseLevel } from '@agent-device/kernel/contracts';
+import { resolveUserPath } from '@agent-device/host-kit/file';
+import type { AgentDeviceBackend } from '@agent-device/contracts/backend';
+import type { AgentDeviceClient } from '@agent-device/command-surface';
+import type { CaptureScreenshotResult } from '@agent-device/contracts/client';
+import { runCliCommand } from '../../commands/cli-runner.ts';
+import { pickScreenshotResultData } from '@agent-device/client';
+import type { CliFlags } from '@agent-device/contracts/command';
+import { writeCommandOutput } from './shared.ts';
+import type { ClientCommandHandler } from './router-types.ts';
+
+export const screenshotCommand: ClientCommandHandler = async ({
+  positionals,
+  flags,
+  client,
+  host,
+}) => {
+  const result = (await runCliCommand({
+    client,
+    command: 'screenshot',
+    positionals,
+    flags,
+    env: host.env,
+  })) as CaptureScreenshotResult;
+  // A non-default responseLevel returns a leveled (digest) payload — overlayCount,
+  // artifacts, leveled overlayRefs. Rebuilding the default { path, overlayRefs }
+  // shape would drop those, so emit the leveled payload verbatim.
+  if (isNonDefaultResponseLevel(flags.responseLevel)) {
+    await writeCommandOutput(flags, result, () => JSON.stringify(result, null, 2));
+    return true;
+  }
+  const data = pickScreenshotResultData(result);
+  await writeCommandOutput(flags, data, () => {
+    const summary = result.overlayRefs
+      ? `Annotated ${result.overlayRefs.length} refs onto ${result.path}`
+      : formatScreenshotSummary(result);
+    const warnings = result.warnings ?? [];
+    return warnings.length > 0 ? [summary, ...warnings].join('\n') : summary;
+  });
+  return true;
+};
+
+export const diffCommand: ClientCommandHandler = async ({ positionals, flags, client, host }) => {
+  if (positionals[0] === 'snapshot') {
+    const result = await runCliCommand({
+      client,
+      command: 'diff',
+      positionals,
+      flags,
+      env: host.env,
+    });
+    await writeCommandOutput(flags, result, () =>
+      formatSnapshotDiffText(result, host.env, process.stdout),
+    );
+    return true;
+  }
+
+  if (positionals[0] !== 'screenshot') return false;
+
+  const baselineRaw = flags.baseline;
+  if (!baselineRaw || typeof baselineRaw !== 'string') {
+    throw new AppError('INVALID_ARGS', 'diff screenshot requires --baseline <path>');
+  }
+
+  const baselinePath = resolveUserPath(baselineRaw, { cwd: host.cwd });
+  const outputPath =
+    typeof flags.out === 'string' ? resolveUserPath(flags.out, { cwd: host.cwd }) : undefined;
+  const currentRaw = positionals[1];
+  if (positionals.length > 2) {
+    throw new AppError(
+      'INVALID_ARGS',
+      'diff screenshot accepts at most one current screenshot path',
+    );
+  }
+
+  // Load the capture, selector and interaction entry for `diff screenshot`.
+  const [{ createCommandSurfaceAgentDevice }, { createLocalArtifactAdapter }] = await Promise.all([
+    import('@agent-device/command-runtime'),
+    import('@agent-device/host-kit/local-artifact-adapter'),
+  ]);
+  const runtime = createCommandSurfaceAgentDevice({
+    backend: createClientScreenshotBackend(client, flags),
+    artifacts: createLocalArtifactAdapter({ cwd: host.cwd }),
+    sessions: {
+      get: (name) => ({ name }),
+      set: () => {},
+    },
+    policy: localCommandPolicy(),
+  });
+
+  const result = await runtime.capture.diffScreenshot({
+    session: flags.session,
+    baseline: { kind: 'path', path: baselinePath },
+    current: currentRaw
+      ? { kind: 'path', path: resolveUserPath(currentRaw, { cwd: host.cwd }) }
+      : { kind: 'live' },
+    ...(outputPath ? { out: { kind: 'path', path: outputPath } } : {}),
+    threshold: parseCliThreshold(flags.threshold),
+    overlayRefs: flags.overlayRefs,
+    normalizeStatusBar: flags.screenshotNormalizeStatusBar,
+    screenMask: flags.screenshotScreenMask,
+    surface: flags.surface,
+  });
+
+  await writeCommandOutput(flags, result, () =>
+    formatScreenshotDiffText(result as ScreenshotDiffResult, host, process.stdout),
+  );
+  return true;
+};
+
+function createClientScreenshotBackend(
+  client: AgentDeviceClient,
+  flags: CliFlags,
+): AgentDeviceBackend {
+  return {
+    platform: resolveClientBackendPlatform(flags),
+    captureScreenshot: async (context, outPath, options) => {
+      const result = await client.capture.screenshot({
+        path: outPath,
+        session: context.session,
+        overlayRefs: options?.overlayRefs,
+        pixelDensity: options?.pixelDensity,
+        fullscreen: options?.fullscreen,
+        normalizeStatusBar: options?.normalizeStatusBar,
+        screenMask: options?.screenMask,
+        stabilize: options?.stabilize,
+        surface: options?.surface,
+      });
+      return pickScreenshotResultData(result);
+    },
+  };
+}
+
+function formatScreenshotSummary(result: CaptureScreenshotResult): string {
+  if (typeof result.width !== 'number' || typeof result.height !== 'number') {
+    return result.path;
+  }
+  const densitySuffix = typeof result.pixelDensity === 'number' ? ` @${result.pixelDensity}x` : '';
+  return `${result.path} (${result.width}x${result.height}${densitySuffix})`;
+}
+
+function resolveClientBackendPlatform(flags: CliFlags): AgentDeviceBackend['platform'] {
+  switch (flags.platform) {
+    case 'android':
+    case 'linux':
+    case 'macos':
+      return flags.platform;
+    case 'ios':
+    case 'apple':
+    default:
+      return 'ios';
+  }
+}
+
+function parseCliThreshold(threshold: string | undefined): number | undefined {
+  if (threshold == null || threshold === '') return undefined;
+  return Number(threshold);
+}

@@ -1,0 +1,109 @@
+import assert from 'node:assert/strict';
+import { test } from 'vitest';
+import {
+  isAppleProductType,
+  isSupportedAppleDevicectlDevice,
+  mapDevicectlAppleDevice,
+  resolveAppleOs,
+  resolveAppleTargetFromDevicectlDevice,
+} from './inventory-classification.ts';
+
+test('devicectl classification recognizes Apple families without relying on a device name', () => {
+  assert.equal(isAppleProductType('iPhone16,2'), true);
+  assert.equal(isAppleProductType('AppleTV11,1'), true);
+  assert.equal(isAppleProductType('RealityDevice14,1'), true);
+  assert.equal(isAppleProductType('Pixel 9'), false);
+  assert.equal(
+    isSupportedAppleDevicectlDevice({
+      hardwareProperties: { productType: 'AppleTV11,1' },
+      deviceProperties: { name: 'Living Room' },
+    }),
+    true,
+  );
+});
+
+test('devicectl classification resolves tvOS, iPadOS, and visionOS vocabulary', () => {
+  assert.equal(
+    resolveAppleTargetFromDevicectlDevice({
+      hardwareProperties: { platform: 'tvOS' },
+    }),
+    'tv',
+  );
+  assert.equal(resolveAppleOs('mobile', ['iPad16,3']), 'ipados');
+  assert.equal(resolveAppleOs('mobile', ['visionOS 2.0']), 'visionos');
+});
+
+test('devicectl records map to normalized physical Apple devices', () => {
+  assert.deepEqual(
+    mapDevicectlAppleDevice({
+      name: 'Living Room',
+      hardwareProperties: {
+        platform: 'tvOS',
+        productType: 'AppleTV11,1',
+        udid: 'tv-1',
+      },
+    }),
+    {
+      platform: 'apple',
+      id: 'tv-1',
+      name: 'Living Room',
+      kind: 'device',
+      target: 'tv',
+      appleOs: 'tvos',
+      iosPhysicalDeviceBackend: 'coredevice',
+      booted: true,
+    },
+  );
+  assert.equal(
+    mapDevicectlAppleDevice({
+      identifier: 'android-1',
+      hardwareProperties: { platform: 'Android' },
+    }),
+    null,
+  );
+});
+
+test('devicectl records report a paired device CoreDevice cannot reach as not booted', () => {
+  const record = (tunnelState?: string) => ({
+    hardwareProperties: { platform: 'iOS', productType: 'iPhone18,1', udid: 'phone-1' },
+    ...(tunnelState === undefined ? {} : { connectionProperties: { tunnelState } }),
+  });
+  assert.equal(mapDevicectlAppleDevice(record('unavailable'))?.booted, false);
+  assert.equal(mapDevicectlAppleDevice(record('Unavailable'))?.booted, false);
+  // CoreDevice opens a tunnel on demand, so an idle device it can reach is still usable.
+  assert.equal(mapDevicectlAppleDevice(record('disconnected'))?.booted, true);
+  assert.equal(mapDevicectlAppleDevice(record('connected'))?.booted, true);
+  assert.equal(mapDevicectlAppleDevice(record())?.booted, true);
+  // devicectl JSON is not validated at runtime, so a malformed state must not break the listing.
+  assert.equal(
+    mapDevicectlAppleDevice({
+      hardwareProperties: { platform: 'iOS', productType: 'iPhone18,1', udid: 'phone-1' },
+      connectionProperties: { tunnelState: 3 as unknown as string },
+    })?.booted,
+    true,
+  );
+});
+
+test('devicectl records report the marketing model and OS version', () => {
+  const devicectlRecord = {
+    identifier: '3F1DAD0D-212F-44F2-B41E-C390F96140BE',
+    hardwareProperties: {
+      deviceType: 'iPhone',
+      marketingName: 'iPhone 17 Pro',
+      platform: 'iOS',
+      productType: 'iPhone18,1',
+      udid: '00008150-000A1C2E3F40001E',
+    },
+    deviceProperties: {
+      bootState: 'booted',
+      name: 'Oskar iPhone',
+      osBuildUpdate: '23F77',
+      osVersionNumber: '26.5',
+    },
+    connectionProperties: { pairingState: 'paired', tunnelState: 'connected' },
+  };
+  const device = mapDevicectlAppleDevice(devicectlRecord);
+  assert.equal(device?.name, 'Oskar iPhone');
+  assert.equal(device?.model, 'iPhone 17 Pro');
+  assert.equal(device?.osVersion, '26.5');
+});

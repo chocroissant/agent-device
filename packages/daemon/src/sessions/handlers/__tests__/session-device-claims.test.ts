@@ -1,0 +1,848 @@
+import { daemonPlatformServicesFixture } from '../../../__tests__/support/platform-services-fixture.ts';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { afterEach, test, vi } from 'vitest';
+import * as hostProcess from '@agent-device/host-kit/process';
+import {
+  MACOS_DEVICE,
+  bindTestCommandHost,
+  createLiveTestHostEnvironment,
+  createTestHostEnvironment,
+  mkdtempForTestSync,
+  pinOwnProcessStartTime,
+} from '@agent-device/test-kit';
+import { fakeCreateCommandSurface } from '../../../__tests__/support/command-surface-fake.ts';
+
+vi.mock('@agent-device/device-selection/dispatch-resolve', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@agent-device/device-selection/dispatch-resolve')>();
+  const { selectionFromResolveTargetDevice } =
+    await import('../../../__tests__/support/device-selection-stub.ts');
+  const resolveTargetDevice = vi.fn();
+  return {
+    ...actual,
+    resolveTargetDevice,
+    resolveTargetDeviceSelection: vi.fn(selectionFromResolveTargetDevice(resolveTargetDevice)),
+  };
+});
+vi.mock('../../../core/device/device-ready.ts', () => ({
+  ensureDeviceReady: vi.fn(async () => {}),
+}));
+vi.mock('@agent-device/platform-android/mechanics', () => ({
+  activateAndroidTestIme: vi.fn(async () => ({ activated: false })),
+  restoreAndroidTestIme: vi.fn(async () => ({ restored: false, reason: 'no-record' })),
+  stopAndroidSnapshotHelperSessionForDevice: vi.fn(async () => {}),
+  resolveAndroidPackageForOpen: vi.fn(),
+  inferAndroidPackageAfterOpen: vi.fn(
+    async (_device, _target, currentAppBundleId) => currentAppBundleId,
+  ),
+}));
+pinOwnProcessStartTime(hostProcess);
+
+import { resolveTargetDevice } from '@agent-device/device-selection/dispatch-resolve';
+import { ensureDeviceReady } from '../../../core/device/device-ready.ts';
+import {
+  activateAndroidTestIme,
+  resolveAndroidPackageForOpen,
+} from '@agent-device/platform-android/mechanics';
+import {
+  applyRuntimeHintsFixture,
+  dispatchApplicationLifecycleEffect,
+  prepareApplicationOpenFixture,
+  resolveOpenTargetFixture,
+} from '../../../__tests__/support/application-lifecycle-runtime-fixture.ts';
+import { clearRequestCanceled, markRequestCanceled } from '@agent-device/host-kit/request';
+import {
+  acquireDeviceClaim as acquireProductionDeviceClaim,
+  inspectDeviceClaims,
+} from '@agent-device/daemon-contracts/device-claims';
+import { LeaseRegistry } from '../../../resources/lease-registry.ts';
+import { SessionStore } from '../../../core/session-store.ts';
+import { handleSessionCloseCommands as handleProductionCloseCommand } from '../../session-lifecycle/internal/session-close.ts';
+import { handleSessionOpenCommands as handleProductionOpenCommand } from '../../session-lifecycle/internal/session-open.ts';
+import { hostAppDevice, type DeviceInfo } from '@agent-device/kernel/device';
+import { makeAuthoringSession } from '../../../__tests__/support/session-factories.ts';
+import { AppError } from '@agent-device/kernel/errors';
+import { resolveMacOsAppDeviceOpenTarget } from '@agent-device/platform-apple/app-resolution';
+import {
+  createLocalAppleToolProvider,
+  withAppleToolProvider,
+} from '@agent-device/platform-apple/tool-provider';
+import {
+  bindProviderLifecycleRuntime,
+  bindLifecycleRuntime,
+  inspectProviderLifecycleRuntimeFacts,
+  inspectLifecycleRuntimeFacts,
+} from '../../../__tests__/support/application-lifecycle-runtime-harness.ts';
+import { platformResourceCleanupFixture } from '../../../__tests__/support/platform-resource-cleanup-fixture.ts';
+import { localRuntimeOwner, narrowDeviceBinding } from '@agent-device/contracts/platform-runtime';
+import type { BindDeviceRuntime } from '../../../core/request-runtime-binding.ts';
+import {
+  BOOT_TIMEOUT_REASON,
+  type EnsureReadyInput,
+} from '@agent-device/contracts/device-readiness-runtime';
+
+bindTestCommandHost();
+
+const mockDispatch = vi.mocked(dispatchApplicationLifecycleEffect);
+const mockPrepareApplicationOpen = vi.mocked(prepareApplicationOpenFixture);
+const mockResolveTargetDevice = vi.mocked(resolveTargetDevice);
+const mockEnsureDeviceReady = vi.mocked(ensureDeviceReady);
+const mockApplyRuntimeHints = vi.mocked(applyRuntimeHintsFixture);
+const mockResolveAndroidPackage = vi.mocked(resolveAndroidPackageForOpen);
+const reconcileOrphanedDeviceClaim = async () => ({
+  status: 'retained' as const,
+  reason: 'test-no-recovery',
+});
+
+function handleOpenCommand(
+  params: Omit<Parameters<typeof handleProductionOpenCommand>[0], 'reconcileOrphanedDeviceClaim'>,
+) {
+  return handleProductionOpenCommand({
+    ...params,
+    inspectFacts: params.inspectFacts ?? inspectLifecycleRuntimeFacts,
+    bindDevice: params.bindDevice ?? bindLifecycleRuntime,
+    reconcileOrphanedDeviceClaim,
+  });
+}
+
+function handleCloseCommand(
+  params: Omit<Parameters<typeof handleProductionCloseCommand>[0], 'inspectFacts' | 'bindDevice'>,
+) {
+  return handleProductionCloseCommand({
+    ...params,
+    platformResourceCleanup: platformResourceCleanupFixture(),
+    inspectFacts: inspectLifecycleRuntimeFacts,
+    bindDevice: bindLifecycleRuntime,
+  });
+}
+
+function acquireDeviceClaim(
+  params: Omit<Parameters<typeof acquireProductionDeviceClaim>[0], 'reconcileOrphanedDeviceClaim'>,
+) {
+  return acquireProductionDeviceClaim({ ...params, reconcileOrphanedDeviceClaim });
+}
+
+afterEach(() => {
+  vi.clearAllMocks();
+  mockEnsureDeviceReady.mockResolvedValue(undefined);
+  mockApplyRuntimeHints.mockResolvedValue(undefined);
+  mockResolveAndroidPackage.mockResolvedValue(undefined);
+  delete process.env.AGENT_DEVICE_CLAIMS_DIR;
+});
+
+function setup(): { store: SessionStore; stateDir: string } {
+  const stateDir = mkdtempForTestSync('agent-device-session-device-claim-');
+  const claimsDir = path.join(stateDir, 'claims');
+  process.env.AGENT_DEVICE_CLAIMS_DIR = claimsDir;
+  return {
+    store: new SessionStore(path.join(stateDir, 'sessions'), createLiveTestHostEnvironment()),
+    stateDir,
+  };
+}
+
+const android: DeviceInfo = {
+  platform: 'android',
+  id: 'emulator-5554',
+  name: 'Pixel',
+  kind: 'emulator',
+  booted: true,
+};
+
+/** The lifecycle harness plus a local readiness operation that boots a stopped AVD. */
+function bindBootingLifecycleRuntime(
+  ensureReady: (input: EnsureReadyInput) => Promise<DeviceInfo>,
+): BindDeviceRuntime {
+  return async (device, use) => {
+    if (!(use.required as readonly string[]).includes('ensureReady')) {
+      return await bindLifecycleRuntime(device, use);
+    }
+    const facts = await inspectLifecycleRuntimeFacts(device);
+    return narrowDeviceBinding(
+      {
+        device,
+        owner: localRuntimeOwner(device.platform),
+        facts: { ...facts, operations: { ...facts.operations, ensureReady: { available: true } } },
+        operations: { ensureReady },
+        [Symbol.asyncDispose]: async () => {},
+      },
+      use,
+    );
+  };
+}
+
+test('failed local open of a stopped AVD rolls back the claim on its booted serial', async () => {
+  const { store, stateDir } = setup();
+  const stoppedAvd = { ...android, id: 'pixel-avd', booted: false };
+  mockResolveTargetDevice.mockResolvedValue(stoppedAvd);
+  // The point of this test is claim-rollback behavior around an opaque pre-device-effect
+  // failure, not any particular error shape, so assert identity of the propagated error.
+  // Readiness is package-owned, so the failure is injected at the lifecycle port's prepare
+  // step; which devices the real owners run discovery for is pinned in the composition lane.
+  const rejectionError = new Error('device not ready');
+  let claimsBeforeFailure: ReturnType<typeof inspectDeviceClaims> = [];
+  mockPrepareApplicationOpen.mockImplementationOnce(async () => {
+    claimsBeforeFailure = inspectDeviceClaims({ serial: android.id }, process.env);
+    throw rejectionError;
+  });
+
+  await assert.rejects(
+    async () =>
+      handleOpenCommand({
+        host: createTestHostEnvironment(),
+        createCommandSurface: fakeCreateCommandSurface,
+        platformServices: daemonPlatformServicesFixture(),
+        req: {
+          command: 'open',
+          token: 'test',
+          session: 'claim-rollback',
+          positionals: ['Demo'],
+          flags: { platform: 'android', device: stoppedAvd.name },
+        },
+        sessionName: 'claim-rollback',
+        logPath: path.join(stateDir, 'daemon.log'),
+        sessionStore: store,
+        bindDevice: bindBootingLifecycleRuntime(async () => android),
+      }),
+    (error: unknown) => error === rejectionError,
+  );
+  assert.equal(claimsBeforeFailure.length, 1);
+  assert.deepEqual(inspectDeviceClaims({ serial: android.id }, process.env), []);
+  assert.deepEqual(inspectDeviceClaims({ serial: stoppedAvd.id }, process.env), []);
+});
+
+test('open of a stopped AVD under an allowlist that excludes its booted serial claims nothing', async () => {
+  const { store, stateDir } = setup();
+  const stoppedAvd = { ...android, id: 'pixel-avd', booted: false };
+  mockResolveTargetDevice.mockResolvedValue(stoppedAvd);
+  // Android readiness discovers only allowlisted emulators, so a boot that comes up on another
+  // serial waits out its deadline instead of returning it.
+  const readinessInputs: EnsureReadyInput[] = [];
+  const ensureReady = async (input: EnsureReadyInput): Promise<DeviceInfo> => {
+    readinessInputs.push(input);
+    if (input.androidSerialAllowlist && !input.androidSerialAllowlist.includes(android.id)) {
+      throw new AppError('COMMAND_FAILED', 'Android emulator did not appear in time', {
+        reason: BOOT_TIMEOUT_REASON,
+      });
+    }
+    return android;
+  };
+
+  await assert.rejects(
+    async () =>
+      handleOpenCommand({
+        host: createTestHostEnvironment(),
+        createCommandSurface: fakeCreateCommandSurface,
+        platformServices: daemonPlatformServicesFixture(),
+        req: {
+          command: 'open',
+          token: 'test',
+          session: 'claim-allowlist',
+          positionals: ['Demo'],
+          flags: {
+            platform: 'android',
+            device: stoppedAvd.name,
+            androidDeviceAllowlist: 'emulator-5556',
+          },
+        },
+        sessionName: 'claim-allowlist',
+        logPath: path.join(stateDir, 'daemon.log'),
+        sessionStore: store,
+        bindDevice: bindBootingLifecycleRuntime(ensureReady),
+      }),
+    (error: unknown) => error instanceof AppError && error.details?.reason === BOOT_TIMEOUT_REASON,
+  );
+  assert.deepEqual(
+    readinessInputs.map((input) => input.androidSerialAllowlist),
+    [['emulator-5556']],
+  );
+  assert.deepEqual(inspectDeviceClaims({ serial: android.id }, process.env), []);
+  assert.equal(store.get('claim-allowlist'), undefined);
+});
+
+test('open of a stopped AVD boots the resolved AVD whatever --serial names', async () => {
+  const { store, stateDir } = setup();
+  const stoppedAvd = { ...android, id: 'pixel-avd', booted: false };
+  mockResolveTargetDevice.mockResolvedValue(stoppedAvd);
+  // Android readiness waits for the serial it is given, so a forwarded --serial for another
+  // device would wait for that device instead of the AVD that was resolved.
+  const readinessInputs: EnsureReadyInput[] = [];
+  const ensureReady = async (input: EnsureReadyInput): Promise<DeviceInfo> => {
+    readinessInputs.push(input);
+    if (input.serial && input.serial !== android.id) {
+      throw new AppError('COMMAND_FAILED', 'Android emulator did not appear in time', {
+        reason: BOOT_TIMEOUT_REASON,
+      });
+    }
+    return android;
+  };
+
+  const response = await handleOpenCommand({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      command: 'open',
+      token: 'test',
+      session: 'claim-serial',
+      positionals: ['Demo'],
+      flags: { platform: 'android', device: stoppedAvd.name, serial: 'emulator-5560' },
+    },
+    sessionName: 'claim-serial',
+    logPath: path.join(stateDir, 'daemon.log'),
+    sessionStore: store,
+    bindDevice: bindBootingLifecycleRuntime(ensureReady),
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(readinessInputs.length, 1);
+  assert.equal(readinessInputs[0]?.serial, undefined);
+  assert.equal(store.get('claim-serial')?.device.id, android.id);
+});
+
+test('failed local open after dispatch retains its device claim for recovery', async () => {
+  const { store, stateDir } = setup();
+  mockResolveTargetDevice.mockResolvedValue(android);
+  // The point of this test is claim-retention behavior around an opaque post-dispatch
+  // failure, not any particular error shape, so assert identity of the propagated error.
+  const rejectionError = new Error('open failed');
+  mockDispatch.mockRejectedValue(rejectionError);
+
+  await assert.rejects(
+    async () =>
+      handleOpenCommand({
+        host: createTestHostEnvironment(),
+        createCommandSurface: fakeCreateCommandSurface,
+        platformServices: daemonPlatformServicesFixture(),
+        req: {
+          command: 'open',
+          token: 'test',
+          session: 'claim-dispatch-failure',
+          positionals: ['Demo'],
+          flags: { platform: 'android' },
+        },
+        sessionName: 'claim-dispatch-failure',
+        logPath: path.join(stateDir, 'daemon.log'),
+        sessionStore: store,
+      }),
+    (error: unknown) => error === rejectionError,
+  );
+  const retained = inspectDeviceClaims({ serial: android.id }, process.env)[0];
+  assert.equal(retained?.classification, 'live');
+  assert.equal(typeof retained?.claim?.abandonedAtMs, 'number');
+});
+
+test('failed local runtime-hint setup retains its device claim before open dispatch', async () => {
+  const { store, stateDir } = setup();
+  mockResolveTargetDevice.mockResolvedValue(android);
+  mockResolveAndroidPackage.mockResolvedValue('com.example.demo');
+  // The point of this test is claim-retention behavior around an opaque pre-dispatch
+  // failure, not any particular error shape, so assert identity of the propagated error.
+  const rejectionError = new Error('runtime hints changed before failure');
+  mockApplyRuntimeHints.mockRejectedValue(rejectionError);
+
+  await assert.rejects(
+    async () =>
+      handleOpenCommand({
+        host: createTestHostEnvironment(),
+        createCommandSurface: fakeCreateCommandSurface,
+        platformServices: daemonPlatformServicesFixture(),
+        req: {
+          command: 'open',
+          token: 'test',
+          session: 'claim-runtime-hint-failure',
+          positionals: ['Demo'],
+          flags: { platform: 'android' },
+          runtime: { metroHost: '10.0.0.10', metroPort: 8081 },
+        },
+        sessionName: 'claim-runtime-hint-failure',
+        logPath: path.join(stateDir, 'daemon.log'),
+        sessionStore: store,
+      }),
+    (error: unknown) => error === rejectionError,
+  );
+
+  assert.equal(mockApplyRuntimeHints.mock.calls.length, 1);
+  assert.equal(mockDispatch.mock.calls.length, 0);
+  assert.equal(inspectDeviceClaims({ serial: android.id }, process.env)[0]?.classification, 'live');
+  assert.equal(store.get('claim-runtime-hint-failure'), undefined);
+});
+
+test('failed local open response rolls its device claim back', async () => {
+  const { store, stateDir } = setup();
+  mockResolveTargetDevice.mockResolvedValue(android);
+
+  const response = await handleOpenCommand({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      command: 'open',
+      token: 'test',
+      session: 'claim-response-rollback',
+      positionals: ['Demo'],
+      flags: { platform: 'android' },
+      runtime: { metroHost: '10.0.0.10', metroPort: 70_000 },
+    },
+    sessionName: 'claim-response-rollback',
+    logPath: path.join(stateDir, 'daemon.log'),
+    sessionStore: store,
+  });
+
+  assert.equal(response.ok, false);
+  assert.deepEqual(inspectDeviceClaims({ serial: android.id }, process.env), []);
+});
+
+test('a canceled attempt lets the next attempt of the same suite open the device', async () => {
+  const { store, stateDir } = setup();
+  const requestId = 'suite:1-gesture-pan-duration:attempt:1';
+  mockResolveTargetDevice.mockResolvedValue(android);
+  mockDispatch.mockResolvedValue(undefined);
+  markRequestCanceled(requestId);
+  try {
+    const timedOut = await handleOpenCommand({
+      host: createTestHostEnvironment(),
+      createCommandSurface: fakeCreateCommandSurface,
+      platformServices: daemonPlatformServicesFixture(),
+      req: {
+        command: 'open',
+        token: 'test',
+        session: 'suite:1-gesture-pan-duration:attempt-1',
+        positionals: ['Demo'],
+        flags: { platform: 'android' },
+        meta: { requestId },
+      },
+      sessionName: 'suite:1-gesture-pan-duration:attempt-1',
+      logPath: path.join(stateDir, 'daemon.log'),
+      sessionStore: store,
+    });
+    assert.equal(timedOut.ok, false);
+  } finally {
+    clearRequestCanceled(requestId);
+  }
+  assert.equal(store.get('suite:1-gesture-pan-duration:attempt-1'), undefined);
+
+  const retry = await handleOpenCommand({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      command: 'open',
+      token: 'test',
+      session: 'suite:1-gesture-pan-duration:attempt-2',
+      positionals: ['Demo'],
+      flags: { platform: 'android' },
+    },
+    sessionName: 'suite:1-gesture-pan-duration:attempt-2',
+    logPath: path.join(stateDir, 'daemon.log'),
+    sessionStore: store,
+  });
+
+  assert.equal(retry.ok, true);
+  const claim = inspectDeviceClaims({ serial: android.id }, process.env)[0]?.claim;
+  assert.equal(claim?.session, 'suite:1-gesture-pan-duration:attempt-2');
+  assert.equal(claim?.abandonedAtMs, undefined);
+  assert.equal(
+    store.get('suite:1-gesture-pan-duration:attempt-2')?.deviceClaim?.ownerToken,
+    claim?.ownerToken,
+  );
+});
+
+test('cancellation after local device setup retains the device claim for recovery', async () => {
+  const { store, stateDir } = setup();
+  const requestId = 'claim-canceled-after-dispatch';
+  mockResolveTargetDevice.mockResolvedValue(android);
+  mockDispatch.mockResolvedValue(undefined);
+  markRequestCanceled(requestId);
+
+  try {
+    const response = await handleOpenCommand({
+      host: createTestHostEnvironment(),
+      createCommandSurface: fakeCreateCommandSurface,
+      platformServices: daemonPlatformServicesFixture(),
+      req: {
+        command: 'open',
+        token: 'test',
+        session: 'claim-canceled-after-dispatch',
+        positionals: ['Demo'],
+        flags: { platform: 'android' },
+        meta: { requestId },
+      },
+      sessionName: 'claim-canceled-after-dispatch',
+      logPath: path.join(stateDir, 'daemon.log'),
+      sessionStore: store,
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(mockDispatch.mock.calls.length, 1);
+    const retainedClaim = inspectDeviceClaims({ serial: android.id }, process.env)[0];
+    assert.equal(retainedClaim?.classification, 'live');
+    assert.equal(typeof retainedClaim?.claim?.abandonedAtMs, 'number');
+    assert.equal(store.get('claim-canceled-after-dispatch'), undefined);
+  } finally {
+    clearRequestCanceled(requestId);
+  }
+});
+
+test('provider-owned open creates no host-local device claim from its selected owner', async () => {
+  const { store, stateDir } = setup();
+  mockResolveTargetDevice.mockResolvedValue(android);
+  mockDispatch.mockResolvedValue(undefined);
+
+  const response = await handleOpenCommand({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      command: 'open',
+      token: 'test',
+      session: 'remote-open',
+      positionals: ['Demo'],
+      flags: { platform: 'android' },
+      // Ambient request metadata is intentionally irrelevant. The admitted binding below is the
+      // sole owner authority and must not reach through to local ADB or claim bookkeeping.
+      meta: { leaseProvider: 'unrelated-ambient-provider', deviceKey: 'android:emulator-5554' },
+    },
+    sessionName: 'remote-open',
+    logPath: path.join(stateDir, 'daemon.log'),
+    sessionStore: store,
+    inspectFacts: inspectProviderLifecycleRuntimeFacts,
+    bindDevice: bindProviderLifecycleRuntime,
+  });
+  assert.equal(response.ok, true);
+  assert.deepEqual(inspectDeviceClaims({ serial: android.id }, process.env), []);
+  assert.equal(store.get('remote-open')?.deviceClaim, undefined);
+});
+
+test('a foreign live claim rejects open before platform preparation or mutation', async () => {
+  const { store, stateDir } = setup();
+  mockResolveTargetDevice.mockResolvedValue(android);
+  const ownerStateDir = path.join(stateDir, 'foreign-owner');
+  fs.mkdirSync(ownerStateDir);
+  const acquired = await acquireDeviceClaim({
+    env: process.env,
+    device: android,
+    session: 'foreign-session',
+    workspace: '/worktrees/foreign',
+    stateDir: ownerStateDir,
+  });
+  assert.equal(acquired.status, 'acquired');
+  if (acquired.status !== 'acquired') return;
+
+  const response = await handleOpenCommand({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      command: 'open',
+      token: 'test',
+      session: 'second-session',
+      positionals: ['Demo'],
+      flags: { platform: 'android' },
+      meta: { cwd: '/worktrees/second' },
+    },
+    sessionName: 'second-session',
+    logPath: path.join(stateDir, 'daemon.log'),
+    sessionStore: store,
+  });
+
+  assert.equal(response.ok, false);
+  if (response.ok) return;
+  assert.equal(response.error.code, 'DEVICE_IN_USE');
+  assert.equal(response.error.retriable, false);
+  assert.equal(response.error.details?.reason, 'DEVICE_CLAIM_LIVE_OWNER');
+  assert.deepEqual(response.error.details?.owner, {
+    session: 'foreign-session',
+    workspace: '/worktrees/foreign',
+    stateDir: ownerStateDir,
+  });
+  assert.deepEqual(response.error.details?.recovery, {
+    command: 'agent-device device status --platform android --serial emulator-5554',
+  });
+  assert.equal(mockEnsureDeviceReady.mock.calls.length, 0);
+  assert.equal(mockResolveAndroidPackage.mock.calls.length, 0);
+  assert.equal(mockApplyRuntimeHints.mock.calls.length, 0);
+  assert.equal(vi.mocked(activateAndroidTestIme).mock.calls.length, 0);
+  assert.equal(mockDispatch.mock.calls.length, 0);
+  assert.equal(store.get('second-session'), undefined);
+});
+
+test('local close clears its matching device claim after teardown', async () => {
+  const { store, stateDir } = setup();
+  const acquired = await acquireDeviceClaim({
+    env: process.env,
+    device: android,
+    session: 'close-claim',
+    workspace: process.cwd(),
+    stateDir,
+  });
+  assert.equal(acquired.status, 'acquired');
+  if (acquired.status !== 'acquired') return;
+  store.publish('close-claim', {
+    name: 'close-claim',
+    device: android,
+    deviceClaim: acquired.ownership,
+    createdAt: Date.now(),
+    actions: [],
+  });
+  mockDispatch.mockResolvedValue(undefined);
+
+  const response = await handleCloseCommand({
+    host: createTestHostEnvironment(),
+    platformServices: daemonPlatformServicesFixture(),
+    req: { command: 'close', token: 'test', session: 'close-claim', positionals: [], flags: {} },
+    sessionName: 'close-claim',
+    logPath: path.join(stateDir, 'daemon.log'),
+    sessionStore: store,
+    leaseRegistry: new LeaseRegistry(),
+  });
+  assert.equal(response.ok, true);
+  assert.deepEqual(inspectDeviceClaims({ serial: android.id }, process.env), []);
+});
+
+test('#1391: a close-time script save failure still clears the device claim and deletes the session', async () => {
+  const { store, stateDir } = setup();
+  const acquired = await acquireDeviceClaim({
+    env: process.env,
+    device: android,
+    session: 'close-save-script-failure',
+    workspace: process.cwd(),
+    stateDir,
+  });
+  assert.equal(acquired.status, 'acquired');
+  if (acquired.status !== 'acquired') return;
+  const targetPath = path.join(stateDir, 'already-published.ad');
+  fs.writeFileSync(targetPath, 'pre-existing\n');
+  // Retained directly (not just looked up via `store`) so it stays inspectable
+  // after `handleCloseCommand` deletes it from the store — `store.delete` only
+  // drops the map entry, it doesn't touch the object this variable still
+  // points at.
+  const session = makeAuthoringSession('close-save-script-failure', {
+    device: android,
+    deviceClaim: acquired.ownership,
+    scriptPublication: {
+      kind: 'authoring',
+      status: 'armed',
+      target: { kind: 'explicit', path: targetPath, force: false },
+    },
+  });
+  store.publish('close-save-script-failure', session);
+  mockDispatch.mockResolvedValue(undefined);
+
+  // Like the platform-close-error tests above, a failed close-time save is
+  // thrown (not returned as `{ok:false}`) — `handleCloseCommand` never
+  // converts its own errors; the request-router does that for real requests.
+  let thrown: unknown;
+  try {
+    await handleCloseCommand({
+      host: createTestHostEnvironment(),
+      platformServices: daemonPlatformServicesFixture(),
+      req: {
+        command: 'close',
+        token: 'test',
+        session: 'close-save-script-failure',
+        positionals: [],
+        flags: {},
+      },
+      sessionName: 'close-save-script-failure',
+      logPath: path.join(stateDir, 'daemon.log'),
+      sessionStore: store,
+      leaseRegistry: new LeaseRegistry(),
+    });
+  } catch (error) {
+    thrown = error;
+  }
+
+  // The failed save is surfaced, but never at the cost of leaking the session
+  // or the device claim (#1391 item 1) — and the target is left untouched
+  // rather than rewritten (#1391 item 2).
+  assert.ok(thrown instanceof AppError, 'expected close to throw an AppError');
+  const error = thrown as AppError;
+  assert.equal(error.code, 'COMMAND_FAILED');
+  assert.match(error.message, /session was closed, but its script was not saved/);
+  assert.equal(error.details?.retriable, false);
+  // The original write failure's machine-readable details survive the
+  // close-specific hint/retriable override, so a caller dispatching on them
+  // (e.g. `reason === 'script_target_exists'`) still can.
+  assert.equal(error.details?.reason, 'script_target_exists');
+  assert.equal(error.details?.path, targetPath);
+  assert.equal(store.get('close-save-script-failure'), undefined);
+  assert.deepEqual(inspectDeviceClaims({ serial: android.id }, process.env), []);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), 'pre-existing\n');
+
+  assert.deepEqual(
+    session.actions.map((action) => action.command),
+    ['close'],
+  );
+  await store.flushEvents('close-save-script-failure');
+  const durableCloseEvents = store
+    .readEvents('close-save-script-failure')
+    .events.filter((event) => event.kind === 'action.recorded' && event.command === 'close');
+  assert.equal(durableCloseEvents.length, session.actions.length);
+});
+
+test('an open under a macos-app lease claims its app device, beside other apps of the Mac', async () => {
+  const { store, stateDir } = setup();
+  const leasedApp = hostAppDevice(MACOS_DEVICE, 'com.example.app');
+  mockResolveTargetDevice.mockResolvedValue(leasedApp);
+  mockDispatch.mockResolvedValue(undefined);
+  const ownerStateDir = path.join(stateDir, 'host-user');
+  fs.mkdirSync(ownerStateDir);
+  const foreign = await acquireDeviceClaim({
+    env: process.env,
+    device: hostAppDevice(MACOS_DEVICE, 'com.example.host-user'),
+    session: 'host-user-session',
+    workspace: '/worktrees/host-user',
+    stateDir: ownerStateDir,
+  });
+  assert.equal(foreign.status, 'acquired');
+  store.publish('other-app', {
+    name: 'other-app',
+    device: hostAppDevice(MACOS_DEVICE, 'com.example.other'),
+    appBundleId: 'com.example.other',
+    lease: {
+      leaseId: 'b'.repeat(32),
+      tenantId: 't2',
+      runId: 'r2',
+      leaseBackend: 'macos-app',
+      deviceKey: 'com.example.other',
+    },
+    createdAt: Date.now(),
+    actions: [],
+  });
+  const admittedLease = new LeaseRegistry().putHostLease('a'.repeat(32), {
+    tenantId: 't1',
+    runId: 'r1',
+    leaseBackend: 'macos-app',
+    deviceKey: 'com.example.app',
+  });
+
+  const response = await handleOpenCommand({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      command: 'open',
+      token: 'test',
+      session: 'leased-app',
+      positionals: ['com.example.app'],
+      flags: { platform: 'macos' },
+      meta: { cwd: '/worktrees/client' },
+      internal: { admittedLease },
+    },
+    sessionName: 'leased-app',
+    logPath: path.join(stateDir, 'daemon.log'),
+    sessionStore: store,
+  });
+
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(store.get('leased-app')?.device.id, leasedApp.id);
+  assert.notEqual(store.get('leased-app')?.deviceClaim, undefined);
+  assert.deepEqual(
+    inspectDeviceClaims({}, process.env)
+      .map((entry) => entry.claim?.session)
+      .sort(),
+    ['host-user-session', 'leased-app'],
+  );
+});
+
+test('a fresh app device open retains only its own device lock, never its host after an app lock', async () => {
+  const { store, stateDir } = setup();
+  const textEdit = hostAppDevice(MACOS_DEVICE, 'com.apple.textedit');
+  mockResolveTargetDevice.mockResolvedValue(textEdit);
+  mockDispatch.mockResolvedValue(undefined);
+  const retained: string[] = [];
+
+  const response = await handleOpenCommand({
+    host: createTestHostEnvironment(),
+    createCommandSurface: fakeCreateCommandSurface,
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      command: 'open',
+      token: 'test',
+      session: 'text-edit',
+      positionals: ['com.apple.textedit'],
+      flags: { platform: 'macos' },
+      meta: { cwd: '/worktrees/client' },
+      // A batch or replay step that already holds another app device's lock retains this one.
+      internal: { retainDeviceExecutionLock: async (deviceId) => void retained.push(deviceId) },
+    },
+    sessionName: 'text-edit',
+    logPath: path.join(stateDir, 'daemon.log'),
+    sessionStore: store,
+  });
+
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.deepEqual(retained, [textEdit.id]);
+});
+
+test('closing another app from an app device session is refused before teardown, keeping the session', async () => {
+  const { store, stateDir } = setup();
+  const textEdit = hostAppDevice(MACOS_DEVICE, 'com.apple.textedit');
+  const acquired = await acquireDeviceClaim({
+    env: process.env,
+    device: textEdit,
+    session: 'text-edit',
+    workspace: process.cwd(),
+    stateDir,
+  });
+  if (acquired.status !== 'acquired') throw new Error('claim seed failed');
+  store.publish('text-edit', {
+    name: 'text-edit',
+    device: textEdit,
+    deviceClaim: acquired.ownership,
+    appBundleId: 'com.apple.TextEdit',
+    appName: 'TextEdit',
+    surface: 'app',
+    createdAt: Date.now(),
+    actions: [],
+  });
+  mockDispatch.mockResolvedValue(undefined);
+  // The platform resolves the target as open does and refuses another app of the Mac.
+  // The production platform refusal, over a stubbed list of installed apps.
+  const provider = createLocalAppleToolProvider({
+    runCommand: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+  });
+  const macosHost = {
+    ...provider.macosHost!,
+    listApps: async () => [
+      { bundleId: 'com.apple.TextEdit', name: 'TextEdit' },
+      { bundleId: 'com.apple.calculator', name: 'Calculator' },
+    ],
+  };
+  resolveOpenTargetFixture.mockImplementationOnce(
+    async (device, _directResolve, input) =>
+      await withAppleToolProvider(
+        { ...provider, macosHost },
+        async () => await resolveMacOsAppDeviceOpenTarget(device, input.target),
+      ),
+  );
+
+  const outcome = await handleCloseCommand({
+    host: createTestHostEnvironment(),
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      command: 'close',
+      token: 'test',
+      session: 'text-edit',
+      positionals: ['Calculator'],
+      flags: {},
+    },
+    sessionName: 'text-edit',
+    logPath: path.join(stateDir, 'daemon.log'),
+    sessionStore: store,
+    leaseRegistry: new LeaseRegistry(),
+  }).catch((error: unknown) => error);
+
+  assert.equal((outcome as AppError).details?.reason, 'app-device-scope');
+  assert.ok(
+    resolveOpenTargetFixture.mock.calls.some(([, , input]) => input.target === 'Calculator'),
+  );
+  assert.equal(mockDispatch.mock.calls.length, 0);
+  assert.equal(store.get('text-edit')?.device.id, textEdit.id);
+  assert.deepEqual(
+    inspectDeviceClaims({}, process.env).map((entry) => entry.claim?.session),
+    ['text-edit'],
+  );
+});

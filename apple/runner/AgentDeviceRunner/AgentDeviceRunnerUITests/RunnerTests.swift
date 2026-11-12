@@ -1,0 +1,423 @@
+//
+//  RunnerTests.swift
+//  AgentDeviceRunnerUITests
+//
+//  Created by Michał Pierzchała on 30/01/2026.
+//
+
+import AgentDeviceSnapshotPresentation
+import XCTest
+import Network
+#if canImport(UIKit)
+import UIKit
+typealias RunnerImage = UIImage
+#elseif canImport(AppKit)
+import AppKit
+typealias RunnerImage = NSImage
+#endif
+
+final class RunnerTests: XCTestCase {
+  enum RunnerErrorDomain {
+    static let general = "AgentDeviceRunner"
+    static let exception = "AgentDeviceRunner.NSException"
+  }
+
+  enum RunnerErrorCode {
+    static let noResponseFromMainThread = 1
+    static let commandReturnedNoResponse = 2
+    static let mainThreadExecutionTimedOut = 3
+    static let objcException = 1
+  }
+
+  /// String codes the daemon keys behavior on. `RUNNER_BUSY` and `RUNNER_WEDGED` come from the busy
+  /// gate; `MAIN_THREAD_TIMEOUT` is emitted by the transport when a command trips the execution
+  /// watchdog, so the daemon can tell "the main thread is now occupied" from a generic failure.
+  /// `APP_NOT_RUNNING` refuses a read whose session app is not running.
+  /// `NO_TEXT_INPUT_AT_POINT` refuses a coordinate fill whose point identified no text input.
+  /// `TEXT_INPUT_PROBE_UNAVAILABLE` refuses one whose input lookup could not answer on the degraded
+  /// channel, so the runner cannot tell whether an input is there.
+  /// `ALERT_BUTTON_NOT_FOUND` is the alert button choice refusing before any activation, so it
+  /// discloses dispatched: no.
+  /// `ALERT_UNRESOLVED` means required alert acquisition failed or exhausted its deadline.
+  /// It establishes no absence and activates nothing, so dispatched: no.
+  enum RunnerWireErrorCode {
+    static let mainThreadTimeout = "MAIN_THREAD_TIMEOUT"
+    static let appNotRunning = "APP_NOT_RUNNING"
+    static let noTextInputAtPoint = "NO_TEXT_INPUT_AT_POINT"
+    static let textInputProbeUnavailable = "TEXT_INPUT_PROBE_UNAVAILABLE"
+    static let alertButtonNotFound = "ALERT_BUTTON_NOT_FOUND"
+    static let alertUnresolved = "ALERT_UNRESOLVED"
+    /// Refuses a repeat of a `commandId` the runner already finished, when that command's own
+    /// classification keeps no response body to replay. Nothing ran for the repeat, but the daemon's
+    /// dispatch disclosure stays `unknown` — only the runner knows whether an earlier send of that id
+    /// reached the device — and its hint sends the caller to observe the screen instead of resending.
+    static let commandAlreadyFinished = "COMMAND_ALREADY_FINISHED"
+  }
+
+  /// A replayed failure must carry the same code and recovery hint as its live reply.
+  static func thrownErrorPayload(for error: Error) -> ErrorPayload {
+    let nsError = error as NSError
+    let abandoned = nsError.domain == RunnerErrorDomain.general
+      && nsError.code == RunnerErrorCode.mainThreadExecutionTimedOut
+    return ErrorPayload(
+      code: abandoned ? RunnerWireErrorCode.mainThreadTimeout : "COMMAND_FAILED",
+      message: error.localizedDescription,
+      hint: abandoned
+        ? "The runner abandoned this command's main-thread work past its execution watchdog and it is still draining. Wait and retry, or use a screenshot and interact by coordinates."
+        : "Check the runner log for XCTest details, then retry after the app is foregrounded if this was a timeout or activation failure."
+    )
+  }
+
+  static let springboardBundleId = "com.apple.springboard"
+  // SpringBoard hosts blocking system modals on iOS/visionOS; tvOS (PineBoard/HeadBoard)
+  // and macOS have no such host, so there is nothing to probe there.
+  static let hasSpringBoardSystemModalHost: Bool = {
+    #if os(tvOS) || os(macOS)
+      return false
+    #else
+      return true
+    #endif
+  }()
+  static let defaultRecordingFps: Int32 = 15
+  var listener: NWListener?
+  var listenerToken: RunnerListenerToken?
+  var acceptsForwardedConnections = false
+  var doneExpectation: XCTestExpectation?
+  var transportConnections: [ObjectIdentifier: NWConnection] = [:]
+  let shutdownResponseWrites = DispatchGroup()
+  let transportQueue = DispatchQueue(label: "agent-device.runner.transport")
+  let commandExecutionQueue = DispatchQueue(label: "agent-device.runner.commands")
+  let app = XCUIApplication()
+  lazy var springboard = XCUIApplication(bundleIdentifier: Self.springboardBundleId)
+  let mainOwned = RunnerMainOwnedState()
+  let litPanelState = RunnerLitPanelState()
+  // Set while serving a command that had to re-activate the bound app, and stamped onto that
+  // command's response before it leaves the execution queue (#2682).
+  var pendingTargetActivation: TargetActivationFactPayload?
+  // iOS does not reliably expose hasKeyboardFocus for a bare type request, especially when
+  // hardware-keyboard input hides the software keyboard. A successful tap on a concrete text
+  // input is a scoped witness for the immediately-following bare type; lifecycle and non-text
+  // interactions clear it before it can become stale.
+  var textEntryTapWitness: TextEntryTapWitness?
+  static let mainThreadExecutionTimeout: TimeInterval = 30
+  let appExistenceTimeout: TimeInterval = 30
+  let retryCooldown: TimeInterval = 0.2
+  let postSnapshotInteractionDelay: TimeInterval = 0.2
+  let firstInteractionAfterActivateDelay: TimeInterval = 0.25
+  let interactionIdleTimeoutDefault: TimeInterval = 1.0
+  let tvRemoteDoublePressDelayDefault: TimeInterval = 0.0
+  // Keep a periodic XCTest liveness marker in runner.log without flooding long-lived sessions.
+  let xctestIdleKeepaliveInterval: TimeInterval = 60.0
+  let minRecordingFps = 1
+  let maxRecordingFps = 120
+  // A recorder frame still capturing on main after this long is abandoned and dropped. It bounds a
+  // screenshot round trip, not the frame interval: a capture slower than the interval lowers the
+  // frame rate, and only a capture this slow counts as main-thread occupancy.
+  let recordingFrameCaptureTimeout: TimeInterval = 1
+  // Per-command markers that restate a fact of the bound target (the fast app guard, the
+  // synthesized gesture policy per gesture kind) write only when that fact changes; otherwise a
+  // long session fills runner.log with one identical line per command. Cleared with the rest of the
+  // target-bound state so a rebind states the fact once more.
+  var lastLoggedFastAppGuardLine: String?
+  var lastLoggedGesturePolicyLines: [SynthesizedGesturePolicyKind: String] = [:]
+  var runnerMarkerWriter: @MainActor (String) -> Void = { NSLog("%@", $0) }
+  /// When the first interaction after an activation may run. The guarantee is a minimum gap
+  /// *since the activation*, not a pause at the interaction: a caller that already spent that gap
+  /// elsewhere (an agent's round trip is 190-260 ms) has satisfied it and waits for nothing.
+  /// `nil` = no activation is pending stabilization.
+  var firstInteractionWindow: FirstInteractionWindow?
+  var activeRecording: ScreenRecorder?
+  let commandJournal = RunnerCommandJournal()
+  let inFlightCommandLock = NSLock()
+  /// Waits of an execution whose `commandId` is in flight, keyed by the execution's identity so the one
+  /// execution answers every send that joined it (#1105 capture pileup). The journal owns which execution
+  /// is in flight and mints the identity; this holds only the sends that attached to it. A `commandId` the
+  /// runner refused before dispatch is claimed again, and the key is what keeps that new execution's sends
+  /// from being answered by the delivery of the refusal that freed the id.
+  var inFlightCommandWaiters: [Int: [@Sendable ((response: RunnerHttpResponse, shouldFinish: Bool)) -> Void]] = [:]
+  // Tracks main-queue work abandoned by the execution watchdog (runMainThreadWork). While any is
+  // outstanding the main thread is occupied: new main-thread commands fail fast as busy instead
+  // of queueing behind work that cannot be cancelled, capture plans skip XCTest-backed tiers,
+  // and post-capture bookkeeping stays off main (#1105/#1244).
+  let mainThreadWorkLock = NSLock()
+  var abandonedMainThreadWorkCount = 0
+  // Dispatched main-queue work that has not finished yet, abandoned or not. Only optional work
+  // reads it, to stay off a main thread that commands are using; occupancy readers do not.
+  var mainThreadWorkInFlightCount = 0
+  var abandonedMainThreadWorkSince: Date?
+  // Past this age the runner stops claiming "busy, retry soon" and reports itself wedged so
+  // the daemon recycles it — the only cure once the main thread is stuck for good.
+  let mainThreadWedgeThreshold: TimeInterval = 120
+  // Sticky per-bundle hint: after an XCTest-backed snapshot tier ground past its slice (or a
+  // snapshot was abandoned by the watchdog), later capture plans avoid the XCTest accessibility
+  // channel when an independent recovery backend exists, or use a bounded XCTest probe when it
+  // does not, for the same screen class (#1105/#1156).
+  let snapshotXCTestChannelPenaltyLock = NSLock()
+  var snapshotXCTestChannelPenalty = SnapshotXCTestChannelPenalty()
+  let snapshotXCTestPenaltyWarmupExemption = SnapshotXCTestPenaltyWarmupExemption()
+  // Sticky per-bundle hint for the private AX depth ladder: deep RN screens reject the default
+  // depth with kAXErrorIllegalArgument on EVERY capture, so once a shallower rung is accepted
+  // later captures start there instead of re-paying the rejected deep request (~300ms per
+  // capture on the Bluesky feed). Shares the penalty's lifetime model: same duration, cleared
+  // on target process change, so screens that regain deep-capture ability are re-probed.
+  let privateAXAcceptedDepthLock = NSLock()
+  var privateAXAcceptedDepthBundleId: String?
+  // PID-bound: a relaunch (external or A->B->A while inactive) changes the process, and the new
+  // tree may accept the full depth again. Any invalidation path that drops the cached PID makes
+  // the memory unmatchable, so every fresh activation re-probes the full requested depth.
+  var privateAXAcceptedDepthProcessIdentifier: Int?
+  var privateAXAcceptedDepth: Int?
+  var privateAXAcceptedDepthUntil = Date.distantPast
+  // Bluesky-class screens can grind ~4-8s before an XCTest-backed snapshot tier fails; anything
+  // past this threshold marks the screen hostile so the next capture uses non-XCTest recovery.
+  let snapshotXCTestSlowCaptureThreshold: TimeInterval = 3
+  // The blocking XCTest tree snapshot XPC runs on the main thread under this slice so a
+  // content-dependent grind (#1105: seconds to minutes on live Bluesky screens) cannot pin
+  // the capture plan.
+  let treeCaptureSliceBudget: TimeInterval = 8
+  // Bounds the pre-plan SpringBoard system-modal probe, which can otherwise grind for tens of
+  // seconds on remote-hosted consent dialogs and bypass the plan budget (#1244).
+  let systemModalProbeBudget: TimeInterval = 4
+  // In-bundle unit tests (every `func test…` except `testCommand` below) compile only under
+  // `-D AGENT_DEVICE_RUNNER_UNIT_TESTS` and are classified by their `#if` guard (#1781 A7):
+  //   - `#if AGENT_DEVICE_RUNNER_UNIT_TESTS` alone: a pure runner decision (rule table,
+  //     geometry, parser, policy, journal, dispatch bookkeeping) that needs no launched app.
+  //     Runs on the macOS host lane on every PR and on the full iOS nightly lane.
+  //   - `… && os(iOS)` (or a nested `#if os(iOS)`): runner/XCTest semantics — launches the
+  //     host app, routes through SpringBoard, swizzles XCUIApplication, or asserts an
+  //     iOS-only branch. Full simulator coverage runs nightly (xctest-nightly.yml).
+  //   - Shared methods with platform-dependent bodies also run on the PR simulator lane.
+  // `pnpm check:xctest-selection` derives each lane's reachable set from these guards and
+  // fails when a declared test is reachable by no lane, so a test gated to a platform nothing
+  // runs (the old tvOS-only pair) cannot go dark silently.
+  #if AGENT_DEVICE_RUNNER_UNIT_TESTS
+  // #1605 merge gate: deterministic live reproduction of the field ambiguity —
+  // a tap whose coordinate activation LANDS while XCTest bookkeeping records a
+  // failure. Armed by writing a decrementing count to the flag file below
+  // (the daemon regenerates tampered xctestrun templates, so env plumbing
+  // cannot reach a daemon-spawned runner); consumed one injection per tap.
+  // The injection records a real XCTIssue AFTER the real gesture, so
+  // `xctestRecordedFailureResponse` and target invalidation fire byte-for-byte
+  // like a field failure. Production builds compile none of this.
+  var textInputProbeIssueForTesting: XCTIssue?
+
+  /// Simulates an app tree read that returns no descendants without an issue or exception.
+  var textInputProbeBlindForTesting = false
+
+  /// Records an XCTest issue during the lit-panel window walk, as a window that vanishes mid-walk does.
+  var litPanelWindowWalkIssueForTesting = false
+
+  static let injectedTapFailureFlagPathForTesting =
+    "/tmp/agent-device-inject-tap-recorded-failure-for-testing"
+
+  static func shouldInjectTapRecordedFailure(command: CommandType, remaining: Int) -> Bool {
+    command == .tap && remaining > 0
+  }
+
+  func consumeInjectedTapRecordedFailureForTesting(command: CommandType) -> Bool {
+    guard
+      let raw = try? String(
+        contentsOfFile: Self.injectedTapFailureFlagPathForTesting,
+        encoding: .utf8
+      ),
+      let remaining = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+    else {
+      return false
+    }
+    guard Self.shouldInjectTapRecordedFailure(command: command, remaining: remaining) else {
+      return false
+    }
+    try? String(remaining - 1).write(
+      toFile: Self.injectedTapFailureFlagPathForTesting,
+      atomically: true,
+      encoding: .utf8
+    )
+    return true
+  }
+
+  // Unit-test-only injectable override for the system-modal probe (see
+  // `boundedBlockingSystemAlertSnapshot` in RunnerTests+Snapshot.swift): when set, a test's probe
+  // body runs in place of `blockingSystemAlertSnapshot` so it can force a real timeout without a
+  // live SpringBoard alert. Production never compiles this property. Stored here (rather than in
+  // the extension that reads it) because Swift extensions cannot hold stored properties.
+  var systemModalProbeOverrideForTesting: (@MainActor (Date) -> DataPayload?)?
+  /// Stands in for the private AX tier's acquisition in unit-test builds, so a plan can meet the
+  /// out-of-process sheet the tier cannot read. Production builds compile none of this.
+  var privateAXAcquisitionOverrideForTesting: (() -> SnapshotAcquisition?)?
+  var blockingSystemModalPresenceOverrideForTesting: Bool?
+  var modalElementsQueryOverrideForTesting: (() -> [XCUIElement])?
+  var alertResolutionOverrideForTesting: (@MainActor (Date) -> AlertResolution)?
+  var alertButtonHittabilityProbeOverrideForTesting: (@MainActor (Date) -> Bool)?
+  // Unit-test-only seam for the in-place surface probe (`presentedSystemSurfaceHost`): a registered
+  // host is an out-of-process XPC service that only comes up because some app presented it, and
+  // `open` refuses to launch one, so the foreground answer for every registered host is supplied
+  // here when set — members are foreground, non-members are not — which lets a test pin the whole
+  // registry walk. The probe's registry order and its `.runningForeground` condition stay the
+  // production ones. Production never compiles this property.
+  var presentedSystemSurfaceForegroundOverrideForTesting: Set<String>?
+  // Runs on the waiting thread after `runMainThreadWork`'s wait timed out and before it takes the
+  // lock that decides between finished and abandoned, so a test can finish the work in that window.
+  var mainThreadWorkTimedOutForTesting: (@Sendable () -> Void)?
+  // Runs before a fill pauses after reading its warmup character back, so a test can change the app's
+  // inputs in that pause.
+  var textEntryWarmupPauseForTesting: (() -> Void)?
+  #endif
+  // Observability for the record(_:) suppression below: how many AX-broken-screen snapshot
+  // issues this session muted, so wedge investigations see the volume without grepping logs.
+  var textInputProbeIssues: TextInputProbeIssues?
+  let suppressedIssueLock = NSLock()
+  var suppressedAxSnapshotIssueCount = 0
+  let actionableTypes: Set<XCUIElement.ElementType> = Set(
+    RunnerTests.elementTypeNamesByRawValue.compactMap { rawValue, name in
+      AlertSurface.actionableTypes.contains(name) ? XCUIElement.ElementType(rawValue: rawValue) : nil
+    }
+  )
+
+  // MARK: - XCTest Entry
+
+#if os(macOS)
+  // Xcode 27.2 aborts in CGS_REQUIRE_INIT on the first synthesized event unless the process is
+  // connected to the window server; the UI-test runner has no NSApplication to do it (#4142).
+  override class func setUp() {
+    super.setUp()
+    MainActor.assumeIsolated { _ = NSApplication.shared }
+  }
+
+#endif
+  override func setUp() {
+    continueAfterFailure = true
+  }
+
+  override func tearDown() {
+    transportQueue.sync { closeTransport() }
+    super.tearDown()
+  }
+
+  /// The XCTest fetch wordings whose recorded issue carries the AX server's own error text: the
+  /// element snapshot fetch and query resolution (`allElementsBoundByIndex`, recorded once per
+  /// element type by the query-sweep tier). Both read the target's tree through testmanagerd and
+  /// fail the same way on the same screens. The wording is the only handle: these issues arrive
+  /// as plain assertion failures with `associatedError` and `detailedDescription` both nil
+  /// (probed on the Bluesky feed under Xcode 26.2).
+  static let axServerRejectionFetchWordings = [
+    "Failed to get matching snapshot",
+    "Failed to resolve query"
+  ]
+
+  /// True for the one recorded-issue class the runner deliberately mutes: an AX-server error
+  /// (`kAXError*`, deliberately covering kAXErrorIllegalArgument and its sibling codes) inside one
+  /// of the fetch wordings above. Variants without that token MUST keep recording: the timeout
+  /// ("Timed out while evaluating UI query.") signals a genuinely hung query, exactly the
+  /// pathology XCTEST_RECORDED_FAILURE must stay able to see, and "Application X is not running"
+  /// names a target that is gone, not a tree that refused a read.
+  static func isSuppressedAxSnapshotIssueDescription(_ description: String) -> Bool {
+    guard description.contains("kAXError") else { return false }
+    return axServerRejectionFetchWordings.contains { description.contains($0) }
+  }
+
+  /// On AX-broken screens (deep RN trees, #758/#1105) XCUIApplication element fetches and query
+  /// resolutions record "... kAXError..." issues; XCTest ends the test case as soon as the
+  /// main-thread block that recorded them returns, killing the long-lived runner right after
+  /// the command (or with it still in flight) and forcing a runner boot per capture. This
+  /// override is deliberately suite-global (all commands, not just snapshot capture):
+  /// tap-triggered element queries on the same screens record the same noise and would still
+  /// tear the runner down, and command outcomes stay honest through their own error paths — only
+  /// this issue side-channel is muted. Everything else still records (and still drives
+  /// XCTEST_RECORDED_FAILURE).
+  override func record(_ issue: XCTIssue) {
+    if containTextInputProbeIssue(issue) { return }
+    let description = issue.compactDescription
+    if Self.isSuppressedAxSnapshotIssueDescription(description) {
+      suppressedIssueLock.lock()
+      suppressedAxSnapshotIssueCount += 1
+      let count = suppressedAxSnapshotIssueCount
+      suppressedIssueLock.unlock()
+      NSLog(
+        "AGENT_DEVICE_RUNNER_AX_SNAPSHOT_ISSUE_SUPPRESSED count=%ld description=%@",
+        count,
+        description
+      )
+      return
+    }
+    super.record(issue)
+  }
+
+  @MainActor
+  func testCommand() throws {
+    doneExpectation = expectation(description: "agent-device command handled")
+    NSLog("AGENT_DEVICE_RUNNER_HEADLESS_STARTUP=1")
+    guard let configuration = RunnerListenerConfiguration.fromEnvironment() else {
+      NSLog("AGENT_DEVICE_RUNNER_LISTENER_CONFIGURATION_MISSING")
+      XCTFail("runner listener port, token, or bind address is missing or invalid; refusing to listen")
+      return
+    }
+    listenerToken = configuration.token
+    acceptsForwardedConnections = configuration.bindAddress != nil
+    NSLog("AGENT_DEVICE_RUNNER_AUTH=required")
+    NSLog("AGENT_DEVICE_RUNNER_DESIRED_PORT=%d", configuration.port.rawValue)
+    listener = try Self.makeRunnerListener(port: configuration.port, bindAddress: configuration.bindAddress)
+    // Reads the OS prompt strings off the alert path, so the first accept/dismiss deadline does not pay for it.
+    DispatchQueue.global(qos: .utility).async { _ = RunnerAlertLabelVocabulary.system }
+    DispatchQueue.global(qos: .utility).async { _ = RunnerLaunchConfirmationPrompt.system }
+    listener?.stateUpdateHandler = { [weak self] state in
+      switch state {
+      case .ready:
+        NSLog("AGENT_DEVICE_RUNNER_LISTENER_READY")
+        if let listenerPort = self?.listener?.port {
+          NSLog("AGENT_DEVICE_RUNNER_PORT=%d", listenerPort.rawValue)
+        } else {
+          NSLog("AGENT_DEVICE_RUNNER_PORT_NOT_SET")
+        }
+      case .failed(let error):
+        NSLog("AGENT_DEVICE_RUNNER_LISTENER_FAILED=%@", String(describing: error))
+        self?.doneExpectation?.fulfill()
+      default:
+        break
+      }
+    }
+    listener?.newConnectionHandler = { [weak self] conn in
+      self?.handle(connection: conn)
+    }
+    listener?.start(queue: transportQueue)
+    let idleKeepaliveTimer = DispatchSource.makeTimerSource(queue: transportQueue)
+    idleKeepaliveTimer.schedule(
+      deadline: .now() + xctestIdleKeepaliveInterval,
+      repeating: xctestIdleKeepaliveInterval
+    )
+    idleKeepaliveTimer.setEventHandler { @Sendable in
+      NSLog("AGENT_DEVICE_RUNNER_IDLE_KEEPALIVE")
+    }
+    idleKeepaliveTimer.resume()
+    defer {
+      idleKeepaliveTimer.cancel()
+    }
+
+    guard let expectation = doneExpectation else {
+      XCTFail("runner expectation was not initialized")
+      return
+    }
+    NSLog("AGENT_DEVICE_RUNNER_WAITING")
+    let result = XCTWaiter.wait(for: [expectation], timeout: 24 * 60 * 60)
+    NSLog("AGENT_DEVICE_RUNNER_WAIT_RESULT=%@", String(describing: result))
+    if result != .completed {
+      XCTFail("runner wait ended with \(result)")
+    }
+  }
+
+  /// Cloud simulators bind their assigned address; local simulators keep the loopback listener.
+  /// Physical devices accept CoreDevice tunnel connections on their network interface.
+  static func makeRunnerListener(port: NWEndpoint.Port, bindAddress: IPv4Address? = nil) throws -> NWListener {
+    if let bindAddress {
+      let parameters = NWParameters.tcp
+      parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(bindAddress), port: port)
+      return try NWListener(using: parameters)
+    }
+    #if targetEnvironment(simulator) || os(macOS)
+      let parameters = NWParameters.tcp
+      parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: port)
+      return try NWListener(using: parameters)
+    #else
+      return try NWListener(using: .tcp, on: port)
+    #endif
+  }
+}

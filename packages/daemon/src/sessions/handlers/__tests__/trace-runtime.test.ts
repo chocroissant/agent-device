@@ -1,0 +1,200 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { expect, test } from 'vitest';
+import {
+  bindTestCommandHost,
+  createLiveTestHostEnvironment,
+  createTestHostEnvironment,
+  mkdtempForTestSync,
+} from '@agent-device/test-kit';
+import { SessionStore } from '../../../core/session-store.ts';
+import type { DaemonRequest } from '../../../core/daemon-request.ts';
+import type { SessionState } from '../../../core/session-state.ts';
+import { handleTraceCommand } from '../trace-runtime.ts';
+
+bindTestCommandHost();
+
+function fixture() {
+  const root = mkdtempForTestSync('agent-device-trace-runtime-');
+  const sessionStore = new SessionStore(
+    path.join(root, 'sessions'),
+    createLiveTestHostEnvironment(),
+  );
+  const session: SessionState = {
+    name: 'trace-session',
+    device: {
+      platform: 'android',
+      id: 'emulator-5554',
+      name: 'Android',
+      kind: 'emulator',
+      booted: true,
+    },
+    createdAt: Date.now(),
+    actions: [],
+  };
+  sessionStore.publish(session.name, session);
+  return { root, session, sessionStore };
+}
+
+function request(positionals: string[], clientOutPath?: string): DaemonRequest {
+  return {
+    token: 'token',
+    session: 'trace-session',
+    command: 'trace',
+    positionals,
+    flags: {},
+    ...(clientOutPath ? { meta: { clientArtifactPaths: { outPath: clientOutPath } } } : {}),
+  };
+}
+
+test('starts and stops one trace through the session-owned trace slot', () => {
+  const { session, sessionStore } = fixture();
+  const start = handleTraceCommand({
+    host: createTestHostEnvironment(),
+    req: request(['start']),
+    sessionName: session.name,
+    sessionStore,
+  });
+  const startedPath = session.trace?.outPath;
+  expect(startedPath).toMatch(/trace-session-.*\.trace\.log$/);
+  expect(start).toMatchObject({ ok: true, data: { trace: 'started', outPath: startedPath } });
+
+  const stop = handleTraceCommand({
+    host: createTestHostEnvironment(),
+    req: request(['stop']),
+    sessionName: session.name,
+    sessionStore,
+  });
+  expect(stop).toMatchObject({ ok: true, data: { trace: 'stopped' } });
+  expect(session.trace).toBeUndefined();
+});
+
+test('relocates trace output and projects the client artifact path', () => {
+  const { root, session, sessionStore } = fixture();
+  const original = path.join(root, 'original.trace');
+  const relocated = path.join(root, 'relocated.trace');
+  const client = '/client/trace.json';
+  handleTraceCommand({
+    host: createTestHostEnvironment(),
+    req: request(['start', original]),
+    sessionName: session.name,
+    sessionStore,
+  });
+
+  const stop = handleTraceCommand({
+    host: createTestHostEnvironment(),
+    req: request(['stop', relocated], client),
+    sessionName: session.name,
+    sessionStore,
+  });
+  expect(fs.existsSync(original)).toBe(false);
+  expect(fs.existsSync(relocated)).toBe(true);
+  expect(stop).toMatchObject({
+    ok: true,
+    data: {
+      outPath: relocated,
+      artifacts: [{ path: relocated, localPath: client, fileName: 'trace.json' }],
+    },
+  });
+});
+
+test('resolves relative trace paths against the caller cwd, not the daemon cwd', () => {
+  const { root, session, sessionStore } = fixture();
+  const callerCwd = path.join(root, 'caller');
+  const host = createTestHostEnvironment({ cwd: path.join(root, 'daemon') });
+  const withCallerCwd = (positionals: string[]): DaemonRequest => ({
+    ...request(positionals),
+    meta: { cwd: callerCwd },
+  });
+
+  handleTraceCommand({
+    host,
+    req: withCallerCwd(['start', 'started.trace']),
+    sessionName: session.name,
+    sessionStore,
+  });
+  expect(session.trace?.outPath).toBe(path.join(callerCwd, 'started.trace'));
+
+  const stop = handleTraceCommand({
+    host,
+    req: withCallerCwd(['stop', 'moved.trace']),
+    sessionName: session.name,
+    sessionStore,
+  });
+  expect(stop).toMatchObject({ ok: true, data: { outPath: path.join(callerCwd, 'moved.trace') } });
+  expect(fs.existsSync(path.join(callerCwd, 'moved.trace'))).toBe(true);
+});
+
+// #1900: `trace` never binds a device runtime (no `bindDevice`/`inspectFacts` call anywhere in
+// `handleTraceCommand`), so its session-scoped start/stop bookkeeping works identically for a web
+// session as it does for the android fixture every other test in this file uses.
+test('starts and stops one trace through the session-owned trace slot on a web session', () => {
+  const { session, sessionStore } = fixture();
+  session.device = {
+    platform: 'web',
+    id: 'agent-browser-chrome',
+    name: 'Agent Browser Chrome',
+    kind: 'device',
+  };
+  const start = handleTraceCommand({
+    host: createTestHostEnvironment(),
+    req: request(['start']),
+    sessionName: session.name,
+    sessionStore,
+  });
+  const startedPath = session.trace?.outPath;
+  expect(startedPath).toMatch(/trace-session-.*\.trace\.log$/);
+  expect(start).toMatchObject({ ok: true, data: { trace: 'started', outPath: startedPath } });
+
+  const stop = handleTraceCommand({
+    host: createTestHostEnvironment(),
+    req: request(['stop']),
+    sessionName: session.name,
+    sessionStore,
+  });
+  expect(stop).toMatchObject({ ok: true, data: { trace: 'stopped' } });
+  expect(session.trace).toBeUndefined();
+});
+
+test('rejects invalid actions, missing sessions, and incoherent lifecycle transitions', () => {
+  const { session, sessionStore } = fixture();
+  expect(
+    handleTraceCommand({
+      host: createTestHostEnvironment(),
+      req: request(['pause']),
+      sessionName: session.name,
+      sessionStore,
+    }),
+  ).toMatchObject({ ok: false, error: { code: 'INVALID_ARGS' } });
+  expect(
+    handleTraceCommand({
+      host: createTestHostEnvironment(),
+      req: request(['start']),
+      sessionName: 'missing',
+      sessionStore,
+    }),
+  ).toMatchObject({ ok: false, error: { code: 'SESSION_NOT_FOUND' } });
+  expect(
+    handleTraceCommand({
+      host: createTestHostEnvironment(),
+      req: request(['stop']),
+      sessionName: session.name,
+      sessionStore,
+    }),
+  ).toMatchObject({ ok: false, error: { message: 'no active trace' } });
+
+  handleTraceCommand({
+    host: createTestHostEnvironment(),
+    req: request(['start']),
+    sessionName: session.name,
+    sessionStore,
+  });
+  expect(
+    handleTraceCommand({
+      host: createTestHostEnvironment(),
+      req: request(['start']),
+      sessionName: session.name,
+      sessionStore,
+    }),
+  ).toMatchObject({ ok: false, error: { message: 'trace already in progress' } });
+});

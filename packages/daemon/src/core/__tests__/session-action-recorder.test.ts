@@ -1,0 +1,999 @@
+import { isSessionRecording } from '../session-script-publication-capability.ts';
+/**
+ * #1271 stage 2 (ADR 0012 amendment): `recordActionEntry`'s repair-segment
+ * default exclusion — the single daemon-side choke point every recording
+ * surface (CLI/Node client/MCP) funnels through via `SessionStore.recordAction`.
+ * Isolates the mechanism itself from the classification wiring
+ * (`selector-recording.test.ts` covers which commands set `interactiveObservation`).
+ */
+import { test, expect } from 'vitest';
+import {
+  isInteractiveObservation,
+  recordActionEntry,
+  type RecordActionEntry,
+} from '../session-action-recorder.ts';
+import { authoringPublication, makeIosSession } from '../../__tests__/support/session-factories.ts';
+import { createLiveTestHostEnvironment } from '@agent-device/test-kit';
+
+// #3753: `recordActionEntry` resolves relative --save-script paths against the runtime host's
+// working directory. This wrapper keeps the pre-#3753 call shape: the live test host's cwd rides
+// in as the third argument without reshaping every fixture below.
+function recordAction(
+  session: Parameters<typeof recordActionEntry>[0],
+  entry: Parameters<typeof recordActionEntry>[1],
+) {
+  return recordActionEntry(session, entry, createLiveTestHostEnvironment().cwd);
+}
+
+test.each([
+  { command: 'wait', replayPlanStep: false, intent: undefined },
+  { command: 'diff', replayPlanStep: false, intent: undefined },
+  { command: 'snapshot', replayPlanStep: false, intent: undefined },
+  { command: 'snapshot', replayPlanStep: true, intent: 'authored' },
+])(
+  'publication intent for $command with replayPlanStep=$replayPlanStep',
+  ({ command, replayPlanStep, intent }) => {
+    const session = makeIosSession('default');
+    const req = {
+      token: 't',
+      session: 'default',
+      command,
+      positionals: [],
+      internal: { replayPlanStep },
+    };
+    const action = recordAction(session, {
+      command,
+      positionals: [],
+      flags: {},
+      interactiveObservation: isInteractiveObservation(req),
+    });
+
+    expect(action).toBeDefined();
+    expect(action?.publicationIntent).toBe(intent);
+  },
+);
+
+test('an observation without --record is excluded while repair-armed', () => {
+  const session = makeIosSession('default', {
+    scriptPublication: {
+      kind: 'repair',
+      status: 'armed',
+      target: { kind: 'default', force: false },
+      boundary: 0,
+    },
+  });
+  const action = recordAction(session, {
+    command: 'get',
+    positionals: ['attrs', 'id="save"'],
+    flags: {},
+    result: {},
+    interactiveObservation: true,
+  });
+  expect(action).toBeUndefined();
+  expect(session.actions).toHaveLength(0);
+});
+
+test('--record forces an observation-only action through while repair-armed', () => {
+  const session = makeIosSession('default', {
+    scriptPublication: {
+      kind: 'repair',
+      status: 'armed',
+      target: { kind: 'default', force: false },
+      boundary: 0,
+    },
+  });
+  const action = recordAction(session, {
+    command: 'get',
+    positionals: ['attrs', 'id="save"'],
+    flags: { record: true },
+    result: {},
+    interactiveObservation: true,
+  });
+  expect(action).toBeDefined();
+  expect(action?.flags.record).toBe(true);
+  expect(action?.publicationIntent).toBe('explicit-record');
+  expect(session.actions.map((a) => a.command)).toEqual(['get']);
+});
+
+test('an observation-only action records normally outside a repair-armed session (ordinary authoring recording is unchanged)', () => {
+  const session = makeIosSession('default');
+  expect(session.scriptPublication).toBeUndefined();
+  const action = recordAction(session, {
+    command: 'is',
+    positionals: ['visible', 'id="save"'],
+    flags: {},
+    result: {},
+    interactiveObservation: true,
+  });
+  expect(action).toBeDefined();
+  expect(session.actions.map((a) => a.command)).toEqual(['is']);
+});
+
+test('ordinary action history preserves authored commands, positionals, and replay flags', () => {
+  const session = makeIosSession('default');
+  const entries = [
+    { command: 'hover', positionals: ['@e4'], flags: {}, result: {} },
+    { command: 'click', positionals: ['@e4'], flags: {}, result: {} },
+    {
+      command: 'fill',
+      positionals: ['@e3', 'qa@example.test'],
+      flags: { delayMs: 1 },
+      result: {},
+    },
+    { command: 'type', positionals: [' ok'], flags: {}, result: {} },
+    { command: 'pan', positionals: ['195', '320'], flags: { pointerCount: 2 }, result: {} },
+    { command: 'tv-remote', positionals: ['select'], flags: {}, result: {} },
+    { command: 'fold', positionals: [], flags: { keyframes: 'fold.json' }, result: {} },
+    {
+      command: 'trigger-app-event',
+      positionals: ['screenshot_taken'],
+      flags: {},
+      result: {},
+    },
+    { command: 'back', positionals: [], flags: {}, result: {} },
+    { command: 'home', positionals: [], flags: {}, result: {} },
+  ] satisfies RecordActionEntry[];
+
+  for (const entry of entries)
+    recordActionEntry(session, entry, createLiveTestHostEnvironment().cwd);
+
+  expect(
+    session.actions.map(({ command, positionals, flags }) => ({ command, positionals, flags })),
+  ).toEqual(entries.map(({ command, positionals, flags }) => ({ command, positionals, flags })));
+});
+
+test('a mutating action is never excluded, repair-armed or not', () => {
+  const session = makeIosSession('default', {
+    scriptPublication: {
+      kind: 'repair',
+      status: 'armed',
+      target: { kind: 'default', force: false },
+      boundary: 0,
+    },
+  });
+  const action = recordAction(session, {
+    command: 'press',
+    positionals: ['@e5'],
+    flags: {},
+    result: {},
+  });
+  expect(action).toBeDefined();
+  expect(session.actions.map((a) => a.command)).toEqual(['press']);
+});
+
+test('a command explicitly marked NOT observation-only (e.g. the top-level `wait`) always records, even while repair-armed', () => {
+  const session = makeIosSession('default', {
+    scriptPublication: {
+      kind: 'repair',
+      status: 'armed',
+      target: { kind: 'default', force: false },
+      boundary: 0,
+    },
+  });
+  const action = recordAction(session, {
+    command: 'wait',
+    positionals: ['500'],
+    flags: {},
+    result: {},
+    interactiveObservation: false,
+  });
+  expect(action).toBeDefined();
+  expect(session.actions.map((a) => a.command)).toEqual(['wait']);
+});
+
+test('--no-record still takes precedence over an observation-only action, repair-armed or not', () => {
+  const session = makeIosSession('default', {
+    scriptPublication: {
+      kind: 'repair',
+      status: 'armed',
+      target: { kind: 'default', force: false },
+      boundary: 0,
+    },
+  });
+  const action = recordAction(session, {
+    command: 'get',
+    positionals: ['attrs', 'id="save"'],
+    flags: { noRecord: true },
+    result: {},
+    interactiveObservation: true,
+  });
+  expect(action).toBeUndefined();
+  expect(session.actions).toHaveLength(0);
+});
+
+test('--no-record suppresses a mutating coordinate press from action history', () => {
+  const session = makeIosSession('default');
+  const action = recordAction(session, {
+    command: 'press',
+    positionals: ['50', '60'],
+    flags: { noRecord: true },
+    result: { x: 50, y: 60 },
+  });
+
+  expect(action).toBeUndefined();
+  expect(session.actions).toHaveLength(0);
+});
+
+test('parameterized fills keep literals out of recording state with deterministic placeholders', () => {
+  const session = makeIosSession('default');
+  const password = 'literal-password-1348';
+  const token = 'literal-token-1348';
+  const passwordEntry = {
+    command: 'fill',
+    positionals: ['id="password"', password],
+    flags: { recordAs: 'PASSWORD' },
+    result: {
+      text: password,
+      message: `Filled ${password}`,
+      selector: 'id="password"',
+      selectorChain: ['id="password"', `value="${password}" editable=true`],
+      settle: {
+        diff: {
+          lines: [{ kind: 'added', text: `value=${password}` }],
+        },
+      },
+    },
+    targetEvidence: {
+      role: 'textinput',
+      label: password,
+      ancestry: [{ role: 'form', label: 'Credentials' }],
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified' as const,
+    },
+  };
+
+  recordActionEntry(session, passwordEntry, createLiveTestHostEnvironment().cwd);
+  recordActionEntry(session, passwordEntry, createLiveTestHostEnvironment().cwd);
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="token"', token],
+    flags: { recordAs: 'API_TOKEN' },
+    result: { text: token, message: 'Filled 18 chars' },
+  });
+
+  expect(session.actions.map((action) => action.positionals.at(-1))).toEqual([
+    '${PASSWORD}',
+    '${PASSWORD}',
+    '${API_TOKEN}',
+  ]);
+  const serialized = JSON.stringify(session.actions);
+  expect(serialized).not.toContain(password);
+  expect(serialized).not.toContain(token);
+  expect(session.actions[0]?.result?.text).toBe('${PASSWORD}');
+  expect(session.actions[0]?.result?.message).toBe('Filled ${PASSWORD}');
+  expect(session.actions[0]?.result?.selector).toBe('id="password"');
+  expect(session.actions[0]?.targetEvidence?.label).toBe('${PASSWORD}');
+  expect(session.actions[0]?.targetEvidence?.ancestry[0]?.label).toBe('Credentials');
+  expect(session.actions[0]?.result?.selectorChain).toEqual(['id="password"']);
+  expect(session.actions[0]?.result?.settle).toEqual({
+    diff: {
+      lines: [{ kind: 'added', text: 'value=${PASSWORD}' }],
+    },
+  });
+});
+
+test('a one-character parameterized fill preserves structural selector provenance', () => {
+  const session = makeIosSession('default');
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', 'a'],
+    flags: { recordAs: 'LETTER' },
+    result: {
+      text: 'a',
+      message: 'Already safe',
+      selector: 'id="password"',
+      selectorChain: ['id="password"', 'label="Account"', 'value="a" editable=true'],
+    },
+    targetEvidence: {
+      role: 'textinput',
+      label: 'Password',
+      ancestry: [{ role: 'form', label: 'Credentials area' }],
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified',
+    },
+  });
+
+  expect(session.actions[0]).toMatchObject({
+    positionals: ['id="password"', '${LETTER}'],
+    result: {
+      text: '${LETTER}',
+      message: 'Alre${LETTER}dy s${LETTER}fe',
+      selector: 'id="password"',
+      selectorChain: ['id="password"', 'label="Account"'],
+    },
+    targetEvidence: {
+      label: 'Password',
+      ancestry: [{ role: 'form', label: 'Credentials area' }],
+    },
+  });
+});
+
+test.each(['', '   '])(
+  'parameterized fills preserve the placeholder when the resolved value is %j',
+  (value) => {
+    const session = makeIosSession('default');
+    recordAction(session, {
+      command: 'fill',
+      positionals: ['id="password"', value],
+      flags: { recordAs: 'PASSWORD' },
+      result: { text: value },
+    });
+
+    expect(session.actions[0]?.positionals).toEqual(['id="password"', '${PASSWORD}']);
+    expect(session.actions[0]?.result?.text).toBe('${PASSWORD}');
+  },
+);
+
+test('an empty parameterized clear rewrites only its own text, never other empty fields', () => {
+  // `fill <target> "" --record-as VAR` (#2063): the empty literal matches inside every string,
+  // so it must redact nothing beyond the fill's own semantic text — an unrelated empty field or
+  // empty evidence label is not an echo of the (empty) value.
+  const session = makeIosSession('default');
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="search"', ''],
+    flags: { recordAs: 'QUERY' },
+    result: {
+      text: '',
+      message: 'Filled 0 chars',
+      selector: 'id="search"',
+      backend: { detail: '' },
+    },
+    targetEvidence: {
+      role: 'textinput',
+      label: '',
+      ancestry: [{ role: 'form', label: '' }],
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified',
+    },
+  });
+
+  expect(session.actions[0]).toMatchObject({
+    positionals: ['id="search"', '${QUERY}'],
+    result: {
+      text: '${QUERY}',
+      message: 'Filled 0 chars',
+      selector: 'id="search"',
+      backend: { detail: '' },
+    },
+    targetEvidence: {
+      label: '',
+      ancestry: [{ role: 'form', label: '' }],
+    },
+  });
+  // The empty literal is never registered for session-wide echo protection either.
+  expect(session.recordedFillLiterals?.has('') ?? false).toBe(false);
+});
+
+test('whitespace-only fills collapse ambiguous recorder output and keys', () => {
+  const session = makeIosSession('default');
+  const whitespace = '   ';
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', whitespace],
+    flags: { recordAs: 'PASSWORD' },
+    result: {
+      text: whitespace,
+      message: `prefix${whitespace}suffix`,
+      backend: {
+        [`key${whitespace}tail`]: `value${whitespace}tail`,
+      },
+      selectorChain: ['id="password"', `value="prefix${whitespace}suffix"`],
+    },
+  });
+
+  expect(session.actions[0]?.result).toEqual({
+    text: '${PASSWORD}',
+    message: '${PASSWORD}',
+    backend: {
+      '${PASSWORD}': '${PASSWORD}',
+    },
+    selectorChain: ['id="password"'],
+  });
+  expect(JSON.stringify(session.actions)).not.toContain(whitespace);
+});
+
+test('#1533: the --save-script ingress does not re-arm an aborted authoring lifecycle', () => {
+  const session = makeIosSession('s', {
+    // What `abortAuthoringOnSecondOpen` leaves behind: a terminal status, which
+    // is by itself what stops the session recording.
+    scriptPublication: authoringPublication('aborted'),
+  });
+
+  // The second `open --save-script` records its own action, carrying the flag
+  // that caused the abort into the recorder's shared ingress.
+  recordAction(session, {
+    command: 'open',
+    positionals: ['com.example.other'],
+    flags: { saveScript: true },
+  });
+
+  expect(isSessionRecording(session)).toBe(false);
+  expect(session.scriptPublication).toEqual(authoringPublication('aborted'));
+});
+
+test('#1533: an aborted lifecycle cannot be retargeted by a later --save-script=<path> either', () => {
+  const session = makeIosSession('s', {
+    scriptPublication: authoringPublication('aborted', { path: '/tmp/original.ad' }),
+  });
+
+  recordAction(session, {
+    command: 'open',
+    positionals: ['com.example.other'],
+    flags: { saveScript: '/tmp/hijacked.ad', force: true },
+  });
+
+  expect(isSessionRecording(session)).toBe(false);
+  expect(session.scriptPublication).toEqual(
+    authoringPublication('aborted', { path: '/tmp/original.ad' }),
+  );
+});
+
+test('#1533: an ARMED authoring lifecycle still takes the ingress (retarget + force unchanged)', () => {
+  const session = makeIosSession('s', {
+    scriptPublication: authoringPublication('armed'),
+  });
+
+  recordAction(session, {
+    command: 'close',
+    positionals: [],
+    flags: { saveScript: '/tmp/out.ad', force: true },
+  });
+
+  expect(isSessionRecording(session)).toBe(true);
+  expect(session.scriptPublication).toEqual(
+    authoringPublication('armed', { path: '/tmp/out.ad', force: true }),
+  );
+});
+
+// #1398: session-scoped echo protection. A LATER, unrelated action can
+// independently observe an app-rendered echo of an earlier parameterized
+// fill's literal (its own displayed value, a search result, a confirmation
+// label, a caller-authored destination landmark). These tests prove the
+// echo never reaches `session.actions` regardless of which later command
+// records it, while never falsely claiming replay-verified identity.
+
+test('#1398: a landmark-mode wait recorded after a parameterized fill drops identity evidence that echoes the literal', () => {
+  const session = makeIosSession('default');
+  const literal = 'hunter2-secret';
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', literal],
+    flags: { recordAs: 'PASSWORD' },
+    result: { text: literal },
+  });
+  recordAction(session, {
+    command: 'wait',
+    positionals: ['role="heading"'],
+    flags: {},
+    result: { waitedMs: 12, text: `Welcome, ${literal}`, hint: `matched Welcome, ${literal}` },
+    targetEvidence: {
+      role: 'heading',
+      label: `Welcome, ${literal}`,
+      ancestry: [{ role: 'window' }],
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified',
+    },
+    targetEvidenceMode: 'landmark',
+  });
+
+  const wait = session.actions[1];
+  expect(wait?.command).toBe('wait');
+  expect(wait?.targetEvidence).toBeUndefined();
+  expect(wait?.result).toEqual({
+    waitedMs: 12,
+    text: 'Welcome, ${PASSWORD}',
+    hint: 'matched Welcome, ${PASSWORD}',
+  });
+  expect(JSON.stringify(session.actions)).not.toContain(literal);
+});
+
+test('#1398: a landmark-mode wait drops identity evidence when the echo is only in the ancestry chain', () => {
+  const session = makeIosSession('default');
+  const literal = 'hunter2-secret';
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', literal],
+    flags: { recordAs: 'PASSWORD' },
+    result: { text: literal },
+  });
+  recordAction(session, {
+    command: 'wait',
+    positionals: ['role="button" label="Continue"'],
+    flags: {},
+    result: { waitedMs: 5 },
+    targetEvidence: {
+      role: 'button',
+      label: 'Continue',
+      ancestry: [{ role: 'group', label: `Signed in as ${literal}` }],
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified',
+    },
+    targetEvidenceMode: 'landmark',
+  });
+
+  expect(session.actions[1]?.targetEvidence).toBeUndefined();
+});
+
+test('#1398: action-mode evidence (get/is) redacts an echoed label and downgrades to unverifiable instead of dropping required identity evidence', () => {
+  const session = makeIosSession('default');
+  const literal = 'hunter2-secret';
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', literal],
+    flags: { recordAs: 'PASSWORD' },
+    result: { text: literal },
+  });
+  recordAction(session, {
+    command: 'is',
+    positionals: ['visible', 'id="password"'],
+    flags: {},
+    result: {},
+    targetEvidence: {
+      role: 'textinput',
+      label: `Password: ${literal}`,
+      ancestry: [{ role: 'form', label: 'Credentials' }],
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified',
+    },
+  });
+
+  expect(session.actions[1]?.targetEvidence).toEqual({
+    role: 'textinput',
+    label: 'Password: ${PASSWORD}',
+    ancestry: [{ role: 'form', label: 'Credentials' }],
+    sibling: 0,
+    viewportOrder: 0,
+    verification: 'unverifiable',
+  });
+  expect(JSON.stringify(session.actions)).not.toContain(literal);
+});
+
+test('#1398: action-mode evidence redacts EVERY registered literal echoed in the same label, not just the first match', () => {
+  const session = makeIosSession('default');
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="username"', 'bob'],
+    flags: { recordAs: 'USERNAME' },
+    result: { text: 'bob' },
+  });
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', 'hunter2-secret'],
+    flags: { recordAs: 'PASSWORD' },
+    result: { text: 'hunter2-secret' },
+  });
+  recordAction(session, {
+    command: 'is',
+    positionals: ['visible', 'id="session-banner"'],
+    flags: {},
+    result: {},
+    targetEvidence: {
+      role: 'text',
+      label: 'Signed in as bob, session hunter2-secret',
+      ancestry: [],
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified',
+    },
+  });
+
+  expect(session.actions[2]?.targetEvidence).toEqual({
+    role: 'text',
+    label: 'Signed in as ${USERNAME}, session ${PASSWORD}',
+    ancestry: [],
+    sibling: 0,
+    viewportOrder: 0,
+    verification: 'unverifiable',
+  });
+  const serialized = JSON.stringify(session.actions);
+  expect(serialized).not.toContain('bob');
+  expect(serialized).not.toContain('hunter2-secret');
+});
+
+test('#1398: two distinct --record-as names sharing the same literal value deterministically keep the first-registered name', () => {
+  const session = makeIosSession('default');
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', 'hunter2'],
+    flags: { recordAs: 'PASSWORD' },
+    result: { text: 'hunter2' },
+  });
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="confirm"', 'hunter2'],
+    flags: { recordAs: 'CONFIRM_PASSWORD' },
+    result: { text: 'hunter2' },
+  });
+  recordAction(session, {
+    command: 'wait',
+    positionals: ['id="confirmation-banner"'],
+    flags: {},
+    result: { waitedMs: 1, text: 'Passwords match: hunter2' },
+  });
+
+  expect(session.actions[2]?.result).toEqual({
+    waitedMs: 1,
+    text: 'Passwords match: ${PASSWORD}',
+  });
+  expect(JSON.stringify(session.actions)).not.toContain('hunter2');
+});
+
+// #1398 review fix: a naive sequential per-pair pass can corrupt an EARLIER
+// pair's just-inserted placeholder when a LATER pair's literal happens to be
+// a substring of it. Register `somethinglong -> ${ABC}` then `ABC ->
+// ${OTHER}` (a --record-as name that collides with an unrelated variable's
+// own literal value): a later echo of "somethinglong" must become exactly
+// `${ABC}`, never the corrupted `${${OTHER}}` a naive second full-string pass
+// over the already-rewritten text would produce.
+test('#1398: redacting one literal never corrupts a placeholder another literal already produced (result payload)', () => {
+  const session = makeIosSession('default');
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="field-one"', 'somethinglong'],
+    flags: { recordAs: 'ABC' },
+    result: { text: 'somethinglong' },
+  });
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="field-two"', 'ABC'],
+    flags: { recordAs: 'OTHER' },
+    result: { text: 'ABC' },
+  });
+  recordAction(session, {
+    command: 'wait',
+    positionals: ['id="confirmation-banner"'],
+    flags: {},
+    result: { waitedMs: 1, text: 'Echo: somethinglong' },
+  });
+
+  expect(session.actions[2]?.result).toEqual({ waitedMs: 1, text: 'Echo: ${ABC}' });
+  const serialized = JSON.stringify(session.actions);
+  expect(serialized).not.toContain('somethinglong');
+  expect(serialized).not.toContain('${${OTHER}}');
+});
+
+test('#1398: redacting one literal never corrupts a placeholder another literal already produced (action-mode target evidence)', () => {
+  const session = makeIosSession('default');
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="field-one"', 'somethinglong'],
+    flags: { recordAs: 'ABC' },
+    result: { text: 'somethinglong' },
+  });
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="field-two"', 'ABC'],
+    flags: { recordAs: 'OTHER' },
+    result: { text: 'ABC' },
+  });
+  recordAction(session, {
+    command: 'is',
+    positionals: ['visible', 'id="confirmation-banner"'],
+    flags: {},
+    result: {},
+    targetEvidence: {
+      role: 'text',
+      label: 'Echo: somethinglong',
+      ancestry: [],
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified',
+    },
+  });
+
+  expect(session.actions[2]?.targetEvidence).toEqual({
+    role: 'text',
+    label: 'Echo: ${ABC}',
+    ancestry: [],
+    sibling: 0,
+    viewportOrder: 0,
+    verification: 'unverifiable',
+  });
+  const serialized = JSON.stringify(session.actions);
+  expect(serialized).not.toContain('somethinglong');
+  expect(serialized).not.toContain('${${OTHER}}');
+});
+
+// #1398 review fix: a registered literal is matched BEFORE checking whether
+// an existing placeholder token starts at the current position, so a typed
+// value that itself happens to look like `${SOMETHING}` is still redacted
+// rather than being skipped as if it were already-parameterized text.
+test('#1398: a literal whose own text is shaped like an existing placeholder is still redacted', () => {
+  const session = makeIosSession('default');
+  const literal = '${OTHERVAR}';
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="field"', literal],
+    flags: { recordAs: 'TOKEN' },
+    result: { text: literal },
+  });
+  recordAction(session, {
+    command: 'wait',
+    positionals: ['id="confirmation-banner"'],
+    flags: {},
+    result: { waitedMs: 1, text: `Echo: ${literal}` },
+  });
+
+  expect(session.actions[1]?.result).toEqual({ waitedMs: 1, text: 'Echo: ${TOKEN}' });
+  expect(JSON.stringify(session.actions)).not.toContain('OTHERVAR');
+});
+
+test('#1398: dual-endpoint (targetEvidences) evidence is protected independently per endpoint', () => {
+  const session = makeIosSession('default');
+  const literal = 'hunter2-secret';
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', literal],
+    flags: { recordAs: 'PASSWORD' },
+    result: { text: literal },
+  });
+  recordAction(session, {
+    command: 'drag',
+    positionals: ['id="source"', 'id="dest"'],
+    flags: {},
+    result: {},
+    targetEvidences: {
+      source: {
+        role: 'button',
+        label: 'Drag me',
+        ancestry: [],
+        sibling: 0,
+        viewportOrder: 0,
+        verification: 'verified',
+      },
+      destination: {
+        role: 'dropzone',
+        label: literal,
+        ancestry: [],
+        sibling: 0,
+        viewportOrder: 0,
+        verification: 'verified',
+      },
+    },
+  });
+
+  const drag = session.actions[1];
+  expect(drag?.targetEvidences?.source).toEqual({
+    role: 'button',
+    label: 'Drag me',
+    ancestry: [],
+    sibling: 0,
+    viewportOrder: 0,
+    verification: 'verified',
+  });
+  expect(drag?.targetEvidences?.destination).toEqual({
+    role: 'dropzone',
+    label: '${PASSWORD}',
+    ancestry: [],
+    sibling: 0,
+    viewportOrder: 0,
+    verification: 'unverifiable',
+  });
+});
+
+test('#1398: multiple registered literals apply longest-first so a shorter value never partially consumes a longer one', () => {
+  const session = makeIosSession('default');
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', 'bob123'],
+    flags: { recordAs: 'PASSWORD' },
+    result: { text: 'bob123' },
+  });
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="username"', 'bob'],
+    flags: { recordAs: 'USERNAME' },
+    result: { text: 'bob' },
+  });
+  recordAction(session, {
+    command: 'wait',
+    positionals: ['text="Welcome bob123!"'],
+    flags: {},
+    result: { waitedMs: 1, text: 'Welcome bob123!' },
+  });
+
+  expect(session.actions[2]?.result).toEqual({ waitedMs: 1, text: 'Welcome ${PASSWORD}!' });
+});
+
+test('#1398: a whitespace-only --record-as value keeps only fill-step-scoped protection (not registered session-wide)', () => {
+  const session = makeIosSession('default');
+  const whitespace = '   ';
+
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', whitespace],
+    flags: { recordAs: 'PASSWORD' },
+    result: { text: whitespace },
+  });
+  expect(session.recordedFillLiterals).toBeUndefined();
+
+  recordAction(session, {
+    command: 'wait',
+    positionals: ['text="a b c"'],
+    flags: {},
+    result: { waitedMs: 1, text: 'a b c' },
+  });
+
+  expect(session.actions[1]?.result).toEqual({ waitedMs: 1, text: 'a b c' });
+});
+
+test('#1398: ordinary recordings with no --record-as fill are completely unaffected', () => {
+  const session = makeIosSession('default');
+  recordAction(session, {
+    command: 'wait',
+    positionals: ['role="heading" label="Home"'],
+    flags: {},
+    result: { waitedMs: 2, text: 'Home' },
+    targetEvidence: {
+      role: 'heading',
+      label: 'Home',
+      ancestry: [],
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified',
+    },
+    targetEvidenceMode: 'landmark',
+  });
+
+  expect(session.recordedFillLiterals).toBeUndefined();
+  expect(session.actions[0]?.targetEvidence).toEqual({
+    role: 'heading',
+    label: 'Home',
+    ancestry: [],
+    sibling: 0,
+    viewportOrder: 0,
+    verification: 'verified',
+  });
+});
+
+test('a stdin fill without --record-as never enters recording state', () => {
+  const session = makeIosSession('default');
+  const secret = 'stdin-secret-3260';
+  const action = recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', secret],
+    flags: { textStdin: true },
+    result: { text: secret },
+  });
+
+  expect(action).toBeUndefined();
+  expect(session.actions).toHaveLength(0);
+  expect(session.recordedFillLiterals).toBeUndefined();
+});
+
+test('a stdin fill with --record-as is recorded as its ${VAR} placeholder', () => {
+  const session = makeIosSession('default');
+  const secret = 'stdin-secret-3260';
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="password"', secret],
+    flags: { textStdin: true, recordAs: 'PASSWORD' },
+    result: { text: secret },
+  });
+
+  expect(session.actions).toHaveLength(1);
+  expect(session.actions[0]?.positionals).toEqual(['id="password"', '${PASSWORD}']);
+  expect(JSON.stringify(session.actions)).not.toContain(secret);
+});
+
+test('an action lists only the placeholders echo protection actually wrote as live', () => {
+  const session = makeIosSession('default', { scriptPublication: authoringPublication('armed') });
+  for (const [literal, recordAs] of [
+    ['foo', 'FOO'],
+    ['foobar', 'FOOBAR'],
+  ] as const) {
+    recordAction(session, {
+      command: 'fill',
+      positionals: ['id="field"', literal],
+      flags: { recordAs },
+      result: { text: literal },
+    });
+  }
+  const echo = recordAction(session, {
+    command: 'click',
+    positionals: ['@e3'],
+    flags: {},
+    result: { refLabel: 'Hello foobar ${FOO}' },
+  });
+
+  expect(echo?.result?.refLabel).toBe('Hello ${FOOBAR} ${FOO}');
+  expect(echo?.livePlaceholders).toEqual(['FOOBAR']);
+});
+
+test('a literal echoed only as an object key does not make its placeholder live', () => {
+  const session = makeIosSession('default', { scriptPublication: authoringPublication('armed') });
+  recordAction(session, {
+    command: 'fill',
+    positionals: ['id="field"', 'foo'],
+    flags: { recordAs: 'FOO' },
+    result: { text: 'foo' },
+  });
+  const echo = recordAction(session, {
+    command: 'click',
+    positionals: ['@e3'],
+    flags: {},
+    result: { attributes: { foo: 'bar' } },
+  });
+
+  expect(echo?.result?.attributes).toEqual({ '${FOO}': 'bar' });
+  expect(echo?.livePlaceholders ?? []).toEqual([]);
+});
+test.each(['field', 'payload', 'multi'])(
+  'echo placeholders fit the %s annotation when written',
+  async (scenario) => {
+    const { formatPortableActionLine, formatTargetAnnotationLines, parseReplayScriptDetailed } =
+      await import('@agent-device/ad-script');
+    const session = makeIosSession('default');
+    recordAction(session, {
+      command: 'fill',
+      positionals: ['id="input"', 'bob'],
+      flags: { recordAs: 'USERNAME' },
+      result: {},
+    });
+    const common = {
+      role: 'button',
+      sibling: 0,
+      viewportOrder: 0,
+      verification: 'verified' as const,
+    };
+    const fieldEvidence = { ...common, id: 'field', label: `${'x'.repeat(253)}bob`, ancestry: [] };
+    const payloadEvidence = {
+      ...common,
+      id: 'payload',
+      label: 'bob',
+      ancestry: Array.from({ length: 8 }, () => ({ role: 'group', label: '\\'.repeat(220) })),
+      scrollRegion: { role: 'group', label: '\\'.repeat(40) },
+      rect: { x: 0, y: 0, width: 1, height: 1 },
+    };
+    payloadEvidence.scrollRegion.label += 'x'.repeat(
+      4096 - Buffer.byteLength(JSON.stringify(payloadEvidence)),
+    );
+    expect(Buffer.byteLength(fieldEvidence.label)).toBe(256);
+    expect(Buffer.byteLength(JSON.stringify(payloadEvidence))).toBe(4096);
+    const target =
+      scenario === 'multi'
+        ? { targetEvidences: { source: fieldEvidence, destination: payloadEvidence } }
+        : { targetEvidence: scenario === 'field' ? fieldEvidence : payloadEvidence };
+    const selected = recordAction(session, {
+      command: scenario === 'multi' ? 'drag' : 'click',
+      positionals: scenario === 'multi' ? ['id="field"', 'id="payload"'] : ['id="field"'],
+      flags: {},
+      result: {},
+      ...target,
+    })!;
+    const script = [
+      ...formatTargetAnnotationLines(selected),
+      formatPortableActionLine(selected),
+    ].join('\n');
+    const parsed = parseReplayScriptDetailed(script).actions;
+    const evidence =
+      scenario === 'multi' ? parsed[0]?.targetEvidences?.source : parsed[0]?.targetEvidence;
+    if (scenario !== 'payload') {
+      expect(evidence).toMatchObject({ id: 'field', verification: 'unverifiable' });
+      expect(evidence?.label).toBeUndefined();
+    }
+    const payload = scenario === 'multi' ? parsed[0]?.targetEvidences?.destination : evidence;
+    if (scenario !== 'field') {
+      expect(payload).toMatchObject({ id: 'payload', verification: 'unverifiable' });
+      expect(payload?.rect).toBeUndefined();
+      expect(payload?.label).toBe('${USERNAME}');
+    }
+  },
+);

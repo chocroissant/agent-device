@@ -1,0 +1,330 @@
+import { isHandheldAppleDevice, type DeviceInfo } from '@agent-device/kernel/device';
+import type {
+  IosRunnerQualityPayloadFacts,
+  IosSnapshotInput,
+  IosViewportEvidence,
+} from '@agent-device/contracts/ios-snapshot';
+import type { SnapshotOptions } from '@agent-device/contracts/interactor-types';
+import {
+  IosSnapshotEngineError,
+  presentIosRunnerSnapshot,
+  toIosSnapshotEngineErrorDetails,
+} from '@agent-device/capture-kit/ios-snapshot-engine';
+import { interpretIosNode } from '@agent-device/capture-kit/ios-node-interpretation';
+import { resolveIosViewportEvidenceFromRoots } from '@agent-device/capture-kit/ios-snapshot-acquisition';
+import { renderSnapshotQualityWarnings } from '@agent-device/capture-kit/quality-warnings';
+import {
+  isSparseSnapshotQualityVerdict,
+  readSnapshotQualityVerdict,
+} from '@agent-device/capture-kit/snapshot-quality-verdict';
+import {
+  createIosSnapshotRequest,
+  buildIosSnapshotPresentationKey,
+} from '@agent-device/capture-kit/ios-snapshot-planning';
+import { emitDiagnostic } from '@agent-device/host-kit/diagnostics';
+import { AppError } from '@agent-device/kernel/errors';
+import {
+  isRecord,
+  readPresentedSurfaceFact,
+  readSnapshotKeyboardBandFact,
+} from '@agent-device/kernel/record';
+import { isPositiveFiniteRect, snapshotViewportSizeFrom } from '@agent-device/kernel/rect';
+import type {
+  PresentedSurface,
+  RawSnapshotNode,
+  Rect,
+  SnapshotKeyboardBandFact,
+  SnapshotQualityVerdict,
+  SnapshotQualityNote,
+  SnapshotViewportSize,
+  IosTargetActivation,
+  IosSnapshotObservation,
+} from '@agent-device/kernel/snapshot';
+import {
+  iosSystemSurfaceHost,
+  type IosSystemSurfaceProvenance,
+} from '@agent-device/contracts/ios-system-surface';
+import { TARGET_ACTIVATION_WIRE_KEY, readTargetActivationFact } from './target-activation.ts';
+import {
+  attachSnapshotViewportEvidence,
+  readSnapshotObservation,
+  readSnapshotQualityNotes,
+} from '@agent-device/contracts/capture';
+
+export type AppleRunnerSnapshotResult = Readonly<{
+  nodes?: RawSnapshotNode[];
+  truncated?: boolean;
+  message?: string;
+  quality?: SnapshotQualityVerdict;
+  qualityNotes?: SnapshotQualityNote[];
+  qualityPayload?: IosRunnerQualityPayloadFacts;
+  runnerFatal?: boolean;
+  systemSurface?: IosSystemSurfaceProvenance;
+  /**
+   * The runner's own answer about a modal presentation over the app (#3565), read from its capture
+   * payload. The runner classifies the acquisition it is about to present, and only publishes a
+   * reading it can support: a payload with no key is a capture the runner could not decide.
+   */
+  presentedSurface?: PresentedSurface;
+  keyboard?: SnapshotKeyboardBandFact;
+  /** Foreground repair this capture's own command had to perform (#2682). */
+  targetActivation?: IosTargetActivation;
+  observation?: IosSnapshotObservation;
+  viewportEvidence?: IosViewportEvidence;
+}>;
+
+export function readAppleSnapshotResult(
+  result: Record<string, unknown>,
+  device: Pick<DeviceInfo, 'platform' | 'appleOs' | 'target'>,
+): AppleRunnerSnapshotResult {
+  const systemSurface = readSystemSurfaceProvenance(result.systemSurface);
+  const presentedSurface = readPresentedSurfaceFact(result);
+  const keyboard = readSnapshotKeyboardBandFact(result.keyboard);
+  const observation = readSnapshotObservation(result.observation);
+  const targetActivation = readTargetActivationFact(result[TARGET_ACTIVATION_WIRE_KEY], (detail) =>
+    emitDiagnostic({
+      level: 'debug',
+      phase: 'ios_runner_target_activation_prior_state_unmapped',
+      data: detail,
+    }),
+  );
+  const nodes = Array.isArray(result.nodes) ? (result.nodes as RawSnapshotNode[]) : undefined;
+  const qualityPayload = readQualityPayload(result.qualityPayload, systemSurface);
+  const interpret = (node: RawSnapshotNode) =>
+    interpretIosNode(node, { reactNativeValue: isHandheldAppleDevice(device) });
+  return {
+    nodes: nodes?.map(interpret),
+    truncated: typeof result.truncated === 'boolean' ? result.truncated : undefined,
+    quality: readSnapshotQualityVerdict(result.snapshotQuality),
+    qualityNotes: readSnapshotQualityNotes(result.snapshotQualityNotes),
+    qualityPayload: qualityPayload
+      ? { ...qualityPayload, nodes: qualityPayload.nodes.map(interpret) }
+      : qualityPayload,
+    runnerFatal: result.runnerFatal === true,
+    ...(keyboard ? { keyboard } : {}),
+    ...(systemSurface ? { systemSurface } : {}),
+    ...(presentedSurface ? { presentedSurface } : {}),
+    ...(targetActivation ? { targetActivation } : {}),
+    ...(observation ? { observation } : {}),
+    ...(result.snapshotViewport === undefined
+      ? {}
+      : { viewportEvidence: readRunnerViewportEvidence(result.snapshotViewport) }),
+    message:
+      typeof result.message === 'string' && result.message.trim().length > 0
+        ? result.message
+        : undefined,
+  };
+}
+
+function readRunnerViewportEvidence(value: unknown): IosViewportEvidence {
+  if (isRecord(value)) {
+    if (
+      (value.kind === 'reported' || value.kind === 'derived') &&
+      isPositiveFiniteRect(value.rect as Rect | undefined)
+    ) {
+      return { kind: value.kind, rect: value.rect as Rect };
+    }
+    if (
+      value.kind === 'missing' &&
+      (value.reason === 'not-provided' || value.reason === 'invalid')
+    ) {
+      return { kind: 'missing', reason: value.reason };
+    }
+  }
+  return { kind: 'missing', reason: 'invalid' };
+}
+
+function readSystemSurfaceProvenance(value: unknown): IosSystemSurfaceProvenance | undefined {
+  if (!isRecord(value) || typeof value.bundleId !== 'string') return undefined;
+  // The shared registry is the authority for both fields: an unknown bundle id is dropped rather
+  // than surfaced, mirroring the wire-reader discipline elsewhere in this module, and the kind is
+  // read from the registry rather than trusted from the wire.
+  const host = iosSystemSurfaceHost(value.bundleId);
+  return host && { bundleId: host.bundleId, kind: host.kind };
+}
+
+/**
+ * What one Apple runner capture leaves behind after presentation: the presented tree, and the box
+ * its rects are measured in (#3182). The viewport is the evidence the regular fold validated against —
+ * the app's own box when the runner read one, otherwise the largest window root in the payload, which
+ * on tvOS is the screen every `XCUIApplication` rect is measured on — and it is published through the
+ * same guard every other producer passes, so an unusable box stays absent instead of reaching a
+ * reader as zero. A raw projection and a runner-declared failure publish no box: neither had a
+ * viewport checked against its tree, so the roots alone would be a guess. The runner's explicit
+ * acquisition evidence owns screen authority. A root-derived validation box cannot upgrade an
+ * unknown screen origin, even when the local tree has valid geometry.
+ */
+export type AppleRunnerSnapshotPresentation = Readonly<{
+  nodes: RawSnapshotNode[];
+  viewport?: SnapshotViewportSize;
+}>;
+
+export function presentAppleRunnerSnapshot(
+  deviceId: string,
+  options: SnapshotOptions | undefined,
+  result: AppleRunnerSnapshotResult,
+): AppleRunnerSnapshotPresentation {
+  const nodes = result.nodes ?? [];
+  const { authority: viewportEvidence, validation: validationViewport } =
+    runnerViewportEvidence(result);
+  if (result.runnerFatal === true || (nodes.length === 0 && result.qualityPayload === undefined)) {
+    return { nodes };
+  }
+
+  const request = createIosSnapshotRequest({
+    raw: options?.raw,
+    interactiveOnly: options?.interactiveOnly,
+    depth: options?.depth,
+    scope: options?.scope,
+    customActions: options?.customActions,
+  });
+  const input: IosSnapshotInput = {
+    stage: 'presented',
+    presentation: {
+      producer: 'apple-runner',
+      intent: 'full',
+      payload: {
+        nodes,
+        truncated: result.truncated ?? false,
+        ...(result.quality?.effectiveDepth !== undefined
+          ? { effectiveDepth: result.quality.effectiveDepth }
+          : {}),
+      },
+      ...(result.qualityPayload ? { qualityPayload: result.qualityPayload } : {}),
+    },
+    validation: {
+      presentationKey: buildIosSnapshotPresentationKey(request),
+      viewport: validationViewport,
+      hittability: { kind: 'available' },
+      lineage: { targetId: deviceId },
+      residue: [],
+    },
+  };
+
+  try {
+    // The engine returns the box its regular projection validated this payload against and no box
+    // for raw — deriving it here would only repeat that rule (#3182).
+    const presentation = presentIosRunnerSnapshot(input, request);
+    attachSnapshotViewportEvidence(presentation.nodes, viewportEvidence);
+    const validatedViewport =
+      viewportEvidence.kind === 'reported'
+        ? snapshotViewportSizeFrom(presentation.validatedViewport)
+        : undefined;
+    return {
+      nodes: presentation.nodes,
+      ...(validatedViewport ? { viewport: validatedViewport } : {}),
+    };
+  } catch (error) {
+    throwSnapshotPresentationError(error, result);
+  }
+}
+
+/**
+ * A payload the runner itself declared sparse is a quality verdict, not a presentation invariant
+ * violation: no backend served the request, so the payload carries a synthetic root with no viewport
+ * for the daemon to reconstruct. The engine reason stays the reason; the producer's verdict travels
+ * with it, because a bare engine invariant tells the caller neither which backend was asked nor that
+ * the capture was known-incomplete. The advice stays owned by the shared quality-warning renderer, so
+ * a sparse refusal says the same thing here as it does wherever a sparse capture surfaces.
+ */
+function throwSnapshotPresentationError(error: unknown, result: AppleRunnerSnapshotResult): never {
+  const verdict = result.quality;
+  if (error instanceof IosSnapshotEngineError && isSparseSnapshotQualityVerdict(verdict)) {
+    throw new AppError(
+      'COMMAND_FAILED',
+      error.message,
+      {
+        ...toIosSnapshotEngineErrorDetails(error),
+        ...(result.systemSurface ? { systemSurface: result.systemSurface } : {}),
+        snapshotQuality: {
+          state: verdict.state,
+          backend: verdict.backend,
+          ...(verdict.reason ? { reason: verdict.reason } : {}),
+          ...(verdict.reasonCode ? { reasonCode: verdict.reasonCode } : {}),
+        },
+        hint: sparseCaptureHint(result.systemSurface, verdict),
+      },
+      error,
+    );
+  }
+  throwSnapshotEngineError(error, result.systemSurface);
+}
+
+function sparseCaptureHint(
+  systemSurface: IosSystemSurfaceProvenance | undefined,
+  verdict: SnapshotQualityVerdict,
+): string {
+  return [
+    systemSurface
+      ? `${systemSurface.bundleId} hosts the surface presented over the app, and this capture targeted that surface.`
+      : undefined,
+    ...renderSnapshotQualityWarnings(verdict, []),
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join(' ');
+}
+
+function readQualityPayload(
+  value: unknown,
+  systemSurface?: IosSystemSurfaceProvenance,
+): IosRunnerQualityPayloadFacts | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || !Array.isArray(value.nodes) || typeof value.truncated !== 'boolean') {
+    throwSnapshotEngineError(
+      new IosSnapshotEngineError(
+        'invalid-quality-payload',
+        'iOS runner returned an invalid quality payload',
+      ),
+      systemSurface,
+    );
+  }
+  if (value.scope !== undefined && value.scope !== null) {
+    throwSnapshotEngineError(
+      new IosSnapshotEngineError(
+        'invalid-quality-payload',
+        'iOS runner quality payload must be unscoped',
+        { field: 'scope' },
+      ),
+      systemSurface,
+    );
+  }
+  return { nodes: value.nodes as RawSnapshotNode[], truncated: value.truncated, scope: null };
+}
+
+function runnerViewportEvidence(result: AppleRunnerSnapshotResult): {
+  authority: IosViewportEvidence;
+  validation: IosViewportEvidence;
+} {
+  const roots = resolveIosViewportEvidenceFromRoots(rootNodes(result.qualityPayload?.nodes), {
+    fallbackToLargestRoot: true,
+  }) ??
+    resolveIosViewportEvidenceFromRoots(rootNodes(result.nodes), {
+      fallbackToLargestRoot: true,
+    }) ?? {
+      kind: 'missing',
+      reason: 'not-provided',
+    };
+  const authority = result.viewportEvidence ?? roots;
+  // A local root can validate a readable tree, but cannot establish a missing screen origin.
+  return { authority, validation: authority.kind === 'missing' ? roots : authority };
+}
+
+function rootNodes(nodes: readonly RawSnapshotNode[] | undefined): readonly RawSnapshotNode[] {
+  return nodes?.filter((node) => node.parentIndex === undefined) ?? [];
+}
+
+function throwSnapshotEngineError(
+  error: unknown,
+  systemSurface?: IosSystemSurfaceProvenance,
+): never {
+  if (!(error instanceof IosSnapshotEngineError)) throw error;
+  throw new AppError(
+    'COMMAND_FAILED',
+    error.message,
+    {
+      ...toIosSnapshotEngineErrorDetails(error),
+      ...(systemSurface ? { systemSurface } : {}),
+    },
+    error,
+  );
+}

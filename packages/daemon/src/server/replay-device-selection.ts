@@ -1,0 +1,123 @@
+import {
+  parseReplayInput,
+  resolveReplayFormat,
+  type ReplayBackendId,
+} from '@agent-device/ad-script';
+import type { ResolveTargetDeviceOptions } from '@agent-device/device-selection/dispatch-resolve';
+import { buildOpenTargetDeviceResolutionOptions } from '@agent-device/device-selection/open-target';
+import type { EnvMap } from '@agent-device/kernel/source-value';
+import type { CommandFlags } from '@agent-device/contracts/command';
+import { readReplayScriptSourceFile } from '@agent-device/replay-port/script-source';
+import type { ReplayBackend } from '@agent-device/contracts/replay-backend';
+import type { DaemonRequest } from '../core/daemon-request.ts';
+import {
+  appTargetResolutionOptions,
+  buildMaestroReplayTargetDeviceResolutionOptions,
+  buildReplayScriptPlatformFlags,
+  readScriptReplaySelection,
+} from '@agent-device/replay-port/replay-script-selection';
+
+export type ReplayTargetDeviceResolution = {
+  flags: CommandFlags;
+  options: ResolveTargetDeviceOptions | undefined;
+};
+
+/**
+ * Finds a static first app target for fresh replay binding. Request binding
+ * must leave a first deep-link or dynamic open to normal device resolution.
+ *
+ * #1802: reads the request's replay script source bundle, never the
+ * filesystem. Before that this opened the caller's path here too, so against a
+ * remote daemon it silently no-opped (the read threw and the catch below
+ * swallowed it) and every remote replay lost its pre-binding.
+ *
+ * The Maestro engine loads only once the entry resolves to a flow: request
+ * binding is in the daemon's startup closure, and most replays are `.ad`.
+ */
+export async function buildReplayTargetDeviceResolution(
+  req: DaemonRequest,
+  env: EnvMap,
+): Promise<ReplayTargetDeviceResolution | undefined> {
+  if (req.command !== 'replay' || req.flags?.replayFrom !== undefined) return undefined;
+  const bundle = req.flags?.replayScriptSource;
+  if (!bundle) return undefined;
+
+  return readAdvisoryResolution(async () => {
+    const resolved = bundle.entry;
+    const source = readReplayScriptSourceFile(bundle, resolved);
+    const backendId = resolveReplayFormat(resolved, req.flags?.replayBackend);
+    if (backendId !== 'ad') {
+      return await readBackendReplayResolution(backendId, source, resolved, req.flags, env);
+    }
+    return readAdScriptResolution(source, req.flags, env);
+  });
+}
+
+async function readBackendReplayResolution(
+  backendId: ReplayBackendId,
+  source: string,
+  resolvedPath: string,
+  flags: DaemonRequest['flags'],
+  env: EnvMap,
+): Promise<ReplayTargetDeviceResolution> {
+  // Function-scoped through the #3377 registry: request binding sits in the daemon's startup
+  // closure, and the engine sits one thunk behind the backend.
+  const backend: ReplayBackend = await (
+    await import('@agent-device/replay-port/replay-backend-registry')
+  ).getReplayBackend(backendId);
+  return {
+    flags: flags ?? {},
+    options: buildMaestroReplayTargetDeviceResolutionOptions(
+      backend.inspectSource(source, resolvedPath).appTarget,
+      flags?.platform,
+      env,
+    ),
+  };
+}
+
+function readAdScriptResolution(
+  source: string,
+  flags: DaemonRequest['flags'],
+  env: EnvMap,
+): ReplayTargetDeviceResolution | undefined {
+  const parsed = parseReplayInput(source, flags);
+  const selection = readScriptReplaySelection(parsed.actions);
+  if (!selection.appTarget) return undefined;
+  const scriptFlags = buildReplayScriptPlatformFlags(flags, parsed.actions);
+  const platform = scriptFlags.platform ?? parsed.metadata.platform;
+  return {
+    flags:
+      platform && scriptFlags.platform === undefined ? { ...scriptFlags, platform } : scriptFlags,
+    options: adScriptTargetOptions(platform, selection.appTarget, env),
+  };
+}
+
+/**
+ * The app the script opens first informs the device its replay locks: an iOS simulator that has it
+ * installed, or on the Mac its app device (ADR 0035), so the replay locks that app and not the host.
+ */
+function adScriptTargetOptions(
+  platform: string | undefined,
+  appTarget: string,
+  env: EnvMap,
+): ReplayTargetDeviceResolution['options'] {
+  if (platform === 'ios') return appTargetResolutionOptions(appTarget, env);
+  // A macOS replay names an app device, never a web session.
+  if (platform === 'macos')
+    return buildOpenTargetDeviceResolutionOptions(appTarget, env, undefined);
+  return undefined;
+}
+
+async function readAdvisoryResolution(
+  read: () => Promise<ReplayTargetDeviceResolution | undefined>,
+): Promise<ReplayTargetDeviceResolution | undefined> {
+  try {
+    return await read();
+  } catch {
+    // Parsing and validation stay in the replay handler. Lock binding is only
+    // advisory, so an unreadable/invalid plan must not mask its real error. The
+    // whole probe sits behind this guard, including the wire bundle's entry and
+    // format, which the request boundary only checks as an object.
+    return undefined;
+  }
+}

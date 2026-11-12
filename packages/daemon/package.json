@@ -1,0 +1,42 @@
+{
+  "name": "@agent-device/daemon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The agent-device daemon server: request routing, sessions, leases, device claims, snapshot and interaction handling. Internal workspace package bundled into the published agent-device artifact (#3352 daemon extraction).",
+  "dependencies": {
+    "@agent-device/ad-replay": "workspace:*",
+    "@agent-device/ad-script": "workspace:*",
+    "@agent-device/capture-kit": "workspace:*",
+    "@agent-device/command-registry": "workspace:*",
+    "@agent-device/contracts": "workspace:*",
+    "@agent-device/daemon-contracts": "workspace:*",
+    "@agent-device/device-selection": "workspace:*",
+    "@agent-device/host-kit": "workspace:*",
+    "@agent-device/kernel": "workspace:*",
+    "@agent-device/maestro": "workspace:*",
+    "@agent-device/platform-android": "workspace:*",
+    "@agent-device/platform-apple": "workspace:*",
+    "@agent-device/platform-web": "workspace:*",
+    "@agent-device/replay-port": "workspace:*",
+    "@agent-device/replay-test": "workspace:*",
+    "@agent-device/selectors": "workspace:*",
+    "@agent-device/session-journal": "workspace:*"
+  },
+  "devDependencies": {
+    "@agent-device/apple-runner": "workspace:*",
+    "@agent-device/proxy": "workspace:*",
+    "@agent-device/test-kit": "workspace:*",
+    "@types/node": "^22.20.1",
+    "fast-check": "^4.9.0",
+    "oxc-parser": "^0.146.0",
+    "vitest": "5.0.4",
+    "yaml": "^2.9.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  }
+}

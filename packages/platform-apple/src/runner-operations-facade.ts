@@ -1,0 +1,58 @@
+export {
+  assertSafeDerivedCleanup,
+  RUNNER_STARTUP_TIMEOUT_MS,
+  createLaunchedAppleRunnerProvider,
+  mintRunnerToken,
+  runnerListenerEnv,
+  RUNNER_XCTESTRUN_CAPTURE_OPTIONS,
+  applyXctestRunnerAppIconFromDerivedPath,
+  detachIosRunnerSessionsForShutdown,
+  findRunnerXctestrun,
+  hasLiveIosRunnerSession,
+  notifyIosRunnerAppRelaunched,
+  prepareIosRunner,
+  prewarmAppleRunnerCache,
+  prewarmIosRunnerSession,
+  readRunnerSessionLiveness,
+  readStaleRunnerLease,
+  releaseIosRunnerOnClose,
+  releaseSpeculativeIosRunnerSessionFor,
+  resolveExistingRunnerProductPaths,
+  resolveExpectedRunnerCacheMetadata,
+  resolveRunnerAppBundleId,
+  resolveRunnerArchBuildSettings,
+  resolveRunnerBundleBuildSettings,
+  resolveRunnerPerformanceBuildSettings,
+  resolveRunnerSandboxBuildArgs,
+  resolveRunnerDerivedOverride,
+  resolveRunnerSigningBuildSettings,
+  requireCertifiedRunnerCacheArtifacts,
+  requireRunnerBuildSettingsMatchBuildLog,
+  runAppleRunnerCommand,
+  shouldDeleteRunnerDerivedRootEntry,
+  stopAllIosRunnerSessions,
+  stopIosRunnerSession,
+  verifyLeaseRunnerPidIdentity,
+  writeRunnerCacheMetadataForArtifacts,
+} from './core/runner-client.ts';
+export {
+  isRunnerXcuitestScriptPlatform,
+  resolveRunnerScriptDefaultDerivedPath,
+  resolveRunnerScriptDevice,
+} from './core/runner-script.ts';
+
+export async function cleanupRunnerLeasesForOwner(
+  owner: Parameters<(typeof import('./core/runner-client.ts'))['cleanupRunnerLeasesForOwner']>[0],
+): Promise<void> {
+  const { cleanupRunnerLeasesForOwner: cleanup } = await import('./core/runner-client.ts');
+  const { runnerLeaseCleanupAdapter } = await import('@agent-device/apple-runner');
+  await cleanup(owner, runnerLeaseCleanupAdapter);
+}
+
+/** Binds provider-owned sessions to the shared Apple runner execution. */
+export async function createAppleRunnerRuntime(
+  options: Parameters<typeof import('./runner-runtime.ts').createAppleRunnerRuntime>[0],
+) {
+  const { createAppleRunnerRuntime } = await import('./runner-runtime.ts');
+  return createAppleRunnerRuntime(options);
+}

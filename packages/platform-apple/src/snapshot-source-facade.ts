@@ -1,0 +1,49 @@
+/**
+ * Lazy Simulator AX acquisition. The implementation is loaded on the first eligible local iOS
+ * Simulator snapshot; importing this facet keeps the platform package's startup surface inert.
+ */
+export type {
+  SnapshotSourceLimits,
+  SnapshotSourceRequest,
+  SnapshotSourceTarget,
+} from './snapshot-source/types.ts';
+
+import type { SnapshotSourceOutcome } from '@agent-device/capture-kit/snapshot-source-channel';
+import type { HostEnvironment } from '@agent-device/kernel/source-value';
+
+import type { SnapshotSourceRequest } from './snapshot-source/types.ts';
+
+export type SimulatorSnapshotSource = Readonly<{
+  acquire(request: SnapshotSourceRequest): Promise<SnapshotSourceOutcome>;
+  close(): Promise<void>;
+}>;
+
+export function createSimulatorSnapshotSource(host: HostEnvironment): SimulatorSnapshotSource {
+  let implementation:
+    | Promise<import('./snapshot-source/adapter.ts').SimulatorSnapshotSource>
+    | undefined;
+  let closed = false;
+  const load = async () => {
+    implementation ??= import('./snapshot-source/host.ts').then(({ createSnapshotSourceHost }) =>
+      import('./snapshot-source/adapter.ts').then(({ createSimulatorSnapshotSource: create }) =>
+        create({ host: createSnapshotSourceHost(host) }),
+      ),
+    );
+    return await implementation;
+  };
+  return {
+    acquire: async (request) => {
+      if (closed) {
+        return {
+          stage: 'failed',
+          failure: { kind: 'unsupported', code: 'source-closed' },
+        };
+      }
+      return await (await load()).acquire(request);
+    },
+    close: async () => {
+      closed = true;
+      if (implementation) await (await implementation).close();
+    },
+  };
+}

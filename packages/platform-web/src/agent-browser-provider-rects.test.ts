@@ -1,0 +1,755 @@
+import { bindTestCommandHost, installFakeManagedAgentBrowser } from '@agent-device/test-kit';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { test, vi } from 'vitest';
+import { mkdtempForTestSync } from './__tests__/test-utils.ts';
+
+const { providerStartupCleanupMock } = vi.hoisted(() => ({
+  providerStartupCleanupMock: vi.fn(),
+}));
+
+// Startup cleanup walks the host process table, which would read as an extra backend call in the
+// exact call lists these tests assert.
+vi.mock('./agent-browser-lifecycle.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./agent-browser-lifecycle.ts')>();
+  return {
+    ...actual,
+    cleanupManagedAgentBrowserOrphansForProviderStartup: providerStartupCleanupMock,
+  };
+});
+
+import { createAgentBrowserWebProvider } from './agent-browser-provider.ts';
+import type { WebSnapshotResult } from './provider.ts';
+import { withCommandExecutorOverride, type ExecResult } from '@agent-device/host-kit/command';
+import { AppError } from '@agent-device/kernel/errors';
+
+bindTestCommandHost();
+
+/**
+ * One backend call, with the text the provider wrote to its stdin — which is how `batch` receives
+ * the work it runs inside a single process.
+ */
+type AgentBrowserCall = {
+  cmd: string;
+  args: readonly string[];
+  stdin?: string;
+};
+
+test('agent-browser provider fetches snapshot geometry in one batch for the whole capture', async () => {
+  await withWebProvider(async (provider) => {
+    const calls: AgentBrowserCall[] = [];
+    const snapshot = await withCommandExecutorOverride(
+      geometryExecutor(calls),
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    assert.deepEqual(
+      calls.map((call) => call.args.slice(0, 3)),
+      [
+        ['snapshot', '--json', '--session'],
+        ['batch', '--json', '--session'],
+      ],
+    );
+    // One round trip for every ref of the capture: each backend call is a process spawn, and a page
+    // can hold hundreds of refs.
+    assert.deepEqual(readBatchCommands(calls[1]?.stdin), [
+      ['get', 'box', '@e1'],
+      ['get', 'box', '@e2'],
+      ['get', 'box', '@e3'],
+      ['get', 'box', '@e4'],
+    ]);
+    assertGeometryRects(snapshot);
+  });
+});
+
+test('agent-browser provider keeps the geometry a batch did measure', async () => {
+  await withWebProvider(async (provider) => {
+    const calls: AgentBrowserCall[] = [];
+    const snapshot = await withCommandExecutorOverride(
+      async (cmd, args, options) => {
+        const cliArgs = recordCall(calls, cmd, args, options.stdin);
+        if (cliArgs[0] !== 'batch') return snapshotPayload();
+        const commands = readBatchCommands(options.stdin);
+        return jsonResult(
+          commands.map((command, index) =>
+            index === 0
+              ? { command, success: false, error: 'Unknown ref: e1', result: null }
+              : { command, success: true, error: null, result: boxRect(command[2]) },
+          ),
+          1,
+        );
+      },
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    // A ref the backend could not measure is an ordinary answer about that ref: the rest of the
+    // tree keeps its geometry, and the entry's own `success` is what decided that — never the
+    // error's wording, which the backend has no reason to keep stable.
+    assert.deepEqual(
+      snapshot.nodes.map((node) => node.rect),
+      [
+        undefined,
+        { x: 11, y: 12, width: 100, height: 20 },
+        { x: 31, y: 32, width: 100, height: 20 },
+        { x: 31, y: 32, width: 100, height: 20 },
+      ],
+    );
+  });
+});
+
+test('agent-browser provider splits snapshot geometry into bounded batches', async () => {
+  await withWebProvider(async (provider) => {
+    const calls: AgentBrowserCall[] = [];
+    const snapshot = await withCommandExecutorOverride(
+      async (cmd, args, options) => {
+        const cliArgs = recordCall(calls, cmd, args, options.stdin);
+        if (cliArgs[0] !== 'batch') return manyRefSnapshotPayload(250);
+        const commands = readBatchCommands(options.stdin);
+        return jsonResult(
+          commands.map((command) => ({
+            command,
+            success: true,
+            error: null,
+            result: { x: 1, y: 2, width: 10, height: 20 },
+          })),
+          1,
+        );
+      },
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    // The backend reads a batch from stdin as one JSON array, so refs are fetched in bounded groups
+    // rather than as one unbounded payload.
+    const groups = calls
+      .filter((call) => call.args[0] === 'batch')
+      .map((call) => readBatchCommands(call.stdin));
+    assert.deepEqual(
+      groups.map((group) => group.length),
+      [200, 50],
+    );
+    assert.equal(
+      snapshot.nodes.filter((node) => node.rect !== undefined).length,
+      250,
+      'every ref of both groups keeps the box its entry reported',
+    );
+  });
+});
+
+test('agent-browser provider keeps a capture whose later groups measured after an early one failed', async () => {
+  // The refusal below is a statement about the capture, so it has to be decided over all of it: a
+  // page whose first group of refs went stale still has geometry for the rest, and answering that
+  // capture is what the caller can act on.
+  await withWebProvider(async (provider) => {
+    const calls: AgentBrowserCall[] = [];
+    const snapshot = await withCommandExecutorOverride(
+      async (cmd, args, options) => {
+        const cliArgs = recordCall(calls, cmd, args, options.stdin);
+        if (cliArgs[0] !== 'batch') return manyRefSnapshotPayload(250);
+        const commands = readBatchCommands(options.stdin);
+        const firstGroup = commands.length === 200;
+        return jsonResult(
+          commands.map((command) =>
+            firstGroup
+              ? { command, success: false, error: 'Unknown ref', result: null }
+              : {
+                  command,
+                  success: true,
+                  error: null,
+                  result: { x: 1, y: 2, width: 10, height: 20 },
+                },
+          ),
+          1,
+        );
+      },
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    assert.equal(
+      snapshot.nodes.filter((node) => node.rect !== undefined).length,
+      50,
+      'the group that answered keeps its geometry',
+    );
+    assert.equal(
+      calls.filter((call) => call.args[0] === 'batch').length,
+      2,
+      'both groups were asked',
+    );
+  });
+});
+
+test('agent-browser provider refuses snapshot geometry when the batch resolves no refs', async () => {
+  // An element the backend knows measures as a box even when hidden, so a capture whose every ref
+  // went unmeasurable answered to refs this snapshot does not publish. Returning no geometry at all
+  // would hand the caller a tree of targets with no usable bounds.
+  await withWebProvider(async (provider) => {
+    await assert.rejects(
+      () =>
+        withCommandExecutorOverride(
+          async (_cmd, args, options) => {
+            if (agentBrowserCliArgs(args)[0] !== 'batch') return snapshotPayload();
+            const commands = readBatchCommands(options.stdin);
+            return jsonResult(
+              commands.map((command) => ({
+                command,
+                success: false,
+                error: 'Unknown ref',
+                result: null,
+              })),
+              1,
+            );
+          },
+          async () => await provider.snapshot({ includeRects: true }),
+        ),
+      (error: unknown) =>
+        error instanceof AppError &&
+        error.code === 'COMMAND_FAILED' &&
+        error.details?.reason === 'snapshot-refs-unmeasurable' &&
+        error.details?.measuredRects === 0,
+    );
+  });
+});
+
+test('agent-browser provider refuses geometry when the batch answers with too few entries', async () => {
+  // Each entry has to name the command it answers, so an answer with fewer entries than commands
+  // cannot be paired at all: filling four refs from the entries that exist would hand each node some
+  // other node's box.
+  await withWebProvider(async (provider) => {
+    await assert.rejects(
+      () =>
+        withCommandExecutorOverride(
+          async (_cmd, args, options) => {
+            if (agentBrowserCliArgs(args)[0] !== 'batch') return snapshotPayload();
+            const commands = readBatchCommands(options.stdin);
+            return jsonResult(
+              [{ command: commands[0], success: true, error: null, result: boxRect('@e1') }],
+              1,
+            );
+          },
+          async () => await provider.snapshot({ includeRects: true }),
+        ),
+      refusedFor('entry-count'),
+    );
+  });
+});
+
+test('agent-browser provider refuses geometry when the batch answers with an object', async () => {
+  // An answer that is not a list of entries cannot be paired to refs at all, so the geometry is
+  // refused rather than guessed at.
+  await withWebProvider(async (provider) => {
+    await assert.rejects(
+      () =>
+        withCommandExecutorOverride(
+          async (_cmd, args) =>
+            agentBrowserCliArgs(args)[0] === 'batch'
+              ? jsonResult({ success: true, data: { measured: 4 } })
+              : snapshotPayload(),
+          async () => await provider.snapshot({ includeRects: true }),
+        ),
+      refusedFor('batch-result-not-a-list'),
+    );
+  });
+});
+
+test('agent-browser provider refuses geometry when a batch entry is not an object', async () => {
+  // Right number of answers, one of them not an object at all. A member that is not an object never
+  // reaches the echo check, so only the shape guard can refuse it.
+  await withWebProvider(async (provider) => {
+    await assert.rejects(
+      () =>
+        withCommandExecutorOverride(
+          async (_cmd, args, options) => {
+            if (agentBrowserCliArgs(args)[0] !== 'batch') return snapshotPayload();
+            const commands = readBatchCommands(options.stdin);
+            return jsonResult(
+              commands.map((command, index) =>
+                index === 0
+                  ? null
+                  : { command, success: true, error: null, result: boxRect(command[2]) },
+              ),
+              1,
+            );
+          },
+          async () => await provider.snapshot({ includeRects: true }),
+        ),
+      refusedFor('entry-shape'),
+    );
+  });
+});
+
+test('agent-browser provider refuses geometry when a batch entry carries no verdict', async () => {
+  // An entry that echoes the right command and carries a box but states no `success` is the shape
+  // the echo check cannot catch: it passes the echo and would be read as an ordinary failed ref,
+  // dropping that node's geometry with no error so it reads as "this element has no box". Only the
+  // shape guard's boolean-`success` clause refuses it.
+  await withWebProvider(async (provider) => {
+    await assert.rejects(
+      () =>
+        withCommandExecutorOverride(
+          async (_cmd, args, options) => {
+            if (agentBrowserCliArgs(args)[0] !== 'batch') return snapshotPayload();
+            const commands = readBatchCommands(options.stdin);
+            return jsonResult(
+              commands.map((command, index) =>
+                // index 0 echoes the command it answers (`command` IS `commands[0]` there) and
+                // carries a plausible box, so only the missing `success` distinguishes it.
+                index === 0
+                  ? { command, result: boxRect(command[2]) }
+                  : { command, success: true, error: null, result: boxRect(command[2]) },
+              ),
+              1,
+            );
+          },
+          async () => await provider.snapshot({ includeRects: true }),
+        ),
+      refusedFor('entry-shape'),
+    );
+  });
+});
+
+test('agent-browser provider refuses geometry when an entry echoes a different command', async () => {
+  // The entries arrive in the order the commands were sent, so position alone would pair them. The
+  // echo is the proof that an entry really describes the ref it is paired with: a backend that
+  // reorders or answers a command it did not receive would otherwise hand each node another node's
+  // box, which reads as a working capture with wrong geometry.
+  await withWebProvider(async (provider) => {
+    await assert.rejects(
+      () =>
+        withCommandExecutorOverride(
+          async (_cmd, args, options) => {
+            if (agentBrowserCliArgs(args)[0] !== 'batch') return snapshotPayload();
+            const commands = readBatchCommands(options.stdin);
+            return jsonResult(
+              commands.map((command, index) => ({
+                command: commands[(index + 1) % commands.length],
+                success: true,
+                error: null,
+                result: boxRect(command[2]),
+              })),
+              1,
+            );
+          },
+          async () => await provider.snapshot({ includeRects: true }),
+        ),
+      refusedFor('entry-command'),
+    );
+  });
+});
+
+test('agent-browser provider refuses geometry when the batch itself faults', async () => {
+  // A whole-batch fault comes back as one envelope rather than one entry per command, so nothing can
+  // be paired back to a ref; the refusal is the typed one the envelope carries.
+  await withWebProvider(async (provider) => {
+    await assert.rejects(
+      () =>
+        withCommandExecutorOverride(
+          async (_cmd, args) =>
+            agentBrowserCliArgs(args)[0] === 'batch'
+              ? jsonResult({ success: false, error: 'Invalid JSON input' }, 1)
+              : snapshotPayload(),
+          async () => await provider.snapshot({ includeRects: true }),
+        ),
+      (error: unknown) => error instanceof AppError && error.code === 'COMMAND_FAILED',
+    );
+  });
+});
+
+test('agent-browser provider surfaces a stale ref as a refusal of the geometry it was asked for', async () => {
+  await withWebProvider(async (provider) => {
+    await assert.rejects(
+      () =>
+        withCommandExecutorOverride(
+          async (_cmd, args) =>
+            agentBrowserCliArgs(args)[0] === 'batch'
+              ? jsonResult({ success: false, error: 'Stale ref @e1' }, 1)
+              : jsonResult({
+                  success: true,
+                  data: {
+                    refs: { e1: { role: 'button', name: 'Save' } },
+                    snapshot: 'button "Save" [ref=e1]',
+                  },
+                }),
+          async () => await provider.snapshot({ includeRects: true }),
+        ),
+      (error: unknown) =>
+        error instanceof AppError &&
+        error.code === 'COMMAND_FAILED' &&
+        error.message === 'Stale ref @e1',
+    );
+  });
+});
+
+test('agent-browser provider passes snapshot cancellation to the geometry batch', async () => {
+  // The batch is the call that now carries up to 200 commands, so it is the one where a dropped
+  // signal costs a whole 30 s after the caller gave up. The capture call has its own test; this is
+  // the geometry half.
+  const controller = new AbortController();
+  await withWebProvider(async (provider) => {
+    const signals: Array<AbortSignal | undefined> = [];
+    await withCommandExecutorOverride(
+      async (_cmd, args, options) => {
+        signals.push(options.signal);
+        if (agentBrowserCliArgs(args)[0] !== 'batch') return snapshotPayload();
+        const commands = readBatchCommands(options.stdin);
+        return jsonResult(
+          commands.map((command) => ({
+            command,
+            success: true,
+            error: null,
+            result: boxRect(command[2]),
+          })),
+        );
+      },
+      async () => await provider.snapshot({ includeRects: true, signal: controller.signal }),
+    );
+    assert.equal(signals.length, 2, 'one capture call and one geometry batch');
+    assert.equal(
+      signals[1],
+      controller.signal,
+      'the geometry batch is cancellable by the request that asked for it',
+    );
+  });
+});
+
+test('agent-browser provider asks the backend nothing for a capture of only ref-less text', async () => {
+  // A capture of only ref-less text has no box to ask for. Declining is the fetcher's decision, and
+  // pinning it here is what keeps the all-unmeasurable refusal from firing on an empty tree.
+  await withWebProvider(async (provider) => {
+    const calls: AgentBrowserCall[] = [];
+    const snapshot = await withCommandExecutorOverride(
+      async (cmd, args) => {
+        recordCall(calls, cmd, args);
+        return jsonResult({
+          success: true,
+          data: { refs: {}, snapshot: '- status "Hello Zed"', truncated: false },
+        });
+      },
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    assert.deepEqual(
+      calls.map((call) => call.args[0]),
+      ['snapshot'],
+      'no batch is sent when nothing in the capture has a ref',
+    );
+    assert.equal(snapshot.nodes.length, 1);
+    assert.equal(snapshot.nodes[0]?.ref, undefined);
+  });
+});
+
+test('agent-browser provider places nodes inside nested iframes in page coordinates', async () => {
+  // Measured on agent-browser 0.39: a node inside an iframe reports its box against that frame's
+  // viewport, so a press at the reported point lands on the page around the frame.
+  await withWebProvider(async (provider) => {
+    const calls: AgentBrowserCall[] = [];
+    const snapshot = await withCommandExecutorOverride(
+      frameGeometryExecutor(calls),
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    const stylesBatch = calls.find((call) => call.stdin?.includes('"styles"'));
+    assert.deepEqual(readBatchCommands(stylesBatch?.stdin), [
+      ['get', 'styles', '@e2'],
+      ['get', 'styles', '@e4'],
+    ]);
+    assert.deepEqual(snapshotRects(snapshot), {
+      e1: { x: 8, y: 400, width: 640, height: 44 },
+      e2: { x: 24, y: 770, width: 304, height: 154 },
+      e3: { x: 24 + 2 + 8, y: 770 + 2 + 59, width: 166, height: 21 },
+      e4: { x: 24 + 2 + 10, y: 770 + 2 + 90, width: 200, height: 50 },
+      e5: { x: 36 + 1 + 5 + 4, y: 862 + 1 + 5 + 6, width: 80, height: 20 },
+    });
+  });
+});
+
+test('agent-browser provider leaves a frame without a measurable inset with unplaced content', async () => {
+  await withWebProvider(async (provider) => {
+    const snapshot = await withCommandExecutorOverride(
+      frameGeometryExecutor([], { styles: { ...FRAME_STYLES, '@e4': null } }),
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    const rects = snapshotRects(snapshot);
+    // The nested frame itself sits in a measured frame; only the content it renders stays unplaced.
+    assert.deepEqual(rects.e4, { x: 36, y: 862, width: 200, height: 50 });
+    assert.equal(rects.e5, undefined);
+    assert.deepEqual(rects.e3, { x: 34, y: 831, width: 166, height: 21 });
+  });
+});
+
+test('agent-browser provider leaves a frame without a measurable box with unplaced content', async () => {
+  await withWebProvider(async (provider) => {
+    const snapshot = await withCommandExecutorOverride(
+      frameGeometryExecutor([], { boxes: { ...FRAME_BOXES, '@e2': undefined } }),
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    const rects = snapshotRects(snapshot);
+    assert.deepEqual(rects.e1, { x: 8, y: 400, width: 640, height: 44 });
+    assert.equal(rects.e2, undefined);
+    assert.equal(rects.e3, undefined);
+    assert.equal(rects.e4, undefined);
+    assert.equal(rects.e5, undefined);
+  });
+});
+
+test('agent-browser provider clips frame content to the frame viewport', async () => {
+  // A frame scrolled by its own document reports content above or below its viewport. The page
+  // around the frame renders at those points, so a press there must not target the content.
+  await withWebProvider(async (provider) => {
+    const snapshot = await withCommandExecutorOverride(
+      frameGeometryExecutor([], {
+        boxes: {
+          ...FRAME_BOXES,
+          '@e3': { x: 8, y: -40, width: 166, height: 21 },
+          '@e4': { x: 10, y: 130, width: 200, height: 50 },
+        },
+      }),
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    const rects = snapshotRects(snapshot);
+    assert.equal(rects.e3, undefined, 'content scrolled above the frame has no reachable point');
+    // The outer frame's viewport ends at 770 + 154 - 2: the visible part of the nested frame.
+    assert.deepEqual(rects.e4, { x: 36, y: 902, width: 200, height: 20 });
+  });
+});
+
+test('agent-browser provider places content of a clipped nested frame from its unclipped viewport', async () => {
+  await withWebProvider(async (provider) => {
+    const snapshot = await withCommandExecutorOverride(
+      // The outer frame is scrolled so the nested frame starts 20px above the outer viewport.
+      frameGeometryExecutor([], {
+        boxes: { ...FRAME_BOXES, '@e4': { x: 10, y: -20, width: 200, height: 50 } },
+      }),
+      async () => await provider.snapshot({ includeRects: true }),
+    );
+
+    const rects = snapshotRects(snapshot);
+    assert.deepEqual(rects.e4, { x: 36, y: 772, width: 200, height: 30 });
+    // The nested viewport starts at 772 - 20 + 6, so the button's top 8px of 20 are hidden.
+    assert.deepEqual(rects.e5, { x: 46, y: 772, width: 80, height: 12 });
+  });
+});
+
+async function withWebProvider(
+  testFn: (provider: ReturnType<typeof createAgentBrowserWebProvider>) => void | Promise<void>,
+): Promise<void> {
+  const stateDir = mkdtempForTestSync('agent-device-web-provider-rects-');
+  try {
+    installFakeManagedAgentBrowser(stateDir);
+    await testFn(
+      createAgentBrowserWebProvider({
+        host: { env: process.env, cwd: process.cwd() },
+        stateDir,
+        session: 'web-session',
+      }),
+    );
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The backend answers a geometry batch with one entry per command, and a ref it cannot measure comes
+ * back as a failed entry rather than a failed batch: `@e3` of this fixture is the element with no
+ * box. `@e1`/`@e2`/`@e4` report the boxes `boxRect` describes.
+ */
+function geometryExecutor(calls: AgentBrowserCall[]) {
+  return batchExecutor(calls, snapshotPayload, ([, , ref]) =>
+    ref === '@e3' ? undefined : boxRect(ref),
+  );
+}
+
+/**
+ * A backend that answers `snapshot` with `snapshot()` and each batch command with `answer`; a
+ * command `answer` returns nothing for comes back as a failed entry.
+ */
+function batchExecutor(
+  calls: AgentBrowserCall[],
+  snapshot: () => ExecResult,
+  answer: (command: string[]) => unknown,
+) {
+  return async (
+    cmd: string,
+    args: readonly string[],
+    options: { allowFailure?: boolean; stdin?: string | Buffer },
+  ): Promise<ExecResult> => {
+    const cliArgs = recordCall(calls, cmd, args, options.stdin);
+    if (cliArgs[0] === 'snapshot') return snapshot();
+    if (cliArgs[0] === 'batch') {
+      const commands = readBatchCommands(options.stdin);
+      assert.equal(options.allowFailure, true);
+      assert.ok(!cliArgs.includes('--bail'), 'a bailed batch drops the refs after a failed one');
+      return jsonResult(
+        commands.map((command) => {
+          const result = answer(command);
+          return result === undefined
+            ? { command, success: false, error: 'No element', result: null }
+            : { command, success: true, error: null, result };
+        }),
+        1,
+      );
+    }
+    return jsonResult({ success: true, data: {} });
+  };
+}
+
+type BackendBox = { x: number; y: number; width: number; height: number };
+
+/** Each frame's computed styles, as `get styles` reports them; `null` is a frame it cannot read. */
+type FrameStyles = Record<string, Record<string, string> | null>;
+
+const FRAME_STYLES: FrameStyles = {
+  '@e2': frameStyles({ border: 2, padding: 0 }),
+  '@e4': frameStyles({ border: 1, padding: 5 }),
+};
+
+function frameStyles({ border, padding }: { border: number; padding: number }) {
+  const styles: Record<string, string> = {};
+  for (const side of ['left', 'top', 'right', 'bottom']) {
+    styles[`border-${side}-width`] = `${border}px`;
+    styles[`padding-${side}`] = `${padding}px`;
+  }
+  return styles;
+}
+
+/** Boxes as the backend reports them: `@e3`-`@e5` against the viewport of the frame they render in. */
+const FRAME_BOXES: Record<string, BackendBox | undefined> = {
+  '@e1': { x: 8, y: 400, width: 640, height: 44 },
+  '@e2': { x: 24, y: 770, width: 304, height: 154 },
+  '@e3': { x: 8, y: 59, width: 166, height: 21 },
+  '@e4': { x: 10, y: 90, width: 200, height: 50 },
+  '@e5': { x: 4, y: 6, width: 80, height: 20 },
+};
+
+function frameGeometryExecutor(
+  calls: AgentBrowserCall[],
+  {
+    styles = FRAME_STYLES,
+    boxes = FRAME_BOXES,
+  }: { styles?: FrameStyles; boxes?: typeof FRAME_BOXES } = {},
+) {
+  return batchExecutor(calls, frameSnapshotPayload, ([, property, ref]) => {
+    if (property === 'box') return boxes[ref!];
+    const frameStyles = styles[ref!];
+    return frameStyles ? { styles: frameStyles } : undefined;
+  });
+}
+
+function frameSnapshotPayload(): ExecResult {
+  return jsonResult({
+    success: true,
+    data: {
+      refs: {
+        e1: { role: 'button', name: 'Page button' },
+        e2: { role: 'Iframe', name: 'Outer frame' },
+        e3: { role: 'button', name: 'Outer frame button' },
+        e4: { role: 'Iframe', name: 'Inner frame' },
+        e5: { role: 'button', name: 'Inner frame button' },
+      },
+      snapshot: [
+        '- button "Page button" [ref=e1]',
+        '- Iframe "Outer frame" [ref=e2]',
+        '  - button "Outer frame button" [ref=e3]',
+        '  - Iframe "Inner frame" [ref=e4]',
+        '    - button "Inner frame button" [ref=e5]',
+      ].join('\n'),
+    },
+  });
+}
+
+function snapshotRects(snapshot: WebSnapshotResult) {
+  return Object.fromEntries(snapshot.nodes.map((node) => [node.ref, node.rect]));
+}
+
+function assertGeometryRects(snapshot: WebSnapshotResult): void {
+  assert.deepEqual(
+    snapshot.nodes.map((node) => node.rect),
+    [
+      { x: 1, y: 2, width: 100, height: 20 },
+      { x: 11, y: 12, width: 100, height: 20 },
+      undefined,
+      { x: 31, y: 32, width: 100, height: 20 },
+    ],
+  );
+}
+
+/**
+ * The refusal this file is about, pinned to the invariant that broke. Every branch below shares the
+ * message prefix, so matching the prefix alone would let any of them satisfy any of these tests.
+ */
+function refusedFor(reason: string) {
+  return (error: unknown) =>
+    error instanceof AppError &&
+    error.code === 'COMMAND_FAILED' &&
+    error.details?.reason === reason;
+}
+
+/** The commands the provider wrote for one `batch`, which is the shape this file is about. */
+function readBatchCommands(stdin: string | Buffer | undefined): string[][] {
+  assert.equal(typeof stdin, 'string', 'batch reads its commands from stdin');
+  return JSON.parse(String(stdin)) as string[][];
+}
+
+function recordCall(
+  calls: AgentBrowserCall[],
+  cmd: string,
+  args: readonly string[],
+  stdin?: string | Buffer,
+): string[] {
+  const cliArgs = agentBrowserCliArgs(args);
+  const written = typeof stdin === 'string' ? stdin : undefined;
+  calls.push({ cmd, args: cliArgs, ...(written === undefined ? {} : { stdin: written }) });
+  return cliArgs;
+}
+
+/**
+ * The backend runs as `node <entry> <agent-browser args>`; that shape is owned and asserted by
+ * agent-browser-tool. Here it is only stripped, so these tests read as the CLI arguments they are
+ * about.
+ */
+function agentBrowserCliArgs(args: readonly string[]): string[] {
+  return args.slice(1);
+}
+
+/** A capture of `count` addressable nodes, to exercise a page bigger than one batch group. */
+function manyRefSnapshotPayload(count: number): ExecResult {
+  const refs: Record<string, { role: string; name: string }> = {};
+  const lines: string[] = [];
+  for (let index = 1; index <= count; index += 1) {
+    refs[`e${index}`] = { role: 'button', name: `Item ${index}` };
+    lines.push(`- button "Item ${index}" [ref=e${index}]`);
+  }
+  return jsonResult({ success: true, data: { refs, snapshot: lines.join('\n') } });
+}
+
+function snapshotPayload(): ExecResult {
+  return jsonResult({
+    success: true,
+    data: {
+      refs: {
+        e1: { role: 'heading', name: 'Welcome' },
+        e2: { role: 'textbox', name: 'Name' },
+        e3: { role: 'button', name: 'Save' },
+        e4: { role: 'link', name: 'Docs' },
+      },
+      snapshot: [
+        '- heading "Welcome" [ref=e1]',
+        '  - textbox "Name" [ref=e2]: Ada',
+        '  - button "Save" [ref=e3]',
+        '  - link "Docs" [ref=e4]',
+      ].join('\n'),
+      truncated: false,
+    },
+  });
+}
+
+/** The box the backend reports for a ref, as a batch entry carries it inline. */
+function boxRect(ref: string | undefined): { x: number; y: number; width: number; height: number } {
+  const offset = ref === '@e1' ? 0 : ref === '@e2' ? 10 : 30;
+  return { x: offset + 1, y: offset + 2, width: 100, height: 20 };
+}
+
+function jsonResult(value: unknown, exitCode = 0): ExecResult {
+  return { stdout: JSON.stringify(value), stderr: '', exitCode };
+}

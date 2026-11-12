@@ -1,0 +1,921 @@
+// The typed-flags request from contracts/, not the daemon's server-side refinement: these
+// descriptors read `command`, `positionals` and `flags` and never touch `internal`.
+import type { CommandFlags, DispatchedCommand } from '@agent-device/contracts/command';
+import type { DispatchDisclosure } from '@agent-device/kernel/errors';
+import type { RuntimeUseStepSelector } from '@agent-device/contracts/command-platform-execution';
+import { checkFindArgs, isReadOnlyFindAction } from '@agent-device/selectors';
+import {
+  findRecordingEffect,
+  HOST_PLATFORM_EXECUTION,
+  NO_PLATFORM_EXECUTION,
+  readDeclaredPlatformExecution,
+  resolveDeferredProviderAppCatalogLeaseAdmissionExemption,
+} from './descriptor-request-policy.ts';
+import { DEFAULT_TIMEOUT_POLICY } from './timeout-policy.ts';
+import {
+  ADMISSION_AND_LOCK_EXEMPT,
+  REQUEST_EXECUTION_EXEMPT,
+  allowAnyDeviceSessionless,
+  ownerFilesEnabled,
+  type RawCommandDescriptor,
+} from './descriptor-traits.ts';
+import {
+  LEASE_ALLOCATE_TIMEOUT_POLICY,
+  LEASE_TIMEOUT_POLICY,
+  PRESERVE_DAEMON_TIMEOUT_POLICY,
+} from './descriptor-timeout-policies.ts';
+import { SESSION_OPERATION_COMMAND_DESCRIPTORS } from './descriptors/session-operations.ts';
+import { DEVICE_OPERATION_COMMAND_DESCRIPTORS } from './descriptors/device-operations.ts';
+import { LOCAL_CLI_COMMAND_DESCRIPTORS } from './descriptors/local-cli.ts';
+import type { PostActionObservationSupport } from './post-action-observation.ts';
+import { inventoryUse } from '@agent-device/contracts/platform-module';
+import {
+  appStateRuntimeUses,
+  appsRuntimeUse,
+  findRuntimeIntent,
+  findRuntimePlanUses,
+  resolveSelectorCaptureRuntimePlan,
+  resolveSnapshotRuntimePlan,
+  snapshotRuntimePlanUses,
+  deviceBootRuntimeUses,
+  shutdownTargetUse,
+} from '@agent-device/contracts/platform-runtime-operations';
+import { assertRecordRuntimeExecution } from '@agent-device/contracts/record-runtime-execution';
+import type {
+  CommandCatalogGroup,
+  CommandDescriptor,
+  CompositeResourceTrait,
+  CommandFrameworkTier,
+  DeviceClaimPolicy,
+  RecordingEffect,
+  CommandResponseDataTransform,
+  CommandTimeoutPolicy,
+  TargetIdentityVerification,
+} from './types.ts';
+
+type RawCommandCatalogGroup<T> = T extends { catalog: { group: infer Group } } ? Group : never;
+
+type RawCommandCatalogKey<T> = T extends { catalog: { key: infer Key extends string } }
+  ? Key
+  : T extends { name: infer Name extends string }
+    ? Name
+    : never;
+
+export type DescriptorCommandNameForCatalogGroup<Group extends CommandCatalogGroup> =
+  Extract<(typeof commandDescriptors)[number], { name: string }> extends infer Descriptor
+    ? Descriptor extends { name: infer Name extends string }
+      ? RawCommandCatalogGroup<Descriptor> extends Group
+        ? Name
+        : never
+      : never
+    : never;
+
+export type DescriptorCliCommandName =
+  | DescriptorCommandNameForCatalogGroup<'public'>
+  | DescriptorCommandNameForCatalogGroup<'local-cli'>;
+
+export type DescriptorCatalogRecord<Group extends CommandCatalogGroup> = {
+  readonly [
+    Descriptor in Extract<
+      (typeof commandDescriptors)[number],
+      { name: string }
+    > as RawCommandCatalogGroup<Descriptor> extends Group ? RawCommandCatalogKey<Descriptor> : never
+  ]: Descriptor['name'];
+};
+
+/**
+ * The literal union of every command whose `daemon.route` is `'session'`.
+ * Drives `SESSION_COMMAND_HANDLER_IMPLS` in `packages/daemon/src/sessions/handlers/session.ts`: adding a
+ * session-routed descriptor without a matching handler table entry is a compile error rather
+ * than a runtime routing gap caught only by `expectHandlerResponse`.
+ */
+export type DescriptorSessionRouteCommandName =
+  Extract<
+    (typeof commandDescriptors)[number],
+    { daemon: { route: 'session' } }
+  > extends infer Descriptor
+    ? Descriptor extends { name: infer Name extends string }
+      ? Name
+      : never
+    : never;
+
+// ---------------------------------------------------------------------------
+// The command declaration root (ADR 0008). Each entry carries the command identity
+// facets plus whichever daemon, batch, MCP, timeout, observation, and
+// platform-dispatch traits that command owns. Public catalog identity and the
+// non-public dispatch aliases live here too; every view derives from this
+// array rather than recreating command-name sets.
+// ---------------------------------------------------------------------------
+
+/**
+ * Plan-time selectors for the commands whose declared alternatives differ in what they execute.
+ * Each reads the daemon step exactly as its handler will (`flags` and `positionals`; a structured
+ * `input` only when a caller kept one) and resolves the same plan the handler resolves, for both
+ * sides of the active-app split the plan cannot know yet.
+ */
+export const selectSnapshotStepUses: RuntimeUseStepSelector = (step) => {
+  const customActions =
+    step.flags?.['snapshotCustomActions'] === true || step.input?.['customActions'] === true;
+  return [true, false].map(
+    (hasActiveApp) => resolveSnapshotRuntimePlan({ customActions, hasActiveApp }).use,
+  );
+};
+
+/**
+ * `find` parses its action from positionals and defaults a missing one to click, so a step the
+ * handler would not parse as a read-only, focus, or type action keeps every declared alternative
+ * (fail closed), including a step whose positionals are not there to parse.
+ */
+export const selectFindStepUses: RuntimeUseStepSelector = (step) => {
+  const checked =
+    step.positionals === undefined ? undefined : checkFindArgs(step.positionals, step.flags);
+  const action = checked?.ok ? checked.parsed.action : undefined;
+  if (
+    action === undefined ||
+    !(isReadOnlyFindAction(action) || action === 'focus' || action === 'type')
+  ) {
+    return findRuntimePlanUses;
+  }
+  const intent = findRuntimeIntent(action);
+  return [true, false].map(
+    (hasActiveApp) => resolveSelectorCaptureRuntimePlan({ hasActiveApp, intent }).use,
+  );
+};
+
+export const RAW_COMMAND_DESCRIPTORS = [
+  {
+    name: 'human_control',
+    deviceClaimPolicy: 'none',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/daemon/src/sessions/handlers/human-control.ts'] as const }
+      : {}),
+    catalog: { group: 'internal', key: 'humanControl' },
+    recordsSessionAction: false,
+    daemon: {
+      route: 'humanControl',
+      refFrameEffect: 'preserve',
+      selectorValidationExempt: true,
+      skipSessionlessProviderDevice: allowAnyDeviceSessionless,
+    },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: false,
+    platformExecution: NO_PLATFORM_EXECUTION,
+  },
+
+  // -- lease (route: lease) --
+  {
+    name: 'lease_allocate',
+    deviceClaimPolicy: 'none',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/daemon/src/sessions/handlers/lease.ts'] as const }
+      : {}),
+    catalog: { group: 'internal', key: 'leaseAllocate' },
+    recordsSessionAction: false,
+    daemon: {
+      route: 'lease',
+      refFrameEffect: 'preserve',
+      ...ADMISSION_AND_LOCK_EXEMPT,
+    },
+    timeoutPolicy: LEASE_ALLOCATE_TIMEOUT_POLICY,
+    batchable: false,
+    platformExecution: NO_PLATFORM_EXECUTION,
+  },
+  {
+    name: 'lease_heartbeat',
+    deviceClaimPolicy: 'none',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/daemon/src/sessions/handlers/lease.ts'] as const }
+      : {}),
+    catalog: { group: 'internal', key: 'leaseHeartbeat' },
+    recordsSessionAction: false,
+    daemon: {
+      route: 'lease',
+      refFrameEffect: 'preserve',
+      ...ADMISSION_AND_LOCK_EXEMPT,
+      appLease: 'allowed',
+    },
+    timeoutPolicy: LEASE_TIMEOUT_POLICY,
+    batchable: false,
+    platformExecution: NO_PLATFORM_EXECUTION,
+  },
+  {
+    name: 'lease_release',
+    deviceClaimPolicy: 'none',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/daemon/src/sessions/handlers/lease.ts'] as const }
+      : {}),
+    catalog: { group: 'internal', key: 'leaseRelease' },
+    recordsSessionAction: false,
+    daemon: {
+      route: 'lease',
+      refFrameEffect: 'preserve',
+      ...ADMISSION_AND_LOCK_EXEMPT,
+      appLease: 'allowed',
+    },
+    timeoutPolicy: LEASE_TIMEOUT_POLICY,
+    batchable: false,
+    platformExecution: NO_PLATFORM_EXECUTION,
+  },
+  {
+    name: 'artifacts',
+    deviceClaimPolicy: 'none',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/management/artifacts.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'extended',
+    recordsSessionAction: false,
+    daemon: {
+      route: 'lease',
+      refFrameEffect: 'preserve',
+      ...ADMISSION_AND_LOCK_EXEMPT,
+    },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: false,
+    platformExecution: NO_PLATFORM_EXECUTION,
+  },
+
+  // -- session (route: session) --
+  {
+    name: 'session_list',
+    deviceClaimPolicy: 'none',
+    ...(ownerFilesEnabled
+      ? {
+          ownerFiles: [
+            'packages/daemon/src/sessions/session-lifecycle/internal/inventory.ts',
+          ] as const,
+        }
+      : {}),
+    catalog: { group: 'internal', key: 'sessionList' },
+    recordsSessionAction: false,
+    daemon: {
+      route: 'session',
+      refFrameEffect: 'preserve',
+      sessionKind: 'inventory',
+      ...REQUEST_EXECUTION_EXEMPT,
+    },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: false,
+    platformExecution: NO_PLATFORM_EXECUTION,
+  },
+  {
+    name: 'session_save_script',
+    deviceClaimPolicy: 'none',
+    ...(ownerFilesEnabled
+      ? {
+          ownerFiles: [
+            'packages/daemon/src/sessions/handlers/session-script-publication.ts',
+          ] as const,
+        }
+      : {}),
+    catalog: { group: 'internal', key: 'sessionSaveScript' },
+    recordsSessionAction: false,
+    daemon: {
+      route: 'session',
+      refFrameEffect: 'preserve',
+      sessionKind: 'publication',
+    },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: false,
+    platformExecution: NO_PLATFORM_EXECUTION,
+  },
+  {
+    name: 'devices',
+    deviceClaimPolicy: 'observe',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/management/device.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'extended',
+    recordsSessionAction: false,
+    daemon: {
+      route: 'session',
+      refFrameEffect: 'preserve',
+      sessionKind: 'inventory',
+      lockPolicySelectorOverride: true,
+      ...REQUEST_EXECUTION_EXEMPT,
+    },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: true,
+    compositeResource: 'none',
+    platformExecution: { kind: 'inventory', use: inventoryUse },
+  },
+  {
+    name: 'capabilities',
+    deviceClaimPolicy: 'observe',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/management/device.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'extended',
+    recordsSessionAction: false,
+    daemon: {
+      androidAvdSelection: 'include-stopped',
+      route: 'session',
+      refFrameEffect: 'preserve',
+      sessionKind: 'inventory',
+      lockPolicySelectorOverride: true,
+      preferExplicitDeviceOverExistingSession: true,
+      ...REQUEST_EXECUTION_EXEMPT,
+    },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: true,
+    compositeResource: 'none',
+    // R63: `capabilities` executes nothing on a device. It reads one side-effect-free facts
+    // inspection and projects each command's own declared uses against it, so it has no platform
+    // execution path of its own to migrate — which is what `none` states. It is deliberately last
+    // among the command units: it projects the union of every migrated command's facts, so it is
+    // only truthful once that surface is complete.
+    platformExecution: NO_PLATFORM_EXECUTION,
+  },
+  {
+    name: 'doctor',
+    deviceClaimPolicy: 'observe',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/management/doctor.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'extended',
+    recordsSessionAction: false,
+    daemon: {
+      route: 'session',
+      refFrameEffect: 'preserve',
+      sessionKind: 'inventory',
+      lockPolicySelectorOverride: true,
+      allowSessionlessDefaultDevice: allowAnyDeviceSessionless,
+      ...REQUEST_EXECUTION_EXEMPT,
+    },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: true,
+    compositeResource: 'none',
+    platformExecution: HOST_PLATFORM_EXECUTION,
+  },
+  {
+    name: 'apps',
+    deviceClaimPolicy: 'observe',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/management/app.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'extended',
+    recordsSessionAction: false,
+    daemon: {
+      androidAvdSelection: 'include-stopped',
+      route: 'session',
+      refFrameEffect: 'preserve',
+      sessionKind: 'inventory',
+      lockPolicySelectorOverride: true,
+      preferExplicitDeviceOverExistingSession: true,
+      sessionlessLeaseAdmissionExemption: resolveDeferredProviderAppCatalogLeaseAdmissionExemption,
+    },
+    platformExecution: { kind: 'device-runtime', uses: [appsRuntimeUse] as const },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: true,
+    compositeResource: 'none',
+  },
+  {
+    name: 'boot',
+    deviceClaimPolicy: 'transient-exclusive',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/management/device.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'extended',
+    recordsSessionAction: false,
+    daemon: {
+      androidAvdSelection: 'include-stopped',
+      route: 'session',
+      refFrameEffect: 'may-invalidate',
+      sessionKind: 'state',
+    },
+    platformExecution: { kind: 'device-runtime', uses: deviceBootRuntimeUses },
+    // --timeout is a startup budget: it reaches the device boot wait, same as open/prepare
+    // (#2325). A first boot can outlast the fixed 90s envelope (#3004).
+    timeoutPolicy: { ...DEFAULT_TIMEOUT_POLICY, budget: { source: 'flag', envelope: 'margin' } },
+    batchable: true,
+    compositeResource: 'none',
+  },
+  {
+    name: 'shutdown',
+    deviceClaimPolicy: 'transient-exclusive',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/management/device.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'extended',
+    recordsSessionAction: false,
+    daemon: {
+      androidAvdSelection: 'include-stopped',
+      route: 'session',
+      refFrameEffect: 'may-invalidate',
+      sessionKind: 'state',
+    },
+    platformExecution: { kind: 'device-runtime', use: shutdownTargetUse },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: true,
+    compositeResource: 'none',
+  },
+  {
+    name: 'appstate',
+    deviceClaimPolicy: 'observe',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/system/index.ts'] as const }
+      : {}),
+    catalog: { group: 'public', key: 'appState' },
+    frameworkTier: 'extended',
+    recordsSessionAction: false,
+    daemon: {
+      route: 'session',
+      refFrameEffect: 'preserve',
+      sessionKind: 'state',
+    },
+    platformExecution: { kind: 'device-runtime', uses: appStateRuntimeUses },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: true,
+    compositeResource: 'none',
+  },
+  ...SESSION_OPERATION_COMMAND_DESCRIPTORS,
+  // -- snapshot (route: snapshot) --
+  {
+    name: 'snapshot',
+    deviceClaimPolicy: 'require-owner',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/capture/snapshot.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'core',
+    recordsSessionAction: true,
+    recordingEffect: 'observes-app',
+    daemon: { route: 'snapshot', refFrameEffect: 'preserve', appLease: 'allowed' },
+    // First Apple snapshot on a device can sit behind runner startup; --timeout
+    // widens the envelope, and a timeout must not tear down the daemon.
+    timeoutPolicy: { ...PRESERVE_DAEMON_TIMEOUT_POLICY, budget: { source: 'flag' } },
+    batchable: true,
+    compositeResource: 'none',
+    platformExecution: {
+      kind: 'device-runtime',
+      uses: snapshotRuntimePlanUses,
+      selectUses: selectSnapshotStepUses,
+    },
+  },
+  {
+    name: 'diff',
+    deviceClaimPolicy: 'require-owner',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/capture/diff.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'extended',
+    recordsSessionAction: true,
+    recordingEffect: 'observes-app',
+    daemon: { route: 'snapshot', refFrameEffect: 'preserve' },
+    timeoutPolicy: DEFAULT_TIMEOUT_POLICY,
+    batchable: true,
+    compositeResource: 'none',
+    platformExecution: {
+      kind: 'device-runtime',
+      uses: snapshotRuntimePlanUses,
+      selectUses: selectSnapshotStepUses,
+    },
+  },
+  ...DEVICE_OPERATION_COMMAND_DESCRIPTORS.captureAndSystem,
+  {
+    name: 'find',
+    deviceClaimPolicy: 'require-owner',
+    ...(ownerFilesEnabled
+      ? { ownerFiles: ['packages/command-surface/src/interaction/index.ts'] as const }
+      : {}),
+    catalog: { group: 'public' },
+    frameworkTier: 'core',
+    recordsSessionAction: true,
+    recordingEffect: findRecordingEffect,
+    daemon: {
+      route: 'find',
+      refFrameEffect: 'may-invalidate',
+      appLease: 'allowed',
+    },
+    timeoutPolicy: PRESERVE_DAEMON_TIMEOUT_POLICY,
+    batchable: true,
+    compositeResource: 'none',
+    platformExecution: {
+      kind: 'device-runtime',
+      uses: findRuntimePlanUses,
+      selectUses: selectFindStepUses,
+    },
+  },
+
+  ...DEVICE_OPERATION_COMMAND_DESCRIPTORS.interactionAndHardware,
+  ...LOCAL_CLI_COMMAND_DESCRIPTORS,
+] as const satisfies readonly RawCommandDescriptor[];
+
+/**
+ * Compile-time owner-claim totality. `keyof` on a union contains only keys
+ * shared by every member, so removing `ownerFiles` from any raw descriptor
+ * makes this resolve to `false` and fail the `AssertTrue` constraint.
+ */
+type AssertTrue<T extends true> = T;
+/** Exported only so `noUnusedLocals` keeps the guard alive. */
+export type CommandOwnerFileClaimsAreComplete = AssertTrue<
+  'ownerFiles' extends keyof (typeof RAW_COMMAND_DESCRIPTORS)[number] ? true : false
+>;
+
+type CompositeResourceClaimsAreComplete = AssertTrue<
+  'compositeResource' extends keyof Extract<
+    (typeof RAW_COMMAND_DESCRIPTORS)[number],
+    { batchable: true } | { recordsSessionAction: true }
+  >
+    ? true
+    : false
+>;
+
+const CLI_CATALOG_GROUPS = new Set<CommandCatalogGroup>(['public', 'local-cli']);
+
+const CLI_COMMAND_NAMES = new Set<string>(
+  RAW_COMMAND_DESCRIPTORS.filter((descriptor) =>
+    CLI_CATALOG_GROUPS.has(readCatalogGroup(descriptor)),
+  ).map((descriptor) => descriptor.name),
+);
+
+/**
+ * {@link RAW_COMMAND_DESCRIPTORS} normalized: `mcpExposed` and `platformExecution`
+ * resolved, `ownerFiles` kept out of the runtime shape. The raw array is the root every
+ * projection folds over, directly or through this normalized copy — `CLI_COMMAND_NAMES`
+ * and the MCP exposure list here, `COMMAND_OWNER_FILES` in `owner-files.ts`, the catalog
+ * records, the daemon registry and batch allowlist in their own modules, and the
+ * {@link COMMAND_DESCRIPTOR_BY_NAME}, {@link TIMEOUT_POLICY_BY_COMMAND},
+ * {@link DEVICE_CLAIM_POLICY_BY_COMMAND} and {@link RESPONSE_DATA_TRANSFORM_BY_COMMAND}
+ * maps below. Those four are keyed by `name`, so a duplicated entry collapses into one
+ * rather than conflicting.
+ *
+ * None of those has an independent table left to be byte-equal against: each consumer
+ * list became a projection of this array and its hand-authored source went away with it —
+ * `47abc8c416` (#907) daemon routes, `96bc7b190c` (#908) capability matrix (retired
+ * outright by `ea1d6b8c55` #2089), `607883d66c` (#909) batch allowlist, `8ef4e73408`
+ * (#1137) MCP exposure. The test that proved those equivalences is now an invariants-only
+ * guard at `src/__tests__/command-descriptor-parity.test.ts` (`2ec4e91b11` #2348).
+ *
+ * Two kinds of check replace that gate. Required traits are typed: `as const satisfies
+ * readonly RawCommandDescriptor[]` on the raw array, `satisfies readonly
+ * CommandDescriptor[]` here, and {@link CommandOwnerFileClaimsAreComplete} for owner
+ * claims. Classifications are pinned as literal command-name lists, so reclassifying or
+ * renaming a command they name means editing that list in the same diff: the device-claim
+ * deviating set in
+ * `packages/command-registry/src/__tests__/registry-device-claim-policy.test.ts`; the timeout
+ * envelopes and budgets in `src/__tests__/command-descriptor-timeout-policy.test.ts` (a
+ * declared trait since `b25ef7b024` #1084); and the `targetIdentityVerification` and
+ * `'core'` tier sets, plus the tier-iff-public rule, in
+ * `src/__tests__/command-descriptor-parity.test.ts`. A duplicated entry is caught by the
+ * list comparisons in `packages/command-registry/src/__tests__/owner-files.test.ts` and
+ * that parity test.
+ *
+ * The `as const` on {@link RAW_COMMAND_DESCRIPTORS} flows through this `.map`, so each
+ * entry keeps its literal `name`. That is what makes the {@link Command} union below a
+ * precise set of command-name literals rather than `string`.
+ */
+type StandaloneCommandProjection = Readonly<{
+  command: string;
+  arguments: 'original-required';
+  session: 'same-session';
+}>;
+
+function standaloneCommandProjection(
+  descriptor: RawCommandDescriptor,
+): StandaloneCommandProjection | undefined {
+  const publicCommand =
+    descriptor.catalog.group === 'internal'
+      ? descriptor.catalog.servesPublicCommand
+      : descriptor.catalog.group === 'public'
+        ? descriptor.name
+        : undefined;
+  return publicCommand
+    ? { command: publicCommand, arguments: 'original-required', session: 'same-session' }
+    : undefined;
+}
+
+export const commandDescriptors = RAW_COMMAND_DESCRIPTORS.map((descriptor) => {
+  const platformExecution = readDeclaredPlatformExecution(descriptor);
+  if (descriptor.name === 'record') assertRecordRuntimeExecution(platformExecution);
+  if (!ownerFilesEnabled) {
+    return {
+      ...descriptor,
+      mcpExposed: resolveMcpExposure(descriptor),
+      platformExecution,
+      standaloneCommandProjection: standaloneCommandProjection(descriptor),
+    };
+  }
+
+  const { ownerFiles: _, ...runtimeDescriptor } = descriptor;
+  return {
+    ...runtimeDescriptor,
+    mcpExposed: resolveMcpExposure(descriptor),
+    platformExecution,
+    standaloneCommandProjection: standaloneCommandProjection(descriptor),
+  };
+}) satisfies CompositeResourceClaimsAreComplete extends true ? readonly CommandDescriptor[] : never;
+
+/** The literal union of every registered command name. */
+export type Command = (typeof commandDescriptors)[number]['name'];
+
+type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
+/**
+ * Compile-time literalness of {@link Command}. The `as const` on {@link RAW_COMMAND_DESCRIPTORS}
+ * keeps each descriptor's literal `name` through the composition and the `.map` above; an array
+ * that lost it would widen this union to `string`, and nothing downstream would say so:
+ * `COMMAND_DEFAULTS` below stops rejecting an unknown key, and the `command: Command`
+ * parameters in `src/cli/command-explain.ts` and `owner-files.ts` would stop excluding a name no
+ * descriptor declares. That silence is why this is a type guard and not a value comparison.
+ */
+export type CommandUnionStaysLiteral = AssertTrue<Equal<Equal<Command, string>, false>>;
+/** The CLI view is narrowed from the same literals, so it cannot hide a widened root union. */
+export type CliCommandUnionStaysLiteral = AssertTrue<
+  Equal<Equal<DescriptorCliCommandName, string>, false>
+>;
+
+/**
+ * @internal Command names for one catalog group, sorted.
+ *
+ * Consumed only by `src/__tests__/command-descriptor-parity.test.ts`, which compares
+ * these names against the `PUBLIC_COMMANDS` / `INTERNAL_COMMANDS` records `catalog.ts`
+ * builds from {@link listDescriptorCatalogEntries}: a duplicated descriptor or a
+ * colliding `catalog.key` drops a name from one side of that comparison. Production code
+ * reads those records; this flat list is the second side the test checks them against,
+ * which is why the helper stays exported.
+ */
+export function listDescriptorCatalogCommandNames<Group extends CommandCatalogGroup>(
+  group: Group,
+): Array<DescriptorCommandNameForCatalogGroup<Group>> {
+  return listDescriptorCatalogEntries(group)
+    .map(([, name]) => name)
+    .sort();
+}
+
+export function listDescriptorCatalogEntries<Group extends CommandCatalogGroup>(
+  group: Group,
+): Array<readonly [key: string, name: DescriptorCommandNameForCatalogGroup<Group>]> {
+  return commandDescriptors
+    .filter((descriptor) => readCatalogGroup(descriptor) === group)
+    .map(
+      (descriptor) =>
+        [
+          readCatalogKey(descriptor),
+          descriptor.name as DescriptorCommandNameForCatalogGroup<Group>,
+        ] as const,
+    );
+}
+
+export function listMcpExposedCommandNames(): DescriptorCliCommandName[] {
+  return commandDescriptors
+    .filter((descriptor) => isMcpExposedCliCommand(descriptor))
+    .map((descriptor) => descriptor.name as DescriptorCliCommandName)
+    .sort();
+}
+
+export function commandRuntimeUseRequirements(
+  command: string,
+): readonly (readonly string[])[] | undefined {
+  const descriptor = commandDescriptors.find((candidate) => candidate.name === command);
+  const execution = descriptor?.platformExecution;
+  if (execution?.kind !== 'device-runtime') return undefined;
+  const uses = 'uses' in execution ? execution.uses : [execution.use];
+  return uses.map((use) => use.required);
+}
+
+export function listRuntimeFactCommands(): string[] {
+  return commandDescriptors
+    .filter(
+      (descriptor) =>
+        descriptor.catalog.group === 'public' &&
+        descriptor.platformExecution.kind === 'device-runtime',
+    )
+    .map((descriptor) => descriptor.name)
+    .sort();
+}
+
+const COMMAND_DESCRIPTOR_BY_NAME: ReadonlyMap<
+  string,
+  CommandDescriptor & { standaloneCommandProjection: StandaloneCommandProjection | undefined }
+> = new Map(commandDescriptors.map((descriptor) => [descriptor.name, descriptor]));
+
+export function resolveCommandCompositeResourceTrait(
+  command: string,
+): CompositeResourceTrait | undefined {
+  return COMMAND_DESCRIPTOR_BY_NAME.get(command)?.compositeResource;
+}
+
+export function resolveCommandStandaloneProjection(
+  command: string,
+): StandaloneCommandProjection | undefined {
+  return COMMAND_DESCRIPTOR_BY_NAME.get(command)?.standaloneCommandProjection;
+}
+
+function isCliCommandName(command: string): command is DescriptorCliCommandName {
+  return CLI_COMMAND_NAMES.has(command);
+}
+
+function resolveMcpExposure(descriptor: RawCommandDescriptor): boolean {
+  return descriptor.mcpExposed ?? CLI_COMMAND_NAMES.has(descriptor.name);
+}
+
+function isMcpExposedCliCommand(descriptor: CommandDescriptor): boolean {
+  return descriptor.mcpExposed && isCliCommandName(descriptor.name);
+}
+
+function readCatalogGroup(descriptor: {
+  name: string;
+  catalog: { group: CommandCatalogGroup; key?: string };
+}): CommandCatalogGroup {
+  return descriptor.catalog.group;
+}
+
+function readCatalogKey(descriptor: {
+  name: string;
+  catalog: { group: CommandCatalogGroup; key?: string };
+}): string {
+  return descriptor.catalog.key ?? descriptor.name;
+}
+
+const TIMEOUT_POLICY_BY_COMMAND: ReadonlyMap<string, CommandTimeoutPolicy> = new Map(
+  Array.from(COMMAND_DESCRIPTOR_BY_NAME.values(), (descriptor) => [
+    descriptor.name,
+    descriptor.timeoutPolicy,
+  ]),
+);
+
+const DEVICE_CLAIM_POLICY_BY_COMMAND: ReadonlyMap<string, DeviceClaimPolicy> = new Map(
+  commandDescriptors.map((descriptor) => [descriptor.name, descriptor.deviceClaimPolicy]),
+);
+
+const RESPONSE_DATA_TRANSFORM_BY_COMMAND: ReadonlyMap<string, CommandResponseDataTransform> =
+  new Map(
+    Array.from(COMMAND_DESCRIPTOR_BY_NAME.values()).flatMap((descriptor) =>
+      descriptor.responseDataTransform
+        ? [[descriptor.name, descriptor.responseDataTransform] as const]
+        : [],
+    ),
+  );
+
+export function resolveCommandPostActionObservationSupport(
+  command: string | undefined,
+): PostActionObservationSupport | undefined {
+  if (command === undefined) return undefined;
+  return COMMAND_DESCRIPTOR_BY_NAME.get(command)?.postActionObservation;
+}
+
+export function commandSupportsSettleObservation(command: string | undefined): boolean {
+  return resolveCommandPostActionObservationSupport(command) !== undefined;
+}
+
+export function commandSupportsVerifyEvidence(command: string | undefined): boolean {
+  return resolveCommandPostActionObservationSupport(command) === 'settle-and-verify';
+}
+
+/**
+ * The declared timeout policy for a command (ADR 0008). Command names outside
+ * the registry (internal probes, unknown commands) fall back to
+ * {@link DEFAULT_TIMEOUT_POLICY} — standard envelope, reset-daemon — exactly as
+ * the deleted hand lists treated unlisted commands.
+ */
+export function resolveCommandTimeoutPolicy(command: string | undefined): CommandTimeoutPolicy {
+  if (command === undefined) return DEFAULT_TIMEOUT_POLICY;
+  return TIMEOUT_POLICY_BY_COMMAND.get(command) ?? DEFAULT_TIMEOUT_POLICY;
+}
+
+/**
+ * The declared #1320 device-claim policy for a command. Names outside the
+ * registry (internal probes, unknown commands) resolve to `require-owner`: the
+ * value that performs no claim-store I/O at the binding seam, so an
+ * unregistered name can neither acquire nor be refused a claim.
+ */
+export function resolveCommandDeviceClaimPolicy(command: string | undefined): DeviceClaimPolicy {
+  if (command === undefined) return 'require-owner';
+  return DEVICE_CLAIM_POLICY_BY_COMMAND.get(command) ?? 'require-owner';
+}
+
+export function resolveCommandResponseDataTransform(
+  command: string | undefined,
+): CommandResponseDataTransform | undefined {
+  if (command === undefined) return undefined;
+  return RESPONSE_DATA_TRANSFORM_BY_COMMAND.get(command);
+}
+
+export function resolveCommandRecordsSessionAction(command: string | undefined): boolean {
+  if (command === undefined) return false;
+  return COMMAND_DESCRIPTOR_BY_NAME.get(command)?.recordsSessionAction ?? false;
+}
+
+/**
+ * The declared {@link CommandFrameworkTier} for a public command, or
+ * `undefined` for a command that never declares one. A tier is declared iff
+ * `catalog.group === 'public'`; that rule is a runtime pin, not a type rule —
+ * `src/__tests__/command-descriptor-parity.test.ts` asserts it and the exact
+ * `'core'` tool set, so a new public command cannot join a framework adapter's
+ * default set silently. Framework adapters (`agent-device/ai-sdk`,
+ * `@agent-device/eve`) read this to build their default tool set instead of
+ * hand-listing tool names.
+ */
+export function resolveCommandFrameworkTier(
+  command: string | undefined,
+): CommandFrameworkTier | undefined {
+  if (command === undefined) return undefined;
+  return COMMAND_DESCRIPTOR_BY_NAME.get(command)?.frameworkTier;
+}
+
+/**
+ * ADR 0012 / #1349: the replay verification phase for one command's recorded
+ * `target-v1` evidence, or `undefined` for a command whose steps never carry
+ * it (an annotation on such a step is inert, exactly like an old reader).
+ */
+export function resolveTargetIdentityVerification(
+  command: string,
+): TargetIdentityVerification | undefined {
+  return COMMAND_DESCRIPTOR_BY_NAME.get(command)?.targetIdentityVerification;
+}
+
+/** ADR 0016 request-sensitive app-state effect for one recorded request. */
+export function resolveCommandRecordingEffect(req: DispatchedCommand): RecordingEffect | undefined {
+  const descriptor = COMMAND_DESCRIPTOR_BY_NAME.get(req.command);
+  if (!descriptor?.recordsSessionAction) return undefined;
+  return typeof descriptor.recordingEffect === 'function'
+    ? descriptor.recordingEffect(req)
+    : descriptor.recordingEffect;
+}
+
+/**
+ * Whether a failed request for this command can have reached the device, from its declared
+ * recording effect: a read (`observes-app`) cannot have changed the app, a mutation may have, and
+ * any other command gets no verdict. The daemon's request seam and the client's transport failures
+ * both start from this; the client, which has no request ledger, adds one rule for a sent
+ * delegating composite ({@link isDelegatingCompositeCommand}).
+ */
+export function resolveCommandDispatchDisclosure(
+  req: DispatchedCommand,
+): DispatchDisclosure | undefined {
+  const effect = resolveCommandRecordingEffect(req);
+  if (effect === undefined) return undefined;
+  return effect === 'observes-app' ? 'no' : 'unknown';
+}
+
+/**
+ * Whether the command is a delegating composite (`batch`, `replay`, `test`) whose nested requests
+ * act. The daemon needs no verdict for it: its request ledger and each nested request disclose
+ * themselves. A caller with no ledger, such as the client after a send, cannot tell, so it
+ * assumes the nested requests may have acted.
+ */
+export function isDelegatingCompositeCommand(req: DispatchedCommand): boolean {
+  const refFrame = COMMAND_DESCRIPTOR_BY_NAME.get(req.command)?.daemon?.refFrameEffect;
+  return (typeof refFrame === 'function' ? refFrame(req) : refFrame) === 'delegated';
+}
+
+/**
+ * @internal The commands that declare a {@link CommandResponseDataTransform}, with it.
+ *
+ * Consumed only by `packages/command-surface/src/__tests__/command-surface-metadata.test.ts`, which
+ * checks every transform field against that command's declared input schema. The
+ * production projection of the same map is
+ * {@link listCommandResponseDataTransformFieldNames}.
+ */
+export function listCommandResponseDataTransforms(): Array<{
+  command: string;
+  transform: CommandResponseDataTransform;
+}> {
+  return Array.from(RESPONSE_DATA_TRANSFORM_BY_COMMAND, ([command, transform]) => ({
+    command,
+    transform,
+  }));
+}
+
+export function listCommandResponseDataTransformFieldNames(): string[] {
+  return [
+    ...new Set(
+      Array.from(RESPONSE_DATA_TRANSFORM_BY_COMMAND.values()).flatMap((transform) =>
+        Object.keys(transform.fields),
+      ),
+    ),
+  ].sort();
+}
+
+// The flag values a command applies when the caller omits them — the single source for both the
+// CLI parser and the daemon request scope. It lives in the registry (not a command facet, not a
+// new module) because the registry is already in both callers' eager closure and declares every
+// other command default here as a literal (see the `defaultValue` descriptors above).
+const COMMAND_DEFAULTS: Partial<Record<DescriptorCliCommandName, Partial<CommandFlags>>> = {
+  apps: { appsFilter: 'user-installed' },
+};
+
+export function applyCommandDefaults(
+  command: string | null,
+  flags: Record<string, unknown>,
+): boolean {
+  if (!command || !isCliCommandName(command)) return false;
+  const defaults = COMMAND_DEFAULTS[command];
+  if (!defaults) return false;
+  let changed = false;
+  for (const key of Object.keys(defaults) as Array<keyof CommandFlags>) {
+    if (flags[key] === undefined) {
+      flags[key] = defaults[key];
+      changed = true;
+    }
+  }
+  return changed;
+}

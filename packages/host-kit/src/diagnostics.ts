@@ -1,0 +1,16 @@
+export {
+  countDiagnosticEventsByPhase,
+  createRequestId,
+  DIAGNOSTIC_STDERR_PREFIX,
+  type DiagnosticEventInput,
+  type DiagnosticLevel,
+  emitDiagnostic,
+  flushDiagnosticsToSessionFile,
+  getDiagnosticsMeta,
+  registerDiagnosticSensitiveValue,
+  type ResourceDiagnostic,
+  toDiagnosticJson,
+  updateDiagnosticsScope,
+  withDiagnosticsScope,
+  withDiagnosticTimer,
+} from './internal/diagnostics.ts';

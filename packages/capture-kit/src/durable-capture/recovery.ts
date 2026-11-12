@@ -1,0 +1,272 @@
+import path from 'node:path';
+import type { DurableResourceEnvelope } from '@agent-device/contracts/durable-resource-envelope';
+import {
+  type LiveResourceHandle,
+  type ResourceUnreattachableReason,
+  isConfirmedCleanup,
+} from '@agent-device/contracts/durable-resource';
+import type { PlatformRequestScope } from '@agent-device/contracts/platform-runtime-host';
+import { emitDiagnostic, type ResourceDiagnostic } from '@agent-device/host-kit/diagnostics';
+import {
+  acquireDurableCaptureRecoveryAuthorityBeforeDeadline,
+  DurableCaptureRecoveryDeadlineError,
+  type DurableCaptureRecoveryAuthority,
+  type DurableCaptureRecoveryControl,
+} from './recovery-authority.ts';
+import { withDurableCaptureResourceFence } from './fence.ts';
+import type { DurableCaptureRecordDefinition } from './definition.ts';
+import { durableCaptureDiagnosticPrefix } from './labels.ts';
+import {
+  cleanupDurableCaptureDescriptor,
+  markCompletingDurableCapture,
+  transitionCleanupOutcome,
+} from './transitions.ts';
+
+const DEFAULT_ACQUISITION_DEADLINE_MS = 5_000;
+
+export type DurableCaptureRecoverySummary = Readonly<{
+  scanned: number;
+  recovered: number;
+  retained: number;
+}>;
+
+export type DurableCaptureRecoveryOutcome = 'ignored' | 'recovered' | 'retained';
+
+export type DurableCaptureRecoveryParams<K extends string, H extends LiveResourceHandle<C>, C> = {
+  definition: DurableCaptureRecordDefinition<K, C>;
+  sessionsDir: string;
+  /**
+   * The one directory a record for `sessionId` may occupy. A record found anywhere else is
+   * retained rather than recovered, so the caller owns how a session name becomes a directory.
+   */
+  resolveSessionDir(sessionId: string): string;
+  scope: PlatformRequestScope;
+  acquireControl(
+    envelope: DurableResourceEnvelope<K>,
+    scope: PlatformRequestScope,
+  ): Promise<DurableCaptureRecoveryControl<K, H, C>>;
+  /**
+   * Bounds one record's reattach acquisition only. The settle phase that follows has no bound
+   * here: the owner's `forceCleanup` and descriptor cleanup run under the record fence, and control
+   * disposal runs after the fence is released. Each owner must bound its own cleanup.
+   */
+  acquisitionDeadlineMs?: number;
+  onDiagnostic?: (diagnostic: ResourceDiagnostic) => void;
+};
+
+export async function recoverDurableCaptureResourcesAfterDaemonLock<
+  K extends string,
+  H extends LiveResourceHandle<C>,
+  C,
+>(params: DurableCaptureRecoveryParams<K, H, C>): Promise<DurableCaptureRecoverySummary> {
+  const paths = params.definition.store.list(params.sessionsDir);
+  const outcomes: DurableCaptureRecoveryOutcome[] = [];
+  for (const resourcePath of paths) {
+    // A canceled scope fails every later acquisition; the remaining records are retained for the
+    // next scan without acquiring control.
+    outcomes.push(
+      params.scope.signal.aborted
+        ? 'retained'
+        : await recoverDurableCaptureResource(params, resourcePath),
+    );
+  }
+  return {
+    scanned: paths.length,
+    recovered: outcomes.filter((outcome) => outcome === 'recovered').length,
+    retained: outcomes.filter((outcome) => outcome === 'retained').length,
+  };
+}
+
+export async function recoverDurableCaptureResource<
+  K extends string,
+  H extends LiveResourceHandle<C>,
+  C,
+>(
+  params: DurableCaptureRecoveryParams<K, H, C>,
+  resourcePath: string,
+): Promise<DurableCaptureRecoveryOutcome> {
+  const candidate = readRecoveryCandidate(params, resourcePath);
+  if (candidate.status !== 'recoverable') return candidate.status;
+  try {
+    const recovered = await recoverBeforeDeadline(
+      params,
+      resourcePath,
+      candidate.envelope,
+      params.acquisitionDeadlineMs ?? DEFAULT_ACQUISITION_DEADLINE_MS,
+    );
+    return recovered ? 'recovered' : 'retained';
+  } catch (error) {
+    report(
+      params,
+      error instanceof DurableCaptureRecoveryDeadlineError ? 'timed_out' : 'failed',
+      resourcePath,
+      {
+        error: error instanceof Error ? error.message : String(error),
+        ...(error instanceof DurableCaptureRecoveryDeadlineError
+          ? { deadlineMs: error.deadlineMs }
+          : {}),
+      },
+    );
+    return 'retained';
+  }
+}
+
+function readRecoveryCandidate<K extends string, H extends LiveResourceHandle<C>, C>(
+  params: DurableCaptureRecoveryParams<K, H, C>,
+  resourcePath: string,
+):
+  | Readonly<{ status: 'ignored' | 'retained' }>
+  | Readonly<{ status: 'recoverable'; envelope: DurableResourceEnvelope<K> }> {
+  const record = params.definition.store.read(resourcePath);
+  if (record.status === 'unreattachable') {
+    report(params, 'record_unreattachable', resourcePath, {
+      reason: record.reason,
+      message: record.message,
+      version: record.version,
+    });
+    return { status: 'retained' };
+  }
+  if (record.status === 'missing' || record.envelope.lifecycle === 'completed') {
+    return { status: 'ignored' };
+  }
+  const canonicalPath = params.definition.store.resolvePath(
+    params.resolveSessionDir(record.envelope.sessionId),
+  );
+  if (path.resolve(resourcePath) !== path.resolve(canonicalPath)) {
+    report(params, 'session_path_mismatch', resourcePath, {
+      envelopeSessionId: record.envelope.sessionId,
+      canonicalPath,
+    });
+    return { status: 'retained' };
+  }
+  return { status: 'recoverable', envelope: record.envelope };
+}
+
+async function recoverBeforeDeadline<K extends string, H extends LiveResourceHandle<C>, C>(
+  params: DurableCaptureRecoveryParams<K, H, C>,
+  resourcePath: string,
+  envelope: DurableResourceEnvelope<K>,
+  deadlineMs: number,
+): Promise<boolean> {
+  const authority = await acquireDurableCaptureRecoveryAuthorityBeforeDeadline({
+    displayName: params.definition.displayName,
+    envelope,
+    scope: params.scope,
+    deadlineMs,
+    acquireControl: params.acquireControl,
+    onLateCleanupFailure: (phase, cleanupError, primaryError) =>
+      report(params, phase, resourcePath, {
+        error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        primaryError: primaryError instanceof Error ? primaryError.message : String(primaryError),
+      }),
+  });
+  return await settleRecoveryAuthority(params, resourcePath, envelope, authority);
+}
+
+async function settleRecoveryAuthority<K extends string, H extends LiveResourceHandle<C>, C>(
+  params: DurableCaptureRecoveryParams<K, H, C>,
+  resourcePath: string,
+  envelope: DurableResourceEnvelope<K>,
+  authority: DurableCaptureRecoveryAuthority<K, H, C>,
+): Promise<boolean> {
+  try {
+    switch (authority.reattached.status) {
+      case 'active': {
+        const handle = authority.reattached.handle;
+        const cleanup = await withDurableCaptureResourceFence({
+          store: params.definition.store,
+          resourcePath,
+          expected: envelope.fence,
+          // The record committed between selection and this fence. The handle recovery reattached is
+          // still this process's native resource, so the terminal branch signals it too; only the
+          // record's own facts are off limits to it.
+          onCompleted: async () => await handle.forceCleanup(),
+          run: async (lease) => {
+            markCompletingDurableCapture(lease);
+            const outcome = await handle.forceCleanup();
+            transitionCleanupOutcome(lease, outcome);
+            return outcome;
+          },
+        });
+        return isConfirmedCleanup(cleanup);
+      }
+      case 'completed':
+        await transitionTerminal(params, resourcePath, envelope, {
+          ...params.definition.completionMetadata(authority.reattached.result),
+        });
+        return true;
+      case 'missing':
+        await transitionTerminal(params, resourcePath, envelope, {
+          recoveryStatus: 'already-missing',
+        });
+        return true;
+      case 'unreattachable': {
+        if (!allowsDurableCaptureDescriptorCleanup(authority.reattached.reason)) {
+          report(params, 'retained', resourcePath, {
+            reason: authority.reattached.reason,
+            message: authority.reattached.message,
+          });
+          return false;
+        }
+        const cleanup = await cleanupDurableCaptureDescriptor(params.definition, {
+          envelope,
+          resourcePath,
+          cleanup: () => authority.control.cleanup(envelope),
+        });
+        return isConfirmedCleanup(cleanup);
+      }
+    }
+  } finally {
+    await authority.control[Symbol.asyncDispose]();
+  }
+}
+
+async function transitionTerminal<K extends string, H extends LiveResourceHandle<C>, C>(
+  params: DurableCaptureRecoveryParams<K, H, C>,
+  resourcePath: string,
+  envelope: DurableResourceEnvelope<K>,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  await withDurableCaptureResourceFence({
+    store: params.definition.store,
+    resourcePath,
+    expected: envelope.fence,
+    // Whoever committed this record terminalized it first, and its facts are the ones a caller is
+    // served. Recovery does not overwrite a committed manifest with its own observation.
+    onCompleted: () => undefined,
+    run: async (lease) => {
+      lease.transition('completed', {
+        metadata: { ...(lease.envelope.metadata ?? {}), phase: 'completed', ...metadata },
+      });
+    },
+  });
+}
+
+export function allowsDurableCaptureDescriptorCleanup(
+  reason: ResourceUnreattachableReason,
+): boolean {
+  switch (reason) {
+    case 'descriptor-invalid':
+    case 'descriptor-version-unsupported':
+    case 'ownership-fence-lost':
+      return false;
+    case 'owner-unavailable':
+    case 'transport-not-reattachable':
+      return true;
+  }
+}
+
+function report<K extends string, H extends LiveResourceHandle<C>, C>(
+  params: DurableCaptureRecoveryParams<K, H, C>,
+  suffix: string,
+  resourcePath: string,
+  data: Record<string, unknown>,
+): void {
+  const diagnostic = {
+    phase: `${durableCaptureDiagnosticPrefix(params.definition.resourceKind)}_recovery_${suffix}`,
+    resourcePath,
+    data,
+  };
+  if (params.onDiagnostic) params.onDiagnostic(diagnostic);
+  else emitDiagnostic({ level: 'warn', phase: diagnostic.phase, data: { resourcePath, ...data } });
+}

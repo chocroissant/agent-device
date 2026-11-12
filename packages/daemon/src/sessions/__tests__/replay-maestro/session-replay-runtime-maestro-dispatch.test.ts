@@ -1,0 +1,434 @@
+import type { DaemonResponse } from '@agent-device/kernel/contracts';
+import { maestroReplayFixture } from './session-replay-runtime-maestro.fixtures.ts';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { test } from 'vitest';
+import {
+  DISPATCH_DISCLOSURE_TABLE_PATH,
+  assertDispatchDisclosureDriversMatchRows,
+  createLiveTestHostEnvironment,
+  dispatchDisclosureRowsOwnedBy,
+  mkdtempForTestSync,
+} from '@agent-device/test-kit';
+import { AppError } from '@agent-device/kernel/errors';
+import {
+  createRequestDispatchLedger,
+  recordNestedRequests,
+} from '../../../core/request-dispatch-ledger.ts';
+import { discloseRequestDispatch } from '../../../execution/request-dispatch-disclosure.ts';
+import type { DaemonRequest } from '../../../core/daemon-request.ts';
+import { SessionStore } from '../../../core/session-store.ts';
+import { replayScriptSourceBundleFor } from '../../../__tests__/support/replay-script-source-fixture.ts';
+import { makeIosSession } from '../../../__tests__/support/session-factories.ts';
+
+const { runReplayFixture, runReplayForTest, assertNoUnresolvedInterpolation } =
+  maestroReplayFixture;
+
+async function maestroDeferredSettleCaptureRefused(): Promise<unknown> {
+  const ledger = createRequestDispatchLedger();
+  const nested = recordNestedRequests(async (request) => {
+    if (request.command === 'back') {
+      if (request.internal?.dispatchLedger) {
+        request.internal.dispatchLedger.dispatchedSteps += 1;
+      }
+      return { ok: true, data: {} };
+    }
+    if (request.command === 'snapshot') {
+      return {
+        ok: false,
+        error: {
+          code: 'COMMAND_FAILED',
+          message: 'runner busy',
+          details: { reason: 'runner_busy', dispatched: 'no' },
+        },
+      };
+    }
+    return { ok: true, data: {} };
+  }, ledger);
+  const { response, calls } = await runReplayFixture({
+    label: 'dispatch-disclosure-maestro-deferred-capture',
+    script: 'appId: com.example.app\n---\n- back\n- assertVisible: "Continue"\n',
+    flags: { replayBackend: 'maestro', platform: 'ios' },
+    invoke: nested,
+  });
+  const req: DaemonRequest = {
+    token: 't',
+    session: 's',
+    command: 'replay',
+    positionals: ['flow.yaml'],
+    flags: { replayBackend: 'maestro', platform: 'ios' },
+  };
+  const disclosed = await discloseRequestDispatch(req, ledger, async () => response);
+  assert.deepEqual(
+    calls.map((call) => call.command),
+    ['back', 'snapshot'],
+  );
+  assert.equal(disclosed?.ok, false);
+  if (disclosed?.ok !== false) throw new Error('Expected deferred snapshot refusal');
+  const failure = new AppError(
+    disclosed.error.code,
+    disclosed.error.message,
+    disclosed.error.details,
+  );
+  assert.equal(failure.details?.dispatched, 'unknown');
+  assert.equal(failure.details?.dispatchedSteps, 1);
+  throw failure;
+}
+
+const DISPATCH_DISCLOSURE_DRIVERS: Record<string, () => Promise<unknown>> = {
+  'daemon.route.maestro-deferred-settle-capture-refused': maestroDeferredSettleCaptureRefused,
+};
+const DISPATCH_DISCLOSURE_ROWS = dispatchDisclosureRowsOwnedBy(
+  import.meta.url,
+  fs.readFileSync(DISPATCH_DISCLOSURE_TABLE_PATH, 'utf8'),
+);
+
+test('every Maestro dispatch-disclosure row has exactly one driver', () => {
+  assertDispatchDisclosureDriversMatchRows(
+    DISPATCH_DISCLOSURE_ROWS,
+    Object.keys(DISPATCH_DISCLOSURE_DRIVERS),
+  );
+});
+
+for (const row of DISPATCH_DISCLOSURE_ROWS) {
+  test(`${row.id}: ${row.trigger} → dispatched ${row.dispatched}`, async () => {
+    const drive = DISPATCH_DISCLOSURE_DRIVERS[row.id];
+    assert.ok(drive, `no driver for ${row.id}`);
+    await assert.rejects(drive(), (error: unknown) => {
+      assert.ok(error instanceof AppError);
+      assert.equal(error.details?.dispatched, row.dispatched);
+      assert.equal(error.details?.dispatchedSteps, 1);
+      return true;
+    });
+  });
+}
+
+test('--update no longer rejects Maestro compat flow controls (the guard existed only for rewrite safety)', async () => {
+  const { response } = await runReplayFixture({
+    label: 'maestro-replay-update-flow-control',
+    script: [
+      'appId: demo.app',
+      '---',
+      '- retry:',
+      '    maxRetries: 1',
+      '    commands:',
+      '      - back',
+      '',
+    ].join('\n'),
+    flags: { replayBackend: 'maestro', replayUpdate: true },
+  });
+
+  assert.equal(response.ok, true);
+});
+
+test('runReplayCommand dispatches resolved literals with file env overridden by CLI', async () => {
+  const { response, calls } = await runReplayFixture({
+    label: 'green',
+    script:
+      [
+        'context platform=android',
+        'env APP=file-app',
+        'env SCOPE=file-scope',
+        '',
+        'open ${APP}',
+        'snapshot -s ${SCOPE}',
+        'click "at ${AD_FILENAME}"',
+      ].join('\n') + '\n',
+    flags: { replayEnv: ['APP=cli-app'] },
+  });
+  assert.equal(response.ok, true);
+  const [open, snapshot, click] = calls;
+  assert.ok(open && snapshot && click);
+  // open ${APP} -> CLI override wins.
+  assert.equal(open.command, 'open');
+  assert.deepEqual(open.positionals, ['cli-app']);
+  // snapshot -s ${SCOPE} -> file env fills in.
+  assert.equal(snapshot.command, 'snapshot');
+  assert.equal(snapshot.flags?.snapshotScope, 'file-scope');
+  // click with ${AD_FILENAME} resolves to the relative script path.
+  assert.equal(click.command, 'click');
+  assert.deepEqual(click.positionals, ['at flow.ad']);
+  // And nothing dispatched still contains a literal ${...} token.
+  assertNoUnresolvedInterpolation(calls);
+});
+
+test('.ad replay normalizes resolved gesture and swipe syntax into structured daemon input', async () => {
+  const { response, calls } = await runReplayFixture({
+    label: 'structured-gesture-input',
+    script: [
+      'env X=10',
+      'gesture pan ${X} 20 30 40 500 --pointer-count 2',
+      'swipe ${X} 20 30 40 --count 2 --pause-ms 5 --pattern ping-pong',
+      '',
+    ].join('\n'),
+  });
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(
+    calls.map((call) => ({
+      command: call.command,
+      positionals: call.positionals,
+      input: call.input,
+    })),
+    [
+      {
+        command: 'gesture',
+        positionals: [],
+        input: {
+          kind: 'pan',
+          origin: { x: 10, y: 20 },
+          delta: { x: 30, y: 40 },
+          pointerCount: 2,
+          durationMs: 500,
+        },
+      },
+      {
+        command: 'swipe',
+        positionals: [],
+        input: {
+          from: { x: 10, y: 20 },
+          to: { x: 30, y: 40 },
+          count: 2,
+          pauseMs: 5,
+          pattern: 'ping-pong',
+        },
+      },
+    ],
+  );
+});
+
+test('runReplayCommand reports snapshot diagnostics from per-action session samples', async () => {
+  const root = mkdtempForTestSync('agent-device-replay-snapshot-samples-');
+  const scriptPath = path.join(root, 'flow.ad');
+  // Four warm captures beyond the cold start: the slow-run warning judges warm
+  // samples only and needs at least three of them.
+  fs.writeFileSync(
+    scriptPath,
+    ['snapshot', 'snapshot', 'snapshot', 'snapshot', 'snapshot', ''].join('\n'),
+  );
+  const sessionStore = new SessionStore(path.join(root, 'state'), createLiveTestHostEnvironment());
+  sessionStore.publish(
+    's',
+    makeIosSession('s', {
+      snapshotDiagnostics: { samples: [] },
+    }),
+  );
+  let captures = 0;
+
+  const response = await runReplayForTest({
+    req: {
+      token: 't',
+      session: 's',
+      command: 'replay',
+      positionals: [scriptPath],
+      flags: { replayScriptSource: replayScriptSourceBundleFor(scriptPath) },
+      meta: { cwd: root },
+    },
+    sessionName: 's',
+    logPath: path.join(root, 'log'),
+    sessionStore,
+    invoke: async (): Promise<DaemonResponse> => {
+      captures += 1;
+      const session = sessionStore.get('s');
+      session?.snapshotDiagnostics?.samples.push({
+        durationMs: captures === 1 ? 400 : 1_900,
+        backend: 'xctest',
+        platform: 'ios',
+      });
+      return {
+        ok: true,
+        data: {
+          snapshotDiagnostics: {
+            stats: {
+              count: captures,
+              p50Ms: captures === 1 ? 400 : 1_900,
+              p95Ms: captures === 1 ? 400 : 1_900,
+              maxMs: captures === 1 ? 400 : 1_900,
+              slowThresholdMs: 1_500,
+              platform: 'ios',
+            },
+          },
+        },
+      };
+    },
+  });
+
+  assert.equal(response.ok, true);
+  const diagnostics = response.data?.snapshotDiagnostics as
+    | { stats?: { count?: number }; warning?: string }
+    | undefined;
+  assert.equal(diagnostics?.stats?.count, 5);
+  assert.match(String(diagnostics?.warning), /p95 1900ms over 4 captures/);
+});
+
+test('runReplayCommand reports snapshot diagnostics on replay failure', async () => {
+  const root = mkdtempForTestSync('agent-device-replay-snapshot-failure-');
+  const scriptPath = path.join(root, 'flow.ad');
+  // Three warm captures precede the failing click so the failure-path summary
+  // has enough warm samples to judge.
+  fs.writeFileSync(
+    scriptPath,
+    ['snapshot', 'snapshot', 'snapshot', 'snapshot', 'click "Missing"', ''].join('\n'),
+  );
+  const sessionStore = new SessionStore(path.join(root, 'state'), createLiveTestHostEnvironment());
+  sessionStore.publish(
+    's',
+    makeIosSession('s', {
+      snapshotDiagnostics: { samples: [] },
+    }),
+  );
+  let captures = 0;
+
+  const response = await runReplayForTest({
+    req: {
+      token: 't',
+      session: 's',
+      command: 'replay',
+      positionals: [scriptPath],
+      flags: { replayScriptSource: replayScriptSourceBundleFor(scriptPath) },
+      meta: { cwd: root },
+    },
+    sessionName: 's',
+    logPath: path.join(root, 'log'),
+    sessionStore,
+    invoke: async (): Promise<DaemonResponse> => {
+      captures += 1;
+      const session = sessionStore.get('s');
+      session?.snapshotDiagnostics?.samples.push({
+        durationMs: captures === 1 ? 450 : 2_100,
+        backend: 'xctest',
+        platform: 'ios',
+      });
+      if (captures < 5) return { ok: true, data: {} };
+      return { ok: false, error: { code: 'COMMAND_FAILED', message: 'button missing' } };
+    },
+  });
+
+  assert.equal(response.ok, false);
+  const diagnostics = response.error.details?.snapshotDiagnostics as
+    | { stats?: { count?: number; p95Ms?: number }; warning?: string }
+    | undefined;
+  assert.equal(diagnostics?.stats?.count, 5);
+  assert.equal(diagnostics?.stats?.p95Ms, 2_100);
+  assert.match(String(diagnostics?.warning), /p95 2100ms over 4 captures/);
+});
+
+test('runReplayCommand applies mixed-case CLI and shell env overrides before Maestro compat mapping', async () => {
+  const { response, calls } = await runReplayFixture({
+    label: 'maestro-env',
+    script: [
+      'appId: ${appId}',
+      'env:',
+      '  appId: yaml-app',
+      '  buttonId: yaml-button',
+      '---',
+      '- launchApp',
+      '- tapOn:',
+      '    id: ${buttonId}',
+      '',
+    ].join('\n'),
+    flags: {
+      replayBackend: 'maestro',
+      platform: 'android',
+      replayShellEnv: { AD_VAR_buttonId: 'shell-button' },
+      replayEnv: ['appId=cli-app'],
+    },
+    invoke: async (req) => {
+      if (req.command === 'snapshot') {
+        return {
+          ok: true,
+          data: {
+            nodes: [
+              {
+                index: 1,
+                identifier: 'shell-button',
+                rect: { x: 20, y: 40, width: 120, height: 44 },
+              },
+            ],
+          },
+        };
+      }
+      return { ok: true, data: {} };
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(calls[0]?.positionals, ['cli-app']);
+  assert.deepEqual(
+    calls.map((call) => [call.command, call.positionals]),
+    [
+      ['open', ['cli-app']],
+      ['snapshot', []],
+      ['snapshot', []],
+      ['click', ['80', '62']],
+    ],
+  );
+});
+
+test('every nested Maestro request keeps the replay envelope and the resolved device flags', async () => {
+  const nested: DaemonRequest[] = [];
+  const { response } = await runReplayFixture({
+    label: 'maestro-nested-envelope',
+    script: ['appId: demo.app', '---', '- launchApp', '- back', ''].join('\n'),
+    flags: { replayBackend: 'maestro', platform: 'android' },
+    invoke: async (req) => {
+      nested.push(req);
+      if (req.command === 'snapshot') return { ok: true, data: { createdAt: 0, nodes: [] } };
+      return { ok: true, data: {} };
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.ok(nested.length >= 2);
+  for (const req of nested) {
+    assert.equal(req.token, 't');
+    assert.equal(req.session, 's');
+    assert.equal(req.meta?.cwd, nested[0]?.meta?.cwd);
+    assert.equal(req.flags?.platform, 'android');
+    assert.equal(req.flags?.target, 'mobile');
+    assert.equal(req.flags?.noRecord, true);
+  }
+  assert.equal(nested[0]?.command, 'open');
+  assert.equal(nested[0]?.flags?.relaunch, true);
+});
+
+// #2997: the flow command's --test-ime/--no-test-ime must reach the session open the
+// Maestro runtime dispatches, or a real-device flow cannot opt in to the test IME that
+// eraseText/backspace needs. Omitting the flag keeps it absent on the dispatch so the
+// session-open defaults (emulator on, device off) still decide.
+test('a Maestro replay carries its --test-ime opt-in onto the open it dispatches', async () => {
+  for (const testIme of [true, false] as const) {
+    const nested: DaemonRequest[] = [];
+    const { response } = await runReplayFixture({
+      label: `maestro-nested-test-ime-${testIme}`,
+      script: ['appId: demo.app', '---', '- launchApp', ''].join('\n'),
+      flags: { replayBackend: 'maestro', platform: 'android', testIme },
+      invoke: async (req) => {
+        nested.push(req);
+        return { ok: true, data: {} };
+      },
+    });
+
+    assert.equal(response.ok, true);
+    const open = nested.find((req) => req.command === 'open');
+    assert.ok(open);
+    assert.equal(open.flags?.testIme, testIme);
+  }
+
+  const nested: DaemonRequest[] = [];
+  const { response } = await runReplayFixture({
+    label: 'maestro-nested-test-ime-absent',
+    script: ['appId: demo.app', '---', '- launchApp', ''].join('\n'),
+    flags: { replayBackend: 'maestro', platform: 'android' },
+    invoke: async (req) => {
+      nested.push(req);
+      return { ok: true, data: {} };
+    },
+  });
+
+  assert.equal(response.ok, true);
+  const open = nested.find((req) => req.command === 'open');
+  assert.ok(open);
+  assert.equal(open.flags?.testIme, undefined);
+});

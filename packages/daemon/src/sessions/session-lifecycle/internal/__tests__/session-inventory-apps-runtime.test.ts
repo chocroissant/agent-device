@@ -1,0 +1,307 @@
+import { daemonPlatformServicesFixture } from '../../../../__tests__/support/platform-services-fixture.ts';
+import { beforeEach, expect, test, vi } from 'vitest';
+import type { DaemonRequest } from '../../../../core/daemon-request.ts';
+import {
+  makeSession,
+  makeSessionStore,
+} from '../../../../__tests__/support/handlers/session-test-harness.ts';
+import { handleSessionInventoryCommands } from '../inventory.ts';
+import { applicationLifecycleOperationFacts } from '@agent-device/contracts/application-lifecycle-runtime';
+import {
+  type RuntimeFacts,
+  localRuntimeOwner,
+  narrowDeviceBinding,
+} from '@agent-device/contracts/platform-runtime';
+import type { PlatformRuntimeOperations } from '@agent-device/contracts/platform-runtime-operations';
+import {
+  unavailableDeploymentSnapshotAndShutdownOperationFacts,
+  bindTestCommandHost,
+  createTestHostEnvironment,
+} from '@agent-device/test-kit';
+import type {
+  BindDeviceRuntime,
+  InspectDeviceRuntimeFacts,
+} from '../../../../core/request-runtime-binding.ts';
+import {
+  clearRequestAbortRegistration,
+  registerRequestAbort,
+} from '@agent-device/host-kit/request';
+
+bindTestCommandHost();
+
+const MACOS_DEVICE = {
+  platform: 'apple' as const,
+  appleOs: 'macos' as const,
+  id: 'macos-1',
+  name: 'macOS test host',
+  kind: 'device' as const,
+  target: 'desktop' as const,
+  booted: true,
+};
+
+const appsAvailable = { available: true } as const;
+const unavailable = { available: false, reason: 'owner-capability-missing' } as const;
+
+function runtimeFacts(
+  overrides: Partial<RuntimeFacts<PlatformRuntimeOperations>['operations']> = {},
+): RuntimeFacts<PlatformRuntimeOperations> {
+  return {
+    device: {
+      family: 'apple',
+      appleOs: 'macos',
+      kind: 'device',
+      target: 'desktop',
+      providerMode: 'local',
+    },
+    operations: {
+      appLogInspect: unavailable,
+      appLogDoctor: unavailable,
+      appLogStart: unavailable,
+      appLogReattach: unavailable,
+      appLogCleanup: unavailable,
+      appState: unavailable,
+      listApps: appsAvailable,
+      networkDump: unavailable,
+      screenRecordingStart: unavailable,
+      screenRecordingReattach: unavailable,
+      screenRecordingCleanup: unavailable,
+      ensureReady: appsAvailable,
+      bootTarget: unavailable,
+      bootTargetHeadless: unavailable,
+      ...unavailableDeploymentSnapshotAndShutdownOperationFacts,
+      ...applicationLifecycleOperationFacts({
+        resolveOpenTarget: unavailable,
+        prepareApplicationOpen: unavailable,
+        openApplication: unavailable,
+        applyRuntimeHints: unavailable,
+        clearRuntimeHints: unavailable,
+        closeApplication: unavailable,
+        finalizeApplicationClose: unavailable,
+        prepareAppleRunner: unavailable,
+        configureProviderPortReverse: unavailable,
+      }),
+      // Last, so a caller can override any cell above. Earlier it sat before the two fixed fact
+      // maps, which quietly dropped an override for a cell either map already stated.
+      ...overrides,
+    },
+  };
+}
+
+const inspectFactsImpl: InspectDeviceRuntimeFacts = async () => runtimeFacts();
+
+const inspectFacts = vi.fn(inspectFactsImpl);
+const ensureReady = vi.fn(async () => MACOS_DEVICE);
+const listApps = vi.fn(async () => [{ id: 'com.example.app', name: 'Example' }]);
+let bindCount = 0;
+const bindDevice: BindDeviceRuntime = async (device, use) => {
+  bindCount += 1;
+  return narrowDeviceBinding(
+    {
+      device,
+      owner: localRuntimeOwner('apple'),
+      facts: runtimeFacts(),
+      operations: {
+        ensureReady,
+        listApps,
+      },
+      [Symbol.asyncDispose]: async () => {},
+    },
+    use,
+  );
+};
+
+beforeEach(() => {
+  inspectFacts.mockClear();
+  ensureReady.mockClear();
+  listApps.mockClear();
+  bindCount = 0;
+});
+
+test('a runtimeFacts override reaches a cell the fixed fact maps state', () => {
+  // `unavailableDeploymentSnapshotAndShutdownOperationFacts` states findText. An override spread
+  // before that map was dropped, which is how the helper came to lie about its own parameter.
+  const overridden = { available: true } as const;
+  expect(runtimeFacts({ findText: overridden }).operations.findText).toBe(overridden);
+});
+
+test('macOS apps consumes generic readiness and app inventory through one runtime bind', async () => {
+  const sessionName = 'macos-apps';
+  const sessionStore = makeSessionStore();
+  sessionStore.publish(sessionName, makeSession(sessionName, MACOS_DEVICE));
+  const req: DaemonRequest = {
+    token: 'test-token',
+    session: sessionName,
+    command: 'apps',
+    positionals: [],
+    flags: { appsFilter: 'all' },
+  };
+
+  const response = await handleSessionInventoryCommands({
+    host: createTestHostEnvironment(),
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    sessionName,
+    sessionStore,
+    inspectFacts,
+    bindDevice,
+  });
+
+  expect(response).toEqual({ ok: true, data: { apps: ['Example (com.example.app)'] } });
+  expect(inspectFacts).toHaveBeenCalledOnce();
+  expect(bindCount).toBe(1);
+  expect(ensureReady).toHaveBeenCalledOnce();
+  expect(listApps).toHaveBeenCalledOnce();
+});
+
+test('apps reports the refused operation fact typed reason on the wire', async () => {
+  const sessionName = 'macos-apps-unsupported';
+  const sessionStore = makeSessionStore();
+  sessionStore.publish(sessionName, makeSession(sessionName, MACOS_DEVICE));
+  inspectFacts.mockResolvedValueOnce(
+    runtimeFacts({
+      listApps: {
+        available: false,
+        reason: 'owner-capability-missing',
+        hint: 'WebDriver provider runtimes do not expose app inventory.',
+      },
+    }),
+  );
+
+  const response = await handleSessionInventoryCommands({
+    host: createTestHostEnvironment(),
+    platformServices: daemonPlatformServicesFixture(),
+    req: {
+      token: 'test-token',
+      session: sessionName,
+      command: 'apps',
+      positionals: [],
+      flags: { appsFilter: 'all' },
+    },
+    sessionName,
+    sessionStore,
+    inspectFacts,
+    bindDevice,
+  });
+
+  expect(response).toEqual({
+    ok: false,
+    error: {
+      code: 'UNSUPPORTED_OPERATION',
+      message: 'apps is not supported on this device',
+      hint: 'WebDriver provider runtimes do not expose app inventory.',
+      details: { reason: 'owner-capability-missing' },
+    },
+  });
+  expect(bindCount).toBe(0);
+  expect(listApps).not.toHaveBeenCalled();
+});
+
+test('deferred provider apps returns uploaded assets without resolving a device', async () => {
+  const sessionStore = makeSessionStore();
+  const listAvailableApps = vi.fn(async () => ['Example.apk', 'Settings.apk']);
+  const req: DaemonRequest = {
+    token: 'test-token',
+    session: 'limrun-apps',
+    command: 'apps',
+    positionals: [],
+    flags: {
+      platform: 'android',
+      leaseProvider: 'limrun',
+    },
+  };
+
+  const response = await handleSessionInventoryCommands({
+    host: createTestHostEnvironment(),
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    sessionName: req.session,
+    sessionStore,
+    inspectFacts,
+    bindDevice,
+    providerAppCatalog: {
+      supports: (provider) => provider === 'limrun',
+      list: listAvailableApps,
+    },
+  });
+
+  expect(response).toEqual({
+    ok: true,
+    data: { apps: ['Example.apk', 'Settings.apk'] },
+  });
+  expect(listAvailableApps).toHaveBeenCalledWith(
+    {
+      provider: 'limrun',
+      platform: 'android',
+    },
+    undefined,
+  );
+  expect(inspectFacts).not.toHaveBeenCalled();
+  expect(bindCount).toBe(0);
+});
+
+test('deferred provider apps forwards request cancellation to the catalog', async () => {
+  const requestId = 'provider-app-catalog-abort';
+  const registration = registerRequestAbort(requestId);
+  const reason = new Error('catalog canceled');
+  const listAvailableApps = vi.fn(async (_query, signal?: AbortSignal) => {
+    expect(signal).toBe(registration?.controller.signal);
+    return await new Promise<readonly string[]>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  });
+  const req: DaemonRequest = {
+    token: 'test-token',
+    session: 'limrun-apps-abort',
+    command: 'apps',
+    positionals: [],
+    flags: { platform: 'ios', leaseProvider: 'limrun' },
+    meta: { requestId },
+  };
+
+  try {
+    const response = handleSessionInventoryCommands({
+      host: createTestHostEnvironment(),
+      platformServices: daemonPlatformServicesFixture(),
+      req,
+      sessionName: req.session,
+      sessionStore: makeSessionStore(),
+      providerAppCatalog: {
+        supports: (provider) => provider === 'limrun',
+        list: listAvailableApps,
+      },
+    });
+    registration?.controller.abort(reason);
+    await expect(response).rejects.toBe(reason);
+  } finally {
+    clearRequestAbortRegistration(registration);
+  }
+});
+
+test('deferred provider apps forwards public daemon access to the catalog', async () => {
+  const listAvailableApps = vi.fn(async () => ['Example.apk']);
+  const req: DaemonRequest = {
+    token: 'test-token',
+    session: 'limrun-public-apps',
+    command: 'apps',
+    positionals: [],
+    flags: { platform: 'ios', leaseProvider: 'limrun' },
+    internal: { publicNetworkOnly: true },
+  };
+
+  await handleSessionInventoryCommands({
+    host: createTestHostEnvironment(),
+    platformServices: daemonPlatformServicesFixture(),
+    req,
+    sessionName: req.session,
+    sessionStore: makeSessionStore(),
+    providerAppCatalog: {
+      supports: (provider) => provider === 'limrun',
+      list: listAvailableApps,
+    },
+  });
+
+  expect(listAvailableApps).toHaveBeenCalledWith(
+    { provider: 'limrun', platform: 'ios', publicNetworkOnly: true },
+    undefined,
+  );
+});

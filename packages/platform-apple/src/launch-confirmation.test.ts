@@ -1,0 +1,762 @@
+import { expect, test, vi } from 'vitest';
+import { setTimeout as realDelay } from 'node:timers/promises';
+import { DEFAULT_ALERT_TIMEOUT_MS } from '@agent-device/contracts/alert-contract';
+import { awaitAppleAlert, readAppleAlert } from './alert.ts';
+import { runAppleRunnerCommand } from './core/runner-client.ts';
+import type { Interactor } from '@agent-device/contracts/interactor-types';
+import type { DeviceInfo } from '@agent-device/kernel/device';
+import { emitDiagnostic } from '@agent-device/host-kit/diagnostics';
+import { AppError } from '@agent-device/kernel/errors';
+import type { ExecOptions, ExecResult } from '@agent-device/host-kit/command';
+import { resolveIosSimulatorDeepLinkBundleId } from './core/app-resolution.ts';
+import { IOS_APP_LAUNCH_TIMEOUT_MS } from './core/config.ts';
+import {
+  type AppleToolProvider,
+  withAppleToolProvider,
+  createLocalAppleToolProvider,
+} from './core/tool-provider.ts';
+import {
+  answerLaunchConfirmation,
+  answerSimulatorLaunchConfirmation,
+  createLaunchConfirmationPort,
+  LAUNCH_CONFIRMATION_FOREIGN_APP_REASON,
+  type LaunchConfirmationPort,
+  type LaunchConfirmationAttempt,
+  URL_OWNER_LOOKUP_TIMEOUT_MS,
+} from './launch-confirmation.ts';
+import { alertNotFound, CONFIRMATION } from './launch-confirmation.fixtures.ts';
+
+vi.mock('./core/runner-client.ts', () => ({ runAppleRunnerCommand: vi.fn() }));
+
+vi.mock('@agent-device/host-kit/diagnostics', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@agent-device/host-kit/diagnostics')>();
+  return { ...actual, emitDiagnostic: vi.fn() };
+});
+
+vi.mock('./core/app-resolution.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./core/app-resolution.ts')>();
+  return {
+    ...actual,
+    resolveIosSimulatorDeepLinkBundleId: vi.fn(actual.resolveIosSimulatorDeepLinkBundleId),
+  };
+});
+
+const simulator: DeviceInfo = {
+  platform: 'apple',
+  appleOs: 'ios',
+  id: 'ios-simulator',
+  name: 'iPhone 17 Pro',
+  kind: 'simulator',
+  target: 'mobile',
+  booted: true,
+};
+
+/** How `exec.ts` rejects a spawn that outlives its timeout; `allowFailure` does not absorb it. */
+function spawnTimeout(): AppError {
+  return new AppError('COMMAND_FAILED', 'xcrun timed out', { timeoutMs: 10_000 });
+}
+
+function port(
+  readAlert: () => Promise<Record<string, unknown> | undefined>,
+  legs: Readonly<{
+    resolveUrlOwner?: () => Promise<string | undefined>;
+    acceptAlert?: () => Promise<unknown>;
+    deadlineAtMs?: number;
+  }> = {},
+) {
+  const acceptAlert = vi.fn(legs.acceptAlert ?? (async () => ({})));
+  const resolveUrlOwner = vi.fn(legs.resolveUrlOwner ?? (async () => 'com.example.app'));
+  const value: LaunchConfirmationPort = {
+    appBundleId: 'com.example.app',
+    awaitAlert: vi.fn(readAlert),
+    readAlert: vi.fn(readAlert),
+    acceptAlert,
+    resolveUrlOwner,
+    deadlineAtMs: legs.deadlineAtMs,
+  };
+  return { port: value, acceptAlert, resolveUrlOwner };
+}
+
+test.each([
+  ['English', 'Open in “Example App”?', ['Cancel', 'Open']],
+  ['French', 'Ouvrir dans «\u00A0Modèle RN\u00A0»\u00A0?', ['Annuler', 'Ouvrir']],
+  ['Japanese', '“テスト”で開きますか?', ['キャンセル', '開く']],
+])(
+  'accepts a %s confirmation the runner marked when the URL owner is the session app',
+  async (_language, message, items) => {
+    const { port: device, acceptAlert } = port(async () => ({
+      message,
+      items,
+      launchConfirmationPrompt: true,
+    }));
+
+    await expect(answerLaunchConfirmation(device)).resolves.toEqual({ outcome: 'accepted' });
+    expect(device.awaitAlert).toHaveBeenCalledOnce();
+    expect(acceptAlert).toHaveBeenCalledOnce();
+  },
+);
+
+test('a confirmation for a URL another app owns is never accepted, whatever name it shows', async () => {
+  const { port: device, acceptAlert } = port(async () => CONFIRMATION, {
+    resolveUrlOwner: async () => 'com.example.other',
+  });
+
+  const failure = await answerLaunchConfirmation(device).catch((error: unknown) => error);
+
+  expect(failure).toBeInstanceOf(AppError);
+  expect((failure as AppError).code).toBe('COMMAND_FAILED');
+  expect((failure as AppError).details).toMatchObject({
+    reason: LAUNCH_CONFIRMATION_FOREIGN_APP_REASON,
+    foreignAppBundleId: 'com.example.other',
+    sessionAppBundleId: 'com.example.app',
+  });
+  expect(acceptAlert).not.toHaveBeenCalled();
+});
+
+test('no alert costs one read and answers nothing', async () => {
+  const { port: device, acceptAlert, resolveUrlOwner } = port(async () => undefined);
+
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual({ outcome: 'absent' });
+  expect(device.awaitAlert).toHaveBeenCalledOnce();
+  expect(resolveUrlOwner).not.toHaveBeenCalled();
+  expect(acceptAlert).not.toHaveBeenCalled();
+});
+
+test('an alert that is not a launch confirmation is left for the caller and reported', async () => {
+  const {
+    port: device,
+    acceptAlert,
+    resolveUrlOwner,
+  } = port(async () => ({
+    message: 'Allow “Example App” to use your location?',
+    items: ['Allow Once', 'Don’t Allow'],
+  }));
+
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual({
+    outcome: 'unanswered',
+    reason: 'alert-unrecognized',
+  });
+  expect(resolveUrlOwner).not.toHaveBeenCalled();
+  expect(acceptAlert).not.toHaveBeenCalled();
+  expect(emitDiagnostic).toHaveBeenCalledWith({
+    level: 'warn',
+    phase: 'ios_launch_confirmation_unanswered',
+    data: {
+      reason: 'alert-unrecognized',
+      title: 'Allow “Example App” to use your location?',
+      buttons: ['Allow Once', 'Don’t Allow'],
+    },
+  });
+});
+
+test('a launch-like alert the runner did not mark is left on screen and reported', async () => {
+  const { port: device, acceptAlert } = port(async () => ({
+    message: 'In „Beispiel-App“ öffnen?',
+    items: ['Abbrechen', 'Öffnen'],
+  }));
+
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual({
+    outcome: 'unanswered',
+    reason: 'alert-unrecognized',
+  });
+  expect(acceptAlert).not.toHaveBeenCalled();
+  expect(emitDiagnostic).toHaveBeenCalledWith(
+    expect.objectContaining({
+      data: expect.objectContaining({
+        reason: 'alert-unrecognized',
+        title: 'In „Beispiel-App“ öffnen?',
+      }),
+    }),
+  );
+});
+
+test('a URL no single installed app owns is neither accepted nor reported as foreign', async () => {
+  const { port: device, acceptAlert } = port(async () => CONFIRMATION, {
+    resolveUrlOwner: async () => undefined,
+  });
+
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual({
+    outcome: 'unanswered',
+    reason: 'url-owner-unresolved',
+  });
+  expect(acceptAlert).not.toHaveBeenCalled();
+});
+
+test.each([
+  [
+    'the alert read fails',
+    port(async () => {
+      throw new AppError('COMMAND_FAILED', 'runner unavailable', { reason: 'runner-start-failed' });
+    }),
+    { outcome: 'unreadable', step: 'alert-read' },
+  ],
+  [
+    'the URL owner lookup rejects',
+    port(async () => CONFIRMATION, {
+      resolveUrlOwner: async () => {
+        throw spawnTimeout();
+      },
+    }),
+    { outcome: 'unreadable', step: 'url-owner' },
+  ],
+  [
+    'the accept rejects and the confirmation remains',
+    port(async () => CONFIRMATION, {
+      acceptAlert: async () => {
+        throw spawnTimeout();
+      },
+    }),
+    { outcome: 'unanswered', reason: 'alert-still-present' },
+  ],
+])('an answer attempt where %s reports %j', async (_case, { port: device }, expected) => {
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual(expected);
+});
+
+/**
+ * A CoreSimulator that never answers: each spawn settles only when its exec timeout fires or its
+ * signal aborts, the way `exec.ts` ends a wedged child. `answers` lets named spawns answer at once,
+ * so the wedge can sit behind a listing that succeeded.
+ */
+function wedgedCoreSimulator(
+  answers: Readonly<Record<string, string>> = {},
+  onSpawn?: (count: number) => void,
+): AppleToolProvider & { spawns: () => number } {
+  let spawns = 0;
+  const answered = (key: string): ExecResult | undefined => {
+    const stdout = answers[key];
+    if (stdout === undefined) return undefined;
+    spawns += 1;
+    onSpawn?.(spawns);
+    return { stdout, stderr: '', exitCode: 0 } as ExecResult;
+  };
+  const hang = async (options?: ExecOptions): Promise<ExecResult> =>
+    await new Promise((_resolve, reject) => {
+      spawns += 1;
+      onSpawn?.(spawns);
+      if (options?.signal?.aborted) {
+        reject(options.signal.reason);
+        return;
+      }
+      const timer = options?.timeoutMs
+        ? setTimeout(() => reject(spawnTimeout()), options.timeoutMs)
+        : undefined;
+      options?.signal?.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(timer);
+          reject(options.signal?.reason);
+        },
+        { once: true },
+      );
+    });
+  return {
+    ...createLocalAppleToolProvider({
+      whichCommand: async () => true,
+      runCommand: async (cmd, args, options) =>
+        answered(`${cmd} ${args.at(-1)}`) ?? (await hang(options)),
+      simctl: { run: async (args, options) => answered(args[0] ?? '') ?? (await hang(options)) },
+      devicectl: { run: async (_args, options) => await hang(options) },
+    }),
+    spawns: () => spawns,
+  };
+}
+
+const LISTED_APP = JSON.stringify({
+  'com.example.app': {
+    ApplicationType: 'User',
+    Path: '/apps/Example.app',
+    CFBundleName: 'Example',
+  },
+});
+
+test.each([
+  ['one Info.plist read hangs after the app list answered', { listapps: LISTED_APP }],
+  [
+    'the app list answered in a format only plutil can convert, and that conversion hangs',
+    { listapps: '{ "com.example.app" = { ApplicationType = User; }; }' },
+  ],
+])(
+  'the owner lookup is bounded as a whole: %s and the open is left unanswered within its budget',
+  async (_case, answers) => {
+    // Only the clock is faked: the lookup stats the Info.plist on the real file system before it
+    // spawns plutil, and that I/O must complete before the budget is advanced past.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    vi.mocked(emitDiagnostic).mockClear();
+    const lookupAbort = new AbortController();
+    try {
+      const { interactor, acceptAlert } = confirmationRunner();
+      let signalLookupStarted: () => void;
+      const lookupStarted = new Promise<void>((resolve) => {
+        signalLookupStarted = resolve;
+      });
+      const coreSimulator = wedgedCoreSimulator(answers, (count) => {
+        if (count === 2) signalLookupStarted();
+      });
+      let answered: unknown = 'pending';
+      const answer = withAppleToolProvider(coreSimulator, async () =>
+        answerSimulatorLaunchConfirmation(
+          simulator,
+          { url: 'example://automation', appBundleId: 'com.example.app' },
+          Promise.resolve(interactor),
+          lookupAbort.signal,
+          undefined,
+        ).then((value) => (answered = value)),
+      );
+
+      const ioWait = new AbortController();
+      try {
+        await Promise.race([
+          lookupStarted,
+          answer.then(() => {
+            throw new Error('Owner lookup completed before the second command started');
+          }),
+          realDelay(1_000, undefined, { signal: ioWait.signal }).then(() => {
+            throw new Error('Owner lookup did not start its second command');
+          }),
+        ]);
+      } finally {
+        ioWait.abort();
+      }
+      expect(coreSimulator.spawns()).toBe(2);
+      await vi.advanceTimersByTimeAsync(URL_OWNER_LOOKUP_TIMEOUT_MS + 1);
+      expect(answered).toEqual({ outcome: 'unreadable', step: 'url-owner' });
+      await answer;
+      expect(acceptAlert).not.toHaveBeenCalled();
+      expect(emitDiagnostic).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ reason: 'step-failed', step: 'url-owner' }),
+        }),
+      );
+    } finally {
+      lookupAbort.abort();
+      vi.useRealTimers();
+    }
+  },
+);
+
+function confirmationRunner() {
+  const acceptAlert = vi.fn(async () => ({}));
+  const interactor = {
+    awaitAlert: async () => CONFIRMATION,
+    readAlert: async () => CONFIRMATION,
+    acceptAlert,
+  } as unknown as Interactor;
+  return { interactor, acceptAlert };
+}
+
+test('a hung URL owner lookup leaves the open unanswered within the launch budget', async () => {
+  vi.useFakeTimers();
+  try {
+    const { interactor, acceptAlert } = confirmationRunner();
+    let answered: unknown = 'pending';
+    const answer = withAppleToolProvider(wedgedCoreSimulator(), async () =>
+      answerSimulatorLaunchConfirmation(
+        simulator,
+        { url: 'example://automation', appBundleId: 'com.example.app' },
+        Promise.resolve(interactor),
+        new AbortController().signal,
+        undefined,
+      ).then((value) => (answered = value)),
+    );
+
+    await vi.advanceTimersByTimeAsync(IOS_APP_LAUNCH_TIMEOUT_MS - 1);
+    expect(answered).toEqual({ outcome: 'unreadable', step: 'url-owner' });
+    await answer;
+    expect(acceptAlert).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each([
+  ['during the lookup', false],
+  ['before the lookup starts', true],
+])('the open aborting %s ends the URL owner lookup', async (_label, abortedBeforeLookup) => {
+  const { interactor, acceptAlert } = confirmationRunner();
+  const open = new AbortController();
+  const canceled = new AppError('COMMAND_FAILED', 'request canceled');
+  if (abortedBeforeLookup) open.abort(canceled);
+  const coreSimulator = wedgedCoreSimulator();
+  const answer = withAppleToolProvider(coreSimulator, async () =>
+    answerSimulatorLaunchConfirmation(
+      simulator,
+      { url: 'example://automation', appBundleId: 'com.example.app' },
+      Promise.resolve(interactor),
+      open.signal,
+      undefined,
+    ),
+  );
+
+  await vi.waitFor(() => expect(coreSimulator.spawns()).toBe(1));
+  if (!abortedBeforeLookup) open.abort(canceled);
+
+  await expect(answer).resolves.toEqual({ outcome: 'unreadable', step: 'url-owner' });
+  expect(acceptAlert).not.toHaveBeenCalled();
+});
+
+test('the launch confirmation waits for a system prompt that is still appearing', async () => {
+  vi.useFakeTimers();
+  const runner = vi.mocked(runAppleRunnerCommand);
+  runner.mockRejectedValueOnce(alertNotFound()).mockResolvedValueOnce(CONFIRMATION);
+  try {
+    const interactor = {
+      readAlert: (options) => readAppleAlert(simulator, {}, options, process.env),
+      awaitAlert: (options) => awaitAppleAlert(simulator, {}, options, process.env),
+      acceptAlert: vi.fn(),
+    } satisfies Pick<Interactor, 'readAlert' | 'awaitAlert' | 'acceptAlert'>;
+    const device = createLaunchConfirmationPort(
+      simulator,
+      { url: 'example://automation', appBundleId: 'com.example.app' },
+      interactor,
+      new AbortController().signal,
+      undefined,
+    );
+    const pending = device.awaitAlert();
+    await vi.advanceTimersByTimeAsync(500);
+    await expect(pending).resolves.toEqual(CONFIRMATION);
+    expect(runner).toHaveBeenCalledTimes(2);
+  } finally {
+    runner.mockReset();
+    vi.useRealTimers();
+  }
+});
+
+test('an expired confirmation wait retains typed absence instead of an unreadable attempt', async () => {
+  vi.useFakeTimers();
+  const runner = vi.mocked(runAppleRunnerCommand);
+  runner.mockRejectedValue(alertNotFound());
+  try {
+    const device = createLaunchConfirmationPort(
+      simulator,
+      { url: 'example://automation', appBundleId: 'com.example.app' },
+      {
+        awaitAlert: (options) => awaitAppleAlert(simulator, {}, options, process.env),
+        readAlert: (options) => readAppleAlert(simulator, {}, options, process.env),
+        acceptAlert: vi.fn(),
+      },
+      new AbortController().signal,
+      undefined,
+    );
+    const pending = answerLaunchConfirmation(device);
+    await vi.advanceTimersByTimeAsync(11_000);
+    await expect(pending).resolves.toEqual({ outcome: 'absent' });
+  } finally {
+    runner.mockReset();
+    vi.useRealTimers();
+  }
+});
+
+test('a failed accept checks presence once without waiting for the dismissed prompt', async () => {
+  vi.useFakeTimers();
+  const runner = vi.mocked(runAppleRunnerCommand);
+  runner.mockResolvedValueOnce(CONFIRMATION).mockRejectedValue(alertNotFound());
+  vi.mocked(resolveIosSimulatorDeepLinkBundleId).mockResolvedValueOnce('com.example.app');
+  try {
+    const readAlert = vi.fn<NonNullable<Interactor['readAlert']>>((options) =>
+      readAppleAlert(simulator, {}, options, process.env),
+    );
+    const awaitAlert = vi.fn<NonNullable<Interactor['awaitAlert']>>((options) =>
+      awaitAppleAlert(simulator, {}, options, process.env),
+    );
+    const interactor = {
+      readAlert,
+      awaitAlert,
+      acceptAlert: vi.fn(async () => {
+        throw spawnTimeout();
+      }),
+    } satisfies Pick<Interactor, 'readAlert' | 'awaitAlert' | 'acceptAlert'>;
+    const device = createLaunchConfirmationPort(
+      simulator,
+      { url: 'example://automation', appBundleId: 'com.example.app' },
+      interactor,
+      new AbortController().signal,
+      undefined,
+    );
+    let settled: LaunchConfirmationAttempt | undefined;
+    const pending = answerLaunchConfirmation(device).then((value) => {
+      settled = value;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toEqual({ outcome: 'unreadable', step: 'alert-accept' });
+    expect(awaitAlert).toHaveBeenCalledOnce();
+    expect(readAlert).toHaveBeenCalledOnce();
+    expect(runner).toHaveBeenCalledTimes(2);
+    await pending;
+  } finally {
+    await vi.advanceTimersByTimeAsync(11_000);
+    runner.mockReset();
+    vi.useRealTimers();
+  }
+});
+
+test('a no-prompt presentation probe completes within a few seconds', async () => {
+  vi.useFakeTimers();
+  const runner = vi.mocked(runAppleRunnerCommand);
+  runner.mockRejectedValue(alertNotFound());
+  try {
+    const interactor = {
+      readAlert: (options) => readAppleAlert(simulator, {}, options, process.env),
+      awaitAlert: (options) => awaitAppleAlert(simulator, {}, options, process.env),
+      acceptAlert: vi.fn(),
+    } satisfies Pick<Interactor, 'readAlert' | 'awaitAlert' | 'acceptAlert'>;
+    const device = createLaunchConfirmationPort(
+      simulator,
+      { url: 'example://automation', appBundleId: 'com.example.app' },
+      interactor,
+      new AbortController().signal,
+      undefined,
+    );
+    let settled: LaunchConfirmationAttempt | undefined;
+    const pending = answerLaunchConfirmation(device).then((value) => {
+      settled = value;
+    });
+    await vi.advanceTimersByTimeAsync(3_500);
+    expect(settled).toEqual({ outcome: 'absent' });
+    expect(runner.mock.calls[0]?.[1]).toMatchObject({ timeoutMs: 3_000 });
+    await pending;
+  } finally {
+    await vi.advanceTimersByTimeAsync(11_000);
+    runner.mockReset();
+    vi.useRealTimers();
+  }
+});
+
+test('the port reads and accepts the alert for the session app and asks the scheme owner', async () => {
+  const awaitAlert = vi.fn(async () => CONFIRMATION);
+  const acceptAlert = vi.fn(async () => ({}));
+  const readAlert = vi.fn(async () => CONFIRMATION);
+  const interactor = { awaitAlert, readAlert, acceptAlert };
+
+  const signal = new AbortController().signal;
+  vi.mocked(resolveIosSimulatorDeepLinkBundleId).mockResolvedValueOnce('com.example.app');
+
+  const device = createLaunchConfirmationPort(
+    simulator,
+    { url: 'example://automation', appBundleId: 'com.example.app' },
+    interactor,
+    signal,
+    undefined,
+  );
+  await device.awaitAlert();
+  await device.readAlert();
+  await device.acceptAlert();
+
+  const target = { appBundleId: 'com.example.app', surface: 'app' };
+  expect(awaitAlert).toHaveBeenCalledWith({ ...target, timeoutMs: 3_000 });
+  expect(readAlert).toHaveBeenCalledWith(target);
+  expect(acceptAlert).toHaveBeenCalledWith(target);
+  await expect(device.resolveUrlOwner()).resolves.toBe('com.example.app');
+  expect(resolveIosSimulatorDeepLinkBundleId).toHaveBeenCalledWith(
+    simulator,
+    'example://automation',
+    { timeoutMs: expect.any(Number), signal },
+  );
+});
+
+test('the port reads a typed absence as no alert and keeps any other failure', async () => {
+  const runnerDown = new AppError('COMMAND_FAILED', 'runner unavailable', {
+    reason: 'runner-start-failed',
+  });
+  const awaitAlert = vi
+    .fn<() => Promise<Record<string, unknown>>>()
+    .mockRejectedValueOnce(alertNotFound())
+    .mockRejectedValueOnce(runnerDown);
+  const interactor = { awaitAlert, readAlert: vi.fn(), acceptAlert: vi.fn() };
+
+  const device = createLaunchConfirmationPort(
+    simulator,
+    { url: 'example://automation', appBundleId: 'com.example.app' },
+    interactor,
+    new AbortController().signal,
+    undefined,
+  );
+
+  await expect(device.awaitAlert()).resolves.toBeUndefined();
+  await expect(device.awaitAlert()).rejects.toBe(runnerDown);
+});
+
+test('a runner that cannot be resolved reports an unreadable attempt', async () => {
+  await expect(
+    answerSimulatorLaunchConfirmation(
+      simulator,
+      { url: 'example://automation', appBundleId: 'com.example.app' },
+      Promise.reject(new AppError('COMMAND_FAILED', 'xcrun timed out', { timeoutMs: 10_000 })),
+      new AbortController().signal,
+      undefined,
+    ),
+  ).resolves.toEqual({ outcome: 'unreadable', step: 'runner' });
+});
+
+test('a confirmed persistent prompt reports its observed outcome without an accept-failure diagnostic', async () => {
+  vi.mocked(emitDiagnostic).mockClear();
+  const { port: device } = port(async () => CONFIRMATION, {
+    acceptAlert: async () => {
+      throw spawnTimeout();
+    },
+  });
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual({
+    outcome: 'unanswered',
+    reason: 'alert-still-present',
+  });
+  expect(emitDiagnostic).toHaveBeenCalledExactlyOnceWith({
+    level: 'debug',
+    phase: 'ios_launch_confirmation_unanswered',
+    data: { reason: 'alert-still-present' },
+  });
+});
+
+test('a launch title the runner did not mark is left unanswered on the first read', async () => {
+  const { port: device, acceptAlert } = port(async () => ({
+    message: CONFIRMATION.message,
+    items: ['Cancel', 'Continue'],
+  }));
+  await expect(answerLaunchConfirmation(device)).resolves.toMatchObject({
+    outcome: 'unanswered',
+    reason: 'alert-unrecognized',
+  });
+  expect(device.awaitAlert).toHaveBeenCalledOnce();
+  expect(acceptAlert).not.toHaveBeenCalled();
+});
+
+/** The accept as the runner answers it when its main-thread watchdog abandons the press (#3861). */
+function runnerMainThreadTimeout(): AppError {
+  return new AppError('COMMAND_FAILED', 'main thread execution timed out', {
+    runnerErrorCode: 'MAIN_THREAD_TIMEOUT',
+  });
+}
+
+const STILL_PRESENT = { outcome: 'unanswered', reason: 'alert-still-present' };
+
+/**
+ * One more press costs its preflight and press watchdog, then the verification read's preflight
+ * and watchdog: 1 s + 10 s + 1 s + 10 s.
+ */
+const NEXT_PRESS_COST_MS = 22_000;
+
+/** Runs `body` on a fake clock, so each leg spends exactly the time it advances. */
+async function onFakeClock(body: () => Promise<void>): Promise<void> {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  try {
+    await body();
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+/** An accept the runner watchdog abandons after `spentMs` of preflight and press. */
+function abandonedPress(spentMs: number = DEFAULT_ALERT_TIMEOUT_MS) {
+  return vi.fn(async () => {
+    vi.advanceTimersByTime(spentMs);
+    throw runnerMainThreadTimeout();
+  });
+}
+
+test('an accept the runner watchdog abandoned is pressed again while the request has time for it', async () => {
+  const acceptAlert = vi
+    .fn<() => Promise<unknown>>()
+    .mockRejectedValueOnce(runnerMainThreadTimeout())
+    .mockResolvedValueOnce({});
+  const { port: device } = port(async () => CONFIRMATION, {
+    acceptAlert,
+    deadlineAtMs: Date.now() + 60_000,
+  });
+
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual({ outcome: 'accepted' });
+  expect(acceptAlert).toHaveBeenCalledTimes(2);
+});
+
+test('an abandoned accept is not pressed again when the request has no deadline', async () => {
+  const acceptAlert = vi.fn(async () => {
+    throw runnerMainThreadTimeout();
+  });
+  const { port: device } = port(async () => CONFIRMATION, { acceptAlert });
+
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual(STILL_PRESENT);
+  expect(acceptAlert).toHaveBeenCalledOnce();
+});
+
+test('the watchdog message without the runner code is not pressed again', async () => {
+  const acceptAlert = vi.fn(async () => {
+    throw new AppError('COMMAND_FAILED', 'main thread execution timed out');
+  });
+  const { port: device } = port(async () => CONFIRMATION, {
+    acceptAlert,
+    deadlineAtMs: Date.now() + 60_000,
+  });
+
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual(STILL_PRESENT);
+  expect(acceptAlert).toHaveBeenCalledOnce();
+});
+
+test('an abandoned accept that removed the confirmation is not pressed again', async () => {
+  const acceptAlert = vi.fn(async () => {
+    throw runnerMainThreadTimeout();
+  });
+  const { port: device } = port(async () => CONFIRMATION, {
+    acceptAlert,
+    deadlineAtMs: Date.now() + 60_000,
+  });
+  vi.mocked(device.readAlert).mockResolvedValue(undefined);
+
+  await expect(answerLaunchConfirmation(device)).resolves.toEqual({
+    outcome: 'unreadable',
+    step: 'alert-accept',
+  });
+  expect(acceptAlert).toHaveBeenCalledOnce();
+});
+
+test('a request budget mostly spent before the first press keeps the existing failure', async () => {
+  await onFakeClock(async () => {
+    const acceptAlert = abandonedPress();
+    const { port: device } = port(async () => CONFIRMATION, {
+      acceptAlert,
+      deadlineAtMs: Date.now() + 15_000,
+    });
+
+    await expect(answerLaunchConfirmation(device)).resolves.toEqual(STILL_PRESENT);
+    expect(acceptAlert).toHaveBeenCalledOnce();
+  });
+});
+
+test('a delayed preflight leaves too little time for another press', async () => {
+  await onFakeClock(async () => {
+    const acceptAlert = abandonedPress(800 + DEFAULT_ALERT_TIMEOUT_MS);
+    const { port: device } = port(async () => CONFIRMATION, {
+      acceptAlert,
+      deadlineAtMs: Date.now() + 800 + DEFAULT_ALERT_TIMEOUT_MS + NEXT_PRESS_COST_MS - 1,
+    });
+
+    await expect(answerLaunchConfirmation(device)).resolves.toEqual(STILL_PRESENT);
+    expect(acceptAlert).toHaveBeenCalledOnce();
+  });
+});
+
+test('a delayed verification read leaves too little time for another press', async () => {
+  await onFakeClock(async () => {
+    const acceptAlert = abandonedPress();
+    const { port: device } = port(async () => CONFIRMATION, {
+      acceptAlert,
+      deadlineAtMs: Date.now() + DEFAULT_ALERT_TIMEOUT_MS + 4_000 + NEXT_PRESS_COST_MS - 1,
+    });
+    vi.mocked(device.readAlert).mockImplementation(async () => {
+      vi.advanceTimersByTime(4_000);
+      return CONFIRMATION;
+    });
+
+    await expect(answerLaunchConfirmation(device)).resolves.toEqual(STILL_PRESENT);
+    expect(acceptAlert).toHaveBeenCalledOnce();
+  });
+});
+
+test('abandoned accepts stop once the request cannot hold another press', async () => {
+  await onFakeClock(async () => {
+    const acceptAlert = abandonedPress();
+    const { port: device } = port(async () => CONFIRMATION, {
+      acceptAlert,
+      deadlineAtMs: Date.now() + DEFAULT_ALERT_TIMEOUT_MS + NEXT_PRESS_COST_MS,
+    });
+
+    await expect(answerLaunchConfirmation(device)).resolves.toEqual(STILL_PRESENT);
+    expect(acceptAlert).toHaveBeenCalledTimes(2);
+  });
+});
